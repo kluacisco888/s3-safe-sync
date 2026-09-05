@@ -81,7 +81,10 @@ export class AwsS3ObjectStore implements ObjectStore {
 
   constructor(options: AwsS3ObjectStoreOptions) {
     this.execute = options.execute;
-    this.hostname = `${options.bucket}.s3.${options.region}.amazonaws.com`;
+    const dnsSuffix = options.region.startsWith("cn-")
+      ? "amazonaws.com.cn"
+      : "amazonaws.com";
+    this.hostname = `${options.bucket}.s3.${options.region}.${dnsSuffix}`;
     this.signer = new SignatureV4({
       credentials: {
         accessKeyId: options.accessKeyId,
@@ -203,27 +206,27 @@ export class AwsS3ObjectStore implements ObjectStore {
     if (typeof value !== "object" || value === null || !("ListBucketResult" in value)) {
       throw new Error("AWS S3 returned an invalid ListObjectsV2 document");
     }
-    const root = value.ListBucketResult;
-    if (typeof root !== "object" || root === null) {
+    const document = value as Record<string, unknown>;
+    const rootValue = document["ListBucketResult"];
+    if (typeof rootValue !== "object" || rootValue === null) {
       throw new Error("AWS S3 returned an invalid ListObjectsV2 result");
     }
-    const contents = "Contents" in root ? root.Contents : [];
+    const root = rootValue as Record<string, unknown>;
+    const contents = root["Contents"] ?? [];
     const items = Array.isArray(contents) ? contents : [contents];
-    const keys = items.flatMap((item) => {
-      if (
-        typeof item === "object" &&
-        item !== null &&
-        "Key" in item &&
-        typeof item.Key === "string"
-      ) {
-        return [item.Key];
+    const keys: string[] = items.flatMap((item): string[] => {
+      if (typeof item === "object" && item !== null) {
+        const key = (item as Record<string, unknown>)["Key"];
+        if (typeof key === "string") {
+          return [key];
+        }
       }
       return [];
     });
+    const rawNextToken = root["NextContinuationToken"];
     const nextContinuationToken =
-      "NextContinuationToken" in root &&
-      typeof root.NextContinuationToken === "string"
-        ? root.NextContinuationToken
+      typeof rawNextToken === "string"
+        ? rawNextToken
         : undefined;
     return { keys, nextContinuationToken };
   }

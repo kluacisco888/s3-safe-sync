@@ -97,7 +97,7 @@ const sha256 = async (input: Uint8Array): Promise<string> => {
     input.buffer instanceof ArrayBuffer &&
     input.byteLength === input.buffer.byteLength
       ? input.buffer
-      : (input.slice().buffer as ArrayBuffer);
+      : input.slice().buffer;
   const digest = await crypto.subtle.digest(
     "SHA-256",
     buffer,

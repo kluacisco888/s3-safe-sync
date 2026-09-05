@@ -58,9 +58,8 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
     const settings = this.controller.getSettings();
     containerEl.empty();
     new Setting(containerEl)
-      .setName("S3 Vault Sync")
-      .setDesc(this.controller.getStatusText())
-      .setHeading();
+      .setName("Status")
+      .setDesc(this.controller.getStatusText());
 
     this.textSetting("Device name", settings.deviceName, async (value) => {
       settings.deviceName = value.trim() || "My device";

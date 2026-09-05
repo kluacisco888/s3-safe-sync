@@ -10,7 +10,7 @@ const toArrayBuffer = (body: Uint8Array): ArrayBuffer =>
   body.buffer instanceof ArrayBuffer &&
   body.byteLength === body.buffer.byteLength
     ? body.buffer
-    : (body.slice().buffer as ArrayBuffer);
+    : body.slice().buffer;
 
 export const executeObsidianHttpRequest: HttpExecutor = async (
   request: HttpRequestInput,

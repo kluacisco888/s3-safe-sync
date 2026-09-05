@@ -89,6 +89,8 @@ npm test
 npm run build
 ```
 
+An opt-in live AWS test is available through `npm run test:integration`. It reads `S3_VAULT_SYNC_TEST_ACCESS_KEY_ID`, `S3_VAULT_SYNC_TEST_SECRET_ACCESS_KEY`, `S3_VAULT_SYNC_TEST_REGION`, and `S3_VAULT_SYNC_TEST_BUCKET` from the process environment and creates only a random `integration/` child prefix. The default test command never reads AWS credentials.
+
 For a manual Beta installation, copy `main.js`, `manifest.json`, and `styles.css` into `<Vault>/.obsidian/plugins/s3-vault-sync/`, reload Obsidian, and enable **S3 Vault Sync** under Community plugins.
 
 In plugin settings, enter a device-specific AWS Access Key ID and Secret Access Key, region, bucket, and an empty new prefix. For migration, also enter the existing Remotely Save prefix, complete one final Remotely Save synchronization, inspect the desktop Vault, and disable Remotely Save before initializing. The same Vault password reads the legacy Rclone Crypt data and protects the new Key Envelope.
@@ -99,7 +101,7 @@ Enable S3 Versioning in the AWS console and scope each device's IAM policy to li
 
 - Automated tests cover deletion resurrection after cache loss, edit/delete, edit/edit, clean Markdown merge, conflicts, history restore, encrypted migration comparison, Head CAS, snapshots, mobile deferral, and bulk-delete blocking.
 - The generated bundle contains no Node/Electron runtime import, but Android and iOS 50 MB transfer behavior still requires real-device validation.
-- S3 integration is implemented for Amazon S3 virtual-hosted endpoints and requires a real prefix-scoped integration test before trusted use with personal data.
+- S3 integration supports global and `aws-cn` virtual-hosted endpoints. A live `cn-northwest-1` test has passed signed List/Get/Put/Delete, stale ETag rejection, encrypted Blob/Commit round trips, and concurrent Head CAS. The Obsidian `requestUrl` transport still requires an in-app test before trusted use with personal data.
 - Desktop transfers currently have no configured size limit but use Obsidian's whole-file binary API; streaming multipart transfer remains required before claiming arbitrarily large-file support.
 - Downloads authenticate and hash the complete plaintext before calling Obsidian's binary write API, but resumable chunk staging is not yet available. Mobile upload and final materialization therefore still have whole-file memory exposure and remain Beta even below the configured 50 MB ceiling.
 - Restore operations enforce the 30-day deadline using AWS-observed time. Removing expired metadata, physical orphan-blob garbage collection, and shared audit browsing remain follow-up hardening work; S3 Versioning is the operational fallback during Beta.

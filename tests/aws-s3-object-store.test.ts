@@ -43,4 +43,28 @@ describe("AwsS3ObjectStore", () => {
       url: "https://example-bucket.s3.us-east-1.amazonaws.com/chosen-prefix/v1/head",
     });
   });
+
+  it("uses the aws-cn endpoint suffix for China regions", async () => {
+    let captured: HttpRequestInput | undefined;
+    const store = new AwsS3ObjectStore({
+      accessKeyId: "AKIDEXAMPLE",
+      bucket: "china-test-bucket",
+      execute: async (request) => {
+        captured = request;
+        return {
+          body: new Uint8Array(),
+          headers: { date: "Sat, 05 Sep 2026 00:00:00 GMT", etag: '"etag"' },
+          status: 200,
+        };
+      },
+      region: "cn-northwest-1",
+      secretAccessKey: "secret-example",
+    });
+
+    await store.put("integration/head", new Uint8Array());
+
+    expect(captured?.url).toBe(
+      "https://china-test-bucket.s3.cn-northwest-1.amazonaws.com.cn/integration/head",
+    );
+  });
 });

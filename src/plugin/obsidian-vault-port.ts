@@ -31,7 +31,7 @@ const asArrayBuffer = (body: Uint8Array): ArrayBuffer =>
   body.buffer instanceof ArrayBuffer &&
   body.byteLength === body.buffer.byteLength
     ? body.buffer
-    : (body.slice().buffer as ArrayBuffer);
+    : body.slice().buffer;
 
 export class ObsidianVaultPort implements LocalVaultPort {
   constructor(private readonly vault: Vault) {}

@@ -37,7 +37,7 @@ const randomBytes = (length: number): Uint8Array => {
 };
 
 const toArrayBuffer = (input: Uint8Array): ArrayBuffer =>
-  input.slice().buffer as ArrayBuffer;
+  input.slice().buffer;
 
 const encodeBase64Url = (input: Uint8Array): string => {
   let binary = "";
