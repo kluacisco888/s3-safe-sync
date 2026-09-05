@@ -6,6 +6,7 @@ import {
   type LocalFileInfo,
   type LocalVaultPort,
   type SyncCachePort,
+  type SyncProgress,
 } from "../src/sync/sync-service";
 import {
   ObjectPreconditionError,
@@ -120,6 +121,241 @@ class MemorySyncCache implements SyncCachePort {
 }
 
 describe("SyncService", () => {
+  it("reports initialization progress for every encrypted upload", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write("notes/one.md", new TextEncoder().encode("one"));
+    await local.write("notes/two.md", new TextEncoder().encode("twice"));
+    const progress: SyncProgress[] = [];
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      onProgress: (update) => progress.push(update),
+      remote,
+      replicaId: "desktop",
+    });
+
+    await service.initializeNew("vault-1");
+
+    expect(local.readCount).toBe(4);
+    expect(progress.filter((update) => update.phase === "scanning")).toEqual([
+      {
+        completed: 0,
+        phase: "scanning",
+        total: 2,
+        totalBytes: 8,
+        transferredBytes: 0,
+      },
+      {
+        completed: 1,
+        currentPath: "notes/one.md",
+        phase: "scanning",
+        total: 2,
+        totalBytes: 8,
+        transferredBytes: 3,
+      },
+      {
+        completed: 2,
+        currentPath: "notes/two.md",
+        phase: "scanning",
+        total: 2,
+        totalBytes: 8,
+        transferredBytes: 8,
+      },
+    ]);
+    expect(progress.filter((update) => update.phase === "uploading")).toEqual([
+      {
+        completed: 0,
+        phase: "uploading",
+        total: 2,
+        totalBytes: 8,
+        transferredBytes: 0,
+      },
+      {
+        completed: 0,
+        currentPath: "notes/one.md",
+        phase: "uploading",
+        total: 2,
+        totalBytes: 8,
+        transferredBytes: 0,
+      },
+      {
+        completed: 1,
+        currentPath: "notes/one.md",
+        phase: "uploading",
+        total: 2,
+        totalBytes: 8,
+        transferredBytes: 3,
+      },
+      {
+        completed: 1,
+        currentPath: "notes/two.md",
+        phase: "uploading",
+        total: 2,
+        totalBytes: 8,
+        transferredBytes: 3,
+      },
+      {
+        completed: 2,
+        currentPath: "notes/two.md",
+        phase: "uploading",
+        total: 2,
+        totalBytes: 8,
+        transferredBytes: 8,
+      },
+    ]);
+    expect(progress.at(-1)).toEqual({
+      completed: 2,
+      phase: "publishing",
+      total: 2,
+      totalBytes: 8,
+      transferredBytes: 8,
+    });
+  });
+
+  it("stops initialization if a local file changes after scanning", async () => {
+    const scanned = new TextEncoder().encode("first");
+    const changed = new TextEncoder().encode("other");
+    let reads = 0;
+    const local: LocalVaultPort = {
+      delete: () => Promise.resolve(),
+      list: () =>
+        Promise.resolve([
+          { modifiedAt: 1, path: "notes/example.md", size: scanned.byteLength },
+        ]),
+      move: () => Promise.resolve(),
+      read: () => Promise.resolve((reads++ === 0 ? scanned : changed).slice()),
+      write: () => Promise.resolve(),
+    };
+    const remote = await RemoteStore.open({
+      objects: new MemoryObjectStore(),
+      prefix: "chosen-prefix",
+      vaultKey: Uint8Array.from({ length: 32 }, (_, index) => index),
+    });
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      remote,
+      replicaId: "desktop",
+    });
+
+    await expect(service.initializeNew("vault-1")).rejects.toThrow(
+      "Local file changed while reading notes/example.md",
+    );
+    expect(await remote.readHead()).toBeUndefined();
+  });
+
+  it("reports the current file while uploading a later Revision", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write("notes/example.md", new TextEncoder().encode("first"));
+    const progress: SyncProgress[] = [];
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      onProgress: (update) => progress.push(update),
+      remote,
+      replicaId: "desktop",
+    });
+    await service.initializeNew("vault-1");
+    progress.splice(0);
+    await local.write("notes/example.md", new TextEncoder().encode("second"));
+
+    await service.synchronize();
+
+    expect(progress.filter((update) => update.phase === "uploading")).toEqual([
+      {
+        completed: 0,
+        currentPath: "notes/example.md",
+        phase: "uploading",
+        total: 1,
+        totalBytes: 6,
+        transferredBytes: 0,
+      },
+      {
+        completed: 1,
+        currentPath: "notes/example.md",
+        phase: "uploading",
+        total: 1,
+        totalBytes: 6,
+        transferredBytes: 6,
+      },
+    ]);
+    expect(progress.at(-1)).toEqual({
+      completed: 1,
+      phase: "publishing",
+      total: 1,
+      totalBytes: 6,
+      transferredBytes: 6,
+    });
+  });
+
+  it("reports the current file while downloading a remote Revision", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const desktopVault = new MemoryVault();
+    await desktopVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("hello"),
+    );
+    await new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: desktopRemote,
+      replicaId: "desktop",
+    }).initializeNew("vault-1");
+    const progress: SyncProgress[] = [];
+    const phone = new SyncService({
+      cache: new MemorySyncCache(),
+      local: new MemoryVault(),
+      onProgress: (update) => progress.push(update),
+      remote: await RemoteStore.open({
+        objects,
+        prefix: "chosen-prefix",
+        vaultKey,
+      }),
+      replicaId: "phone",
+    });
+
+    await phone.synchronize();
+
+    expect(progress.filter((update) => update.phase === "downloading")).toEqual([
+      {
+        completed: 0,
+        currentPath: "notes/example.md",
+        phase: "downloading",
+        total: 1,
+        totalBytes: 5,
+        transferredBytes: 0,
+      },
+      {
+        completed: 1,
+        currentPath: "notes/example.md",
+        phase: "downloading",
+        total: 1,
+        totalBytes: 5,
+        transferredBytes: 5,
+      },
+    ]);
+  });
+
   it("bootstraps a new Replica from an encrypted Remote Store", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);

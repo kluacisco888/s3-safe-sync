@@ -10,17 +10,20 @@ import { RemotelySaveMigration } from "./migration/remotely-save-migration";
 import { CredentialStore, type AwsCredentials } from "./plugin/credential-store";
 import { StatusModal, VersionHistoryModal } from "./plugin/modals";
 import { ObsidianVaultPort, isInSyncScope } from "./plugin/obsidian-vault-port";
+import { formatSyncProgress } from "./plugin/sync-progress";
 import {
   DEFAULT_SETTINGS,
   S3VaultSyncSettingsTab,
   type S3VaultSyncSettings,
   type SettingsController,
+  type SyncStatusDisplay,
 } from "./plugin/settings";
 import {
   SyncService,
   type CachedSyncState,
   type LocalSyncIssue,
   type SyncCachePort,
+  type SyncProgress,
 } from "./sync/sync-service";
 import type {
   ConflictedEntry,
@@ -91,6 +94,10 @@ export default class S3VaultSyncPlugin
   private status: PluginStatus = "Not configured";
   private statusDetail = "Enter AWS settings and a Vault password.";
   private statusElement: HTMLElement | undefined;
+  private readonly statusListeners = new Set<
+    (status: SyncStatusDisplay) => void
+  >();
+  private progressLabel: string | undefined;
 
   async onload(): Promise<void> {
     await this.loadPluginData();
@@ -135,6 +142,7 @@ export default class S3VaultSyncPlugin
     });
     if (Platform.isDesktop) {
       this.statusElement = this.addStatusBarItem();
+      this.statusElement.addClass("s3-vault-sync-status-bar");
     }
     this.refreshConfiguredStatus();
     this.app.workspace.onLayoutReady(() => {
@@ -172,6 +180,17 @@ export default class S3VaultSyncPlugin
 
   getStatusText(): string {
     return `${this.status}: ${this.statusDetail}`;
+  }
+
+  getProgressLabel(): string | undefined {
+    return this.progressLabel;
+  }
+
+  onStatusChange(
+    listener: (status: SyncStatusDisplay) => void,
+  ): () => void {
+    this.statusListeners.add(listener);
+    return () => this.statusListeners.delete(listener);
   }
 
   isPaused(): boolean {
@@ -320,6 +339,7 @@ export default class S3VaultSyncPlugin
       if (!password) {
         throw new Error("Enter the Vault password first");
       }
+      this.setStatus("Checking", "Checking S3 and the encrypted Remote Store.");
       const objects = this.createObjectStore();
       const prefix = normalizePrefix(this.data.settings.prefix);
       const bootstrap = new BootstrapStore(objects, prefix);
@@ -480,6 +500,7 @@ export default class S3VaultSyncPlugin
       local: new ObsidianVaultPort(this.app.vault),
       maxAutomaticFileBytes: mobileAutomaticFileLimit(),
       remote,
+      onProgress: (progress) => this.updateSyncProgress(progress),
       replicaId: this.data.settings.replicaId,
     });
   }
@@ -650,14 +671,33 @@ export default class S3VaultSyncPlugin
     }, 5_000);
   }
 
-  private setStatus(status: PluginStatus, detail: string): void {
+  private setStatus(
+    status: PluginStatus,
+    detail: string,
+    progressLabel?: string,
+  ): void {
     this.status = status;
     this.statusDetail = detail;
-    this.statusElement?.setText(`S3 Sync: ${status}`);
+    this.progressLabel = progressLabel;
+    this.statusElement?.setText(`S3 Sync: ${progressLabel ? detail : status}`);
+    this.statusElement?.setAttr("aria-label", this.getStatusText());
+    this.statusElement?.setAttr("title", this.getStatusText());
     this.statusElement?.toggleClass(
       "s3-vault-sync-error",
       status === "Action required" || status === "Error",
     );
+    const display: SyncStatusDisplay = {
+      ...(progressLabel ? { progressLabel } : {}),
+      text: this.getStatusText(),
+    };
+    for (const listener of this.statusListeners) {
+      listener(display);
+    }
+  }
+
+  private updateSyncProgress(progress: SyncProgress): void {
+    const formatted = formatSyncProgress(progress);
+    this.setStatus("Syncing", formatted.detail, formatted.label);
   }
 
   private showError(error: unknown): void {

@@ -9,6 +9,13 @@
   color: var(--text-error);
 }
 
+.s3-vault-sync-status-bar {
+  max-width: min(36rem, 45vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .s3-vault-sync-muted {
   color: var(--text-muted);
 }

@@ -3,6 +3,7 @@ import {
   Plugin,
   PluginSettingTab,
   Setting,
+  type ButtonComponent,
   type TextComponent,
 } from "obsidian";
 
@@ -31,10 +32,19 @@ export const DEFAULT_SETTINGS: S3VaultSyncSettings = {
   remotelySavePrefix: "",
 };
 
+export interface SyncStatusDisplay {
+  progressLabel?: string;
+  text: string;
+}
+
 export interface SettingsController {
+  getProgressLabel(): string | undefined;
   getSettings(): S3VaultSyncSettings;
   getStatusText(): string;
   initializeOrUnlock(password: string): Promise<void>;
+  onStatusChange(
+    listener: (status: SyncStatusDisplay) => void,
+  ): () => void;
   saveAwsCredentials(credentials: AwsCredentials): Promise<void>;
   saveSettings(): Promise<void>;
   syncNow(): Promise<void>;
@@ -46,6 +56,8 @@ const asPasswordInput = (component: TextComponent): TextComponent => {
 };
 
 export class S3VaultSyncSettingsTab extends PluginSettingTab {
+  private stopStatusUpdates: (() => void) | undefined;
+
   constructor(
     app: App,
     private readonly controller: SettingsController & Plugin,
@@ -54,10 +66,11 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
   }
 
   display(): void {
+    this.stopStatusUpdates?.();
     const { containerEl } = this;
     const settings = this.controller.getSettings();
     containerEl.empty();
-    new Setting(containerEl)
+    const statusSetting = new Setting(containerEl)
       .setName("Status")
       .setDesc(this.controller.getStatusText());
 
@@ -128,21 +141,34 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
       );
 
     let password = "";
-    new Setting(containerEl)
+    let initializationRunning = false;
+    let initializeButton: ButtonComponent | undefined;
+    let renderStatus = (): void => {};
+    const passwordDescription =
+      "Creates a new encrypted remote Vault or unlocks an existing one.";
+    const passwordSetting = new Setting(containerEl)
       .setName("Vault password")
-      .setDesc("Creates a new encrypted remote Vault or unlocks an existing one.")
+      .setDesc(passwordDescription)
       .addText((text) =>
         asPasswordInput(text).onChange((value) => {
           password = value;
         }),
       )
-      .addButton((button) =>
+      .addButton((button) => {
+        initializeButton = button;
         button.setButtonText("Initialize or unlock").onClick(async () => {
-          await this.controller.initializeOrUnlock(password);
-          password = "";
-          this.display();
-        }),
-      );
+          initializationRunning = true;
+          button.setDisabled(true);
+          renderStatus();
+          try {
+            await this.controller.initializeOrUnlock(password);
+          } finally {
+            initializationRunning = false;
+            password = "";
+            this.display();
+          }
+        });
+      });
 
     new Setting(containerEl)
       .setName("Pause automatic sync")
@@ -154,15 +180,48 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
         }),
       );
 
-    new Setting(containerEl)
+    const syncDescription =
+      "Checks the encrypted remote Head and reconciles this device.";
+    let manualSyncRunning = false;
+    let syncButton: ButtonComponent | undefined;
+    const syncSetting = new Setting(containerEl)
       .setName("Sync now")
-      .setDesc("Checks the encrypted remote Head and reconciles this device.")
-      .addButton((button) =>
+      .setDesc(syncDescription)
+      .addButton((button) => {
+        syncButton = button;
         button.setButtonText("Sync now").onClick(async () => {
-          await this.controller.syncNow();
-          this.display();
-        }),
-      );
+          manualSyncRunning = true;
+          button.setDisabled(true);
+          renderStatus();
+          try {
+            await this.controller.syncNow();
+          } finally {
+            manualSyncRunning = false;
+            this.display();
+          }
+        });
+      });
+
+    renderStatus = (): void => {
+      const status = this.controller.getStatusText();
+      const progressLabel = this.controller.getProgressLabel();
+      statusSetting.setDesc(status);
+      if (initializationRunning && initializeButton) {
+        passwordSetting.setDesc(status);
+        initializeButton.setButtonText(progressLabel ?? "Initializing…");
+      }
+      if (manualSyncRunning && syncButton) {
+        syncSetting.setDesc(status);
+        syncButton.setButtonText(progressLabel ?? "Syncing…");
+      }
+    };
+    this.stopStatusUpdates = this.controller.onStatusChange(renderStatus);
+  }
+
+  hide(): void {
+    this.stopStatusUpdates?.();
+    this.stopStatusUpdates = undefined;
+    super.hide();
   }
 
   private textSetting(

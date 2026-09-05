@@ -10,7 +10,7 @@ The plugin does not run after Obsidian is closed, provide telemetry, synchronize
 
 - Synchronize on startup, five seconds after local edits settle, every two foreground minutes for remote changes, and on explicit command.
 - Permit per-device pause without losing local observations.
-- Show routine progress in plugin UI and the desktop status bar without success popups.
+- Show the current phase, file count, byte count, and current path during scanning, uploading, and downloading in plugin settings and the desktop status bar without routine success popups.
 - Persist an action-required state for conflicts, corruption, unsafe bulk deletion, or repair.
 - Mirror normal files to mobile up to 50 MB. Larger remote files are listed as unavailable on that device; larger local files are explicitly unsynchronized.
 - Delay mobile attachments above 10 MB until Wi-Fi by default.

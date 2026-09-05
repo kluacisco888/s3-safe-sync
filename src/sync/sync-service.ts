@@ -47,8 +47,18 @@ export interface SyncServiceOptions {
   cache: SyncCachePort;
   local: LocalVaultPort;
   maxAutomaticFileBytes?: number;
+  onProgress?: (progress: SyncProgress) => void;
   remote: RemoteStore;
   replicaId: string;
+}
+
+export interface SyncProgress {
+  completed: number;
+  currentPath?: string;
+  phase: "downloading" | "publishing" | "scanning" | "uploading";
+  total: number;
+  totalBytes: number;
+  transferredBytes: number;
 }
 
 export interface SyncResult {
@@ -159,21 +169,54 @@ export class SyncService {
     if (await this.options.remote.readHead()) {
       throw new Error("Remote Store is already initialized");
     }
-    const scan = await this.scanFiles();
+    const scan = await this.scanFiles(undefined, true);
     const files = scan.files;
     if (scan.unsyncedLocalEntries > 0) {
       throw new Error("The Migration Baseline contains files above the device limit");
     }
+    const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+    let completed = 0;
+    let transferredBytes = 0;
+    this.reportProgress({
+      completed,
+      phase: "uploading",
+      total: files.length,
+      totalBytes,
+      transferredBytes,
+    });
     const createdAt = new Date().toISOString();
     const entries: VaultSnapshot["entries"] = {};
+    const cacheFiles: Record<string, CachedFileState> = {};
     for (const file of files) {
       const entryId = crypto.randomUUID();
       const blobId = crypto.randomUUID();
       const revisionId = crypto.randomUUID();
-      await this.options.remote.writeBlob(
-        blobId,
-        await this.options.local.read(file.path),
-      );
+      this.reportProgress({
+        completed,
+        currentPath: file.path,
+        phase: "uploading",
+        total: files.length,
+        totalBytes,
+        transferredBytes,
+      });
+      const plaintext = await this.options.local.read(file.path);
+      if (
+        plaintext.byteLength !== file.size ||
+        (await sha256(plaintext)) !== file.contentHash
+      ) {
+        throw new Error(`Local file changed while reading ${file.path}`);
+      }
+      await this.options.remote.writeBlob(blobId, plaintext);
+      completed += 1;
+      transferredBytes += file.size;
+      this.reportProgress({
+        completed,
+        currentPath: file.path,
+        phase: "uploading",
+        total: files.length,
+        totalBytes,
+        transferredBytes,
+      });
       entries[entryId] = {
         entryId,
         kind: "live",
@@ -186,6 +229,7 @@ export class SyncService {
           size: file.size,
         },
       };
+      cacheFiles[file.path] = { ...file, entryId };
     }
     const commitId = crypto.randomUUID();
     const commit: CommitRecord = {
@@ -206,6 +250,13 @@ export class SyncService {
       protocolVersion: 1,
       vaultId,
     };
+    this.reportProgress({
+      completed,
+      phase: "publishing",
+      total: files.length,
+      totalBytes,
+      transferredBytes,
+    });
     await this.options.remote.initialize({ commit, head });
     const snapshot: VaultSnapshot = {
       commitId,
@@ -213,7 +264,23 @@ export class SyncService {
       protocolVersion: 1,
       vaultId,
     };
-    await this.options.cache.save(await this.buildCache(snapshot));
+    const currentFiles = new Map(
+      (await this.options.local.list()).map((file) => [file.path, file] as const),
+    );
+    const stableCacheFiles = Object.fromEntries(
+      Object.entries(cacheFiles).filter(([path, cached]) => {
+        const current = currentFiles.get(path);
+        return (
+          current?.modifiedAt === cached.modifiedAt &&
+          current.size === cached.size
+        );
+      }),
+    );
+    await this.options.cache.save({ files: stableCacheFiles, snapshot });
+  }
+
+  private reportProgress(progress: SyncProgress): void {
+    this.options.onProgress?.(progress);
   }
 
   async downloadDeferred(entryId: string): Promise<void> {
@@ -543,7 +610,7 @@ export class SyncService {
     }
     let remote = await this.options.remote.readSnapshot(versionedHead.value);
     const cached = await this.options.cache.load();
-    const scan = await this.scanFiles(cached);
+    const scan = await this.scanFiles(cached, true);
     const scanned = scan.files;
     const localPaths = new Set(scanned.map((file) => file.path));
     const missingCachedByFingerprint = new Map<string, CachedFileState[]>();
@@ -643,8 +710,16 @@ export class SyncService {
       };
     }
 
+    const downloadingActions = plan.localActions.filter(
+      (action) => action.kind === "download-remote",
+    );
+    const downloadTotalBytes = downloadingActions.reduce(
+      (sum, action) => sum + action.revision.size,
+      0,
+    );
     let deleted = 0;
     let downloaded = 0;
+    let downloadedBytes = 0;
     for (const action of plan.localActions) {
       if (action.kind === "delete-local") {
         await this.options.local.delete(action.path);
@@ -652,6 +727,14 @@ export class SyncService {
       } else if (action.kind === "move-local") {
         await this.options.local.move(action.fromPath, action.toPath);
       } else {
+        this.reportProgress({
+          completed: downloaded,
+          currentPath: action.path,
+          phase: "downloading",
+          total: downloadingActions.length,
+          totalBytes: downloadTotalBytes,
+          transferredBytes: downloadedBytes,
+        });
         const plaintext = await this.options.remote.readBlob(
           action.revision.blobId,
         );
@@ -663,6 +746,15 @@ export class SyncService {
         }
         await this.options.local.write(action.path, plaintext);
         downloaded += 1;
+        downloadedBytes += action.revision.size;
+        this.reportProgress({
+          completed: downloaded,
+          currentPath: action.path,
+          phase: "downloading",
+          total: downloadingActions.length,
+          totalBytes: downloadTotalBytes,
+          transferredBytes: downloadedBytes,
+        });
       }
     }
 
@@ -672,6 +764,33 @@ export class SyncService {
         conflict.kind === "edit-delete" ||
         conflict.kind === "edit-edit",
     );
+    const uploadingChanges = plan.remoteChanges.filter(
+      (change) => change.kind === "upload-local" || change.kind === "upload-new",
+    );
+    const uploadingConflicts = sharedConflicts.filter(
+      (conflict) => conflict.kind === "edit-delete" || conflict.kind === "edit-edit",
+    );
+    const uploadTotal = uploadingChanges.length + uploadingConflicts.length;
+    const uploadTotalBytes = [
+      ...uploadingChanges.map((change) => change.file.size),
+      ...uploadingConflicts.map((conflict) => conflict.localFile.size),
+    ].reduce((sum, size) => sum + size, 0);
+    let uploadCompleted = 0;
+    let uploadedBytes = 0;
+    const reportUpload = (path: string, completedSize?: number): void => {
+      if (completedSize !== undefined) {
+        uploadCompleted += 1;
+        uploadedBytes += completedSize;
+      }
+      this.reportProgress({
+        completed: uploadCompleted,
+        currentPath: path,
+        phase: "uploading",
+        total: uploadTotal,
+        totalBytes: uploadTotalBytes,
+        transferredBytes: uploadedBytes,
+      });
+    };
     let unresolvedConflicts =
       plan.conflicts.length -
       sharedConflicts.length +
@@ -707,12 +826,14 @@ export class SyncService {
           }
           changedEntry = { ...current, path: change.toPath };
         } else {
+          reportUpload(change.path);
           const plaintext = await this.options.local.read(change.path);
           if ((await sha256(plaintext)) !== change.file.contentHash) {
             throw new Error(`Local file changed while reading ${change.path}`);
           }
           const blobId = crypto.randomUUID();
           await this.options.remote.writeBlob(blobId, plaintext);
+          reportUpload(change.path, change.file.size);
           const current = remote.entries[change.entryId];
           const previousRevisions =
             current?.kind === "live"
@@ -762,6 +883,7 @@ export class SyncService {
           changedEntries.push(changedEntry);
           continue;
         }
+        reportUpload(conflict.path);
         const plaintext = await this.options.local.read(conflict.path);
         if ((await sha256(plaintext)) !== conflict.localFile.contentHash) {
           throw new Error(`Local file changed while reading ${conflict.path}`);
@@ -854,6 +976,7 @@ export class SyncService {
             unresolvedConflicts += 1;
           }
         }
+        reportUpload(conflict.path, conflict.localFile.size);
         nextEntries[conflict.entryId] = changedEntry;
         changedEntries.push(changedEntry);
       }
@@ -888,6 +1011,13 @@ export class SyncService {
         });
         head.snapshotId = snapshotId;
       }
+      this.reportProgress({
+        completed: uploadCompleted,
+        phase: "publishing",
+        total: uploadTotal,
+        totalBytes: uploadTotalBytes,
+        transferredBytes: uploadedBytes,
+      });
       await this.options.remote.advance({
         commit,
         expectedHeadEtag: versionedHead.etag,
@@ -941,7 +1071,10 @@ export class SyncService {
     return { files, snapshot };
   }
 
-  private async scanFiles(cached?: CachedSyncState): Promise<{
+  private async scanFiles(
+    cached?: CachedSyncState,
+    reportProgress = false,
+  ): Promise<{
     files: Array<LocalFileInfo & { contentHash: string }>;
     skippedTrackedEntryIds: string[];
     unsyncedLocalEntries: number;
@@ -951,7 +1084,28 @@ export class SyncService {
     const skippedTrackedEntryIds: string[] = [];
     const unsyncedLocalPaths: string[] = [];
     let unsyncedLocalEntries = 0;
-    for (const file of await this.options.local.list()) {
+    const localFiles = await this.options.local.list();
+    const totalBytes = localFiles.reduce((sum, file) => sum + file.size, 0);
+    let completed = 0;
+    let transferredBytes = 0;
+    const reportScanned = (file?: LocalFileInfo): void => {
+      if (file) {
+        completed += 1;
+        transferredBytes += file.size;
+      }
+      if (reportProgress) {
+        this.reportProgress({
+          completed,
+          ...(file ? { currentPath: file.path } : {}),
+          phase: "scanning",
+          total: localFiles.length,
+          totalBytes,
+          transferredBytes,
+        });
+      }
+    };
+    reportScanned();
+    for (const file of localFiles) {
       const cachedFile = cached?.files[file.path];
       if (
         this.options.maxAutomaticFileBytes !== undefined &&
@@ -970,6 +1124,7 @@ export class SyncService {
             skippedTrackedEntryIds.push(cachedFile.entryId);
           }
         }
+        reportScanned(file);
         continue;
       }
       const contentHash =
@@ -982,6 +1137,7 @@ export class SyncService {
         ...file,
         contentHash,
       });
+      reportScanned(file);
     }
     return {
       files,
