@@ -1,0 +1,3 @@
+# Use Rclone Crypt for client-side encryption
+
+The migration reader will support the user's existing Remotely Save Rclone Crypt data, and the new protocol will continue to encrypt user content client-side with an authenticated Rclone Crypt format. A random Vault Key will encrypt content and metadata, while the user-entered password encrypts a small Key Envelope containing that key; changing the password therefore does not require re-encrypting the Vault. A trusted Replica stores the unlocked Vault Key in Obsidian SecretStorage for automatic synchronization. Supporting the current format avoids an unnecessary cryptographic migration while preserving password-based confidentiality and integrity.

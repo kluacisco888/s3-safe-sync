@@ -1,0 +1,32 @@
+.s3-vault-sync-status {
+  display: flex;
+  align-items: center;
+  gap: var(--size-4-2);
+}
+
+.s3-vault-sync-status[data-state="action-required"],
+.s3-vault-sync-error {
+  color: var(--text-error);
+}
+
+.s3-vault-sync-muted {
+  color: var(--text-muted);
+}
+
+.s3-vault-sync-conflict {
+  display: grid;
+  gap: var(--size-4-2);
+  margin-block: var(--size-4-3);
+  padding: var(--size-4-3);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+}
+
+.s3-vault-sync-history {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--size-4-3);
+  padding-block: var(--size-4-2);
+  border-bottom: 1px solid var(--background-modifier-border);
+}

@@ -1,0 +1,35 @@
+{
+  "name": "s3-vault-sync",
+  "version": "0.1.0",
+  "description": "Deletion-safe encrypted Obsidian synchronization through Amazon S3.",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "npm run check && node esbuild.config.mjs production",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "obsidian",
+    "s3",
+    "sync"
+  ],
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@aws-crypto/sha256-browser": "^5.2.0",
+    "@fyears/rclone-crypt": "0.0.7",
+    "@smithy/protocol-http": "^5.6.2",
+    "@smithy/signature-v4": "^5.7.3",
+    "fast-xml-parser": "^5.11.1",
+    "node-diff3": "^3.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.17",
+    "esbuild": "^0.25.5",
+    "obsidian": "^1.13.1",
+    "typescript": "^5.8.3",
+    "vitest": "3.2.7"
+  }
+}

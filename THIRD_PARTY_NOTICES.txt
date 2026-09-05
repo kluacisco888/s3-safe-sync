@@ -1,0 +1,14 @@
+S3 Vault Sync includes or depends on the following open-source software:
+
+- @fyears/rclone-crypt (MIT), including Rclone Crypt format support.
+  https://github.com/fyears/rclone-crypt
+- node-diff3 (MIT), used for three-way Markdown merging.
+  https://github.com/bhousel/node-diff3
+- AWS Crypto and Smithy JavaScript packages (Apache-2.0), used for SigV4.
+  https://github.com/aws/aws-sdk-js-v3
+- fast-xml-parser (MIT), used to read Amazon S3 ListObjectsV2 responses.
+  https://github.com/NaturalIntelligence/fast-xml-parser
+
+Remotely Save behavior and its Apache-2.0 documentation/tests were consulted
+for compatibility. Its PolyForm Strict pro/src synchronization implementation
+was not copied.

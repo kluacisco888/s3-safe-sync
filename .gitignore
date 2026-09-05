@@ -1,0 +1,6 @@
+main.js
+main.js.map
+node_modules/
+.DS_Store
+coverage/
+*.log

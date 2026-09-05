@@ -1,0 +1,9 @@
+{
+  "id": "s3-vault-sync",
+  "name": "S3 Vault Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.12.3",
+  "description": "Deletion-safe encrypted synchronization for Obsidian through Amazon S3.",
+  "author": "S3 Vault Sync contributors",
+  "isDesktopOnly": false
+}

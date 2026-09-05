@@ -1,0 +1,3 @@
+# Transfer whole-file Revisions
+
+The first release will upload each changed file as one complete encrypted Revision, without block-level deltas or content deduplication. Desktop transfers may stream and use multipart upload. A mobile Replica materializes files up to 50 MB; larger remote files remain known Deferred Downloads without placeholder files, while larger files created locally are reported as Unsynced Local Entries and may be attempted only through an explicit risk warning. Attachments above 10 MB wait for Wi-Fi by default on mobile. This favors a small verifiable protocol over storage and bandwidth optimization.
