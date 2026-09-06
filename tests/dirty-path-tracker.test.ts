@@ -1,9 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  DirtyPathTracker,
-  dirtyPathsForRename,
-} from "../src/sync/dirty-path-tracker";
+import { DirtyPathTracker } from "../src/sync/dirty-path-tracker";
 
 describe("DirtyPathTracker", () => {
   it("does not acknowledge edits that arrive after a sync captures its paths", () => {
@@ -38,22 +35,14 @@ describe("DirtyPathTracker", () => {
     ]);
   });
 
-  it("marks both sides of every cached path under a renamed folder", () => {
-    expect(
-      dirtyPathsForRename(
-        ["folder/a.md", "folder/nested/b.md", "other.md"],
-        "folder",
-        "renamed",
-      ),
-    ).toEqual(
-      new Set([
-        "folder",
-        "renamed",
-        "folder/a.md",
-        "renamed/a.md",
-        "folder/nested/b.md",
-        "renamed/nested/b.md",
-      ]),
-    );
+  it("identifies the first path changed after a synchronization snapshot", () => {
+    const tracker = new DirtyPathTracker();
+    tracker.mark("notes/existing.md");
+    const captured = tracker.capture();
+    expect(tracker.changedPathSince(captured)).toBeUndefined();
+
+    tracker.mark("notes/renamed.md");
+
+    expect(tracker.changedPathSince(captured)).toBe("notes/renamed.md");
   });
 });

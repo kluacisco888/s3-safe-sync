@@ -13,6 +13,7 @@ describe("isFullHashVerificationDue", () => {
     expect(isFullHashVerificationDue(now - 1_000, false, now)).toBe(true);
     expect(isFullHashVerificationDue(Number.NaN, true, now)).toBe(true);
     expect(isFullHashVerificationDue(now + 1, true, now)).toBe(true);
+    expect(isFullHashVerificationDue(now - 1_000, true, now, true)).toBe(true);
     expect(
       isFullHashVerificationDue(
         now - FULL_HASH_VERIFICATION_INTERVAL_MS + 1,

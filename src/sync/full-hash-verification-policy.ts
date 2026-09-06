@@ -4,7 +4,9 @@ export const isFullHashVerificationDue = (
   lastVerificationAt: number | undefined,
   hasCache: boolean,
   now: number,
+  verificationRequired = false,
 ): boolean =>
+  verificationRequired ||
   !hasCache ||
   lastVerificationAt === undefined ||
   !Number.isFinite(lastVerificationAt) ||

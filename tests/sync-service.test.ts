@@ -1685,6 +1685,93 @@ describe("SyncService", () => {
     expect(local.readPaths).toEqual(["notes/one.md", "notes/two.md"]);
   });
 
+  it("reuses verified hashes after a full check loses the Head race", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const competingRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write("notes/changed.md", new TextEncoder().encode("first"));
+    await local.write("notes/unchanged.md", new TextEncoder().encode("stable"));
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      remote,
+      replicaId: "desktop",
+    });
+    await service.initializeNew("vault-1");
+    local.writePreservingMetadata(
+      "notes/changed.md",
+      new TextEncoder().encode("other"),
+    );
+    const competingHead = await competingRemote.readHead();
+    if (!competingHead) {
+      throw new Error("Expected initialized Head");
+    }
+    objects.onPut = async (key) => {
+      if (!key.includes("/commits/")) {
+        return;
+      }
+      objects.onPut = undefined;
+      await competingRemote.advance({
+        commit: {
+          changes: [],
+          commitId: "competing-commit",
+          createdAt: competingHead.serverDate,
+          parentIds: [competingHead.value.commitId],
+          protocolVersion: 1,
+          replicaId: "other-device",
+          vaultId: competingHead.value.vaultId,
+        },
+        expectedHeadEtag: competingHead.etag,
+        head: {
+          commitId: "competing-commit",
+          generation: competingHead.value.generation + 1,
+          protocolVersion: 1,
+          snapshotId: competingHead.value.snapshotId,
+          vaultId: competingHead.value.vaultId,
+        },
+      });
+    };
+    const retryHashMemo = new Map();
+
+    await expect(
+      service.synchronize([], {
+        fullHashVerification: true,
+        retryHashMemo,
+      }),
+    ).rejects.toThrow("Head changed");
+    local.readCount = 0;
+    local.readPaths.length = 0;
+
+    const result = await service.synchronize([], {
+      fullHashVerification: false,
+      retryHashMemo,
+    });
+
+    expect(result).toMatchObject({ status: "complete", uploaded: 1 });
+    expect(local.readPaths).toEqual(["notes/changed.md"]);
+    const currentHead = await remote.readHead();
+    if (!currentHead) {
+      throw new Error("Expected current Head");
+    }
+    const current = await remote.readSnapshot(currentHead.value);
+    const currentEntry = Object.values(current.entries)[0];
+    if (currentEntry?.kind !== "live") {
+      throw new Error("Expected current live Entry");
+    }
+    const currentContent = await remote.readBlob(currentEntry.revision.blobId);
+    expect(new TextDecoder().decode(currentContent)).toBe("other");
+  });
+
   it("finds a deletion from metadata without rereading unchanged files", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
@@ -1768,6 +1855,36 @@ describe("SyncService", () => {
     ).rejects.toMatchObject({ path: "notes/example.md" });
 
     expect(phoneVault.readText("notes/example.md")).toBe("draft");
+  });
+
+  it("restarts before planning when a file event arrives during scanning", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write("notes/example.md", new TextEncoder().encode("first"));
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      remote,
+      replicaId: "desktop",
+    });
+    await service.initializeNew("vault-1");
+    await local.write("notes/example.md", new TextEncoder().encode("second"));
+
+    await expect(
+      service.synchronize([], {
+        assertLocalObservationCurrent: () => {
+          throw new Error("stale local observation");
+        },
+      }),
+    ).rejects.toThrow("stale local observation");
+
+    expect((await remote.readHead())?.value.generation).toBe(1);
   });
 
   it("hashes a dirty attachment after a temporary device limit is raised", async () => {
@@ -3517,14 +3634,16 @@ describe("SyncService", () => {
     if (!cachedFile) {
       throw new Error("Expected cached Entry");
     }
-    delete cache.state.files["notes/b.md"];
-    cache.state.files["notes/c.md"] = {
-      ...cachedFile,
-      path: "notes/c.md",
-    };
     await local.write("notes/b.md", new TextEncoder().encode("new local file"));
 
-    const result = await service.synchronize();
+    const result = await service.synchronize([], {
+      pathRenames: new Map([
+        [
+          "notes/b.md",
+          { entryId: cachedFile.entryId, toPath: "notes/c.md" },
+        ],
+      ]),
+    });
 
     expect(result.status).toBe("action-required");
     expect(result.localIssues).toEqual([
@@ -3535,6 +3654,56 @@ describe("SyncService", () => {
     await expect(remote.readHead()).resolves.toMatchObject({
       value: { commitId: initialHead.value.commitId },
     });
+  });
+
+  it("ignores a persisted rename after its Entry is already cached at the target", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write("notes/b.md", new TextEncoder().encode("tracked"));
+    const cache = new MemorySyncCache();
+    const service = new SyncService({
+      cache,
+      local,
+      remote,
+      replicaId: "desktop",
+    });
+    await service.initializeNew("vault-1");
+    const tracked = cache.state?.files["notes/b.md"];
+    if (!tracked) {
+      throw new Error("Expected cached Entry");
+    }
+    const rename = new Map([
+      [
+        "notes/b.md",
+        { entryId: tracked.entryId, toPath: "notes/c.md" },
+      ],
+    ]);
+    await local.move("notes/b.md", "notes/c.md");
+    await service.synchronize([], { pathRenames: rename });
+    await local.write("notes/b.md", new TextEncoder().encode("new file"));
+
+    const result = await service.synchronize([], { pathRenames: rename });
+
+    expect(result.status).toBe("complete");
+    const currentHead = await remote.readHead();
+    if (!currentHead) {
+      throw new Error("Expected current Head");
+    }
+    const current = await remote.readSnapshot(currentHead.value);
+    expect(current.entries[tracked.entryId]).toMatchObject({
+      entryId: tracked.entryId,
+      kind: "live",
+      path: "notes/c.md",
+    });
+    expect(Object.values(current.entries)).toContainEqual(
+      expect.objectContaining({ kind: "live", path: "notes/b.md" }),
+    );
   });
 
   it("does not assign one missing Entry identity to two identical new files", async () => {

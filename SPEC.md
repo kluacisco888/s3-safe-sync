@@ -9,7 +9,7 @@ The plugin does not run after Obsidian is closed, provide telemetry, synchronize
 ## User-visible behavior
 
 - Synchronize on startup, five seconds after local edits settle, every two foreground minutes for remote changes, and on explicit command. When Obsidian becomes hidden or begins unloading, request one best-effort final sync; the host may still terminate before network work completes, so the next startup scan remains the guarantee. An ordinary sync request received during an active synchronization is coalesced into a guaranteed follow-up run instead of being dropped; destructive confirmations are revalidated against a fresh plan.
-- Every automatic run lists the complete Sync Scope to discover creates, deletes, renames, sizes, and modification times, but reads and hashes content only for new files, changed metadata, and paths reported dirty by Obsidian. Manual **Sync now**, a missing cache, and the 24-hour full hash verification read every eligible file. Remote overwrite and deletion preconditions always hash the affected local content regardless of this optimization.
+- Every automatic run lists the complete Sync Scope to discover creates, deletes, renames, sizes, and modification times, but reads and hashes content only for new files, changed metadata, and paths reported dirty by Obsidian. Manual **Sync now**, a missing cache, and the 24-hour full hash verification read every eligible file. Repeated Head-CAS attempts reuse hashes verified by the first attempt while their size and modification time remain unchanged. An incomplete verification remains required across restart. Remote overwrite and deletion preconditions always hash the affected local content regardless of this optimization.
 - Permit per-device pause without losing local observations.
 - Show the current phase, file count, byte count, and current path during metadata checking, content hashing, uploading, and downloading in plugin settings and the desktop status bar without routine success popups.
 - Persist an action-required state for conflicts, corruption, unsafe bulk deletion, repair, or a local edit waiting behind a deferred remote Revision.
@@ -57,6 +57,7 @@ Sync Commits form an immutable parent-linked history. The accepted Head identifi
 10. Local materialization uses a no-overwrite copy and hash-checked local trash fallback. A path owned by another Entry, a move target that appears after planning, or a non-unique rename identity stops without replacing either file.
 11. A deferred Entry retains the last accepted local Revision as its reconciliation base. Raising a device limit downloads an unchanged stale copy, while edits made during deferral become action-required and later reconcile as a Conflict.
 12. A rename concurrent with an edit combines the renamed path and edited content when those changes are independent. Deletion wins over a rename that did not change content; rename plus content changes enters the Conflict Center.
+13. Host-observed renames retain the expected Entry ID until the serialized synchronization accepts the new path. Reusing the old path for a new file cannot transfer the renamed Entry's history to that file.
 
 ## Encryption
 
@@ -68,7 +69,7 @@ Paths, hashes, entry metadata, deletion records, conflicts, commits, snapshots, 
 
 - Bulk deletion over 100 entries or 20 percent of current entries requires confirmation bound to the exact Entry ID set; any changed deletion set requires a new confirmation.
 - Automatic sync, initialization, deferred downloads, imports, previews, and all restore or Conflict actions share one per-plugin serial operation queue so an older operation cannot overwrite a newer cache.
-- Dirty paths carry monotonic in-memory versions. A completed run acknowledges only the event versions it captured, so an edit that arrives during synchronization always remains queued for a follow-up run.
+- Dirty paths carry monotonic in-memory versions. A completed run acknowledges only the event versions it captured, so an edit that arrives during synchronization always remains queued for a follow-up run. Pending Path Renames and an incomplete Full Hash Verification are persisted across restart.
 - A missing, unauthenticated, or dangling Head enters read-only Repair Mode.
 - S3 capability probes verify conditional create/update, read, list, and delete before initialization.
 - S3 Versioning and a 30-day noncurrent-version lifecycle are an independent safety layer.
@@ -86,6 +87,7 @@ The user completes one final Remotely Save sync, reviews the desktop Vault, disa
 - Concurrent CAS writers converge after one receives `412 Precondition Failed`.
 - A one-file automatic edit reads and hashes only that file while still discovering deletions from a complete metadata listing; a manual or 24-hour verification hashes the full eligible Vault.
 - An unreported equal-size/equal-mtime edit blocks any remote overwrite through the final content-hash precondition and is retried as dirty.
+- A Head-CAS retry preserves a newly verified equal-metadata edit without rereading unchanged Vault content, and an old-path reuse cannot steal the renamed Entry identity.
 - Crash or cancellation before Head advancement leaves live state unchanged, and an uploaded Orphan Blob never becomes current.
 - Wrong password, corrupted ciphertext, mixed legacy data, Vault ID mismatch, and unsupported protocol version perform no writes.
 - Android and iOS pass encrypted 50 MB upload, download, interruption, and resume tests before leaving Beta.

@@ -1,20 +1,5 @@
 export type DirtyPathSnapshot = ReadonlyMap<string, number>;
 
-export const dirtyPathsForRename = (
-  cachedPaths: Iterable<string>,
-  oldPath: string,
-  newPath: string,
-): Set<string> => {
-  const paths = new Set([oldPath, newPath]);
-  for (const path of cachedPaths) {
-    if (path === oldPath || path.startsWith(`${oldPath}/`)) {
-      paths.add(path);
-      paths.add(`${newPath}${path.slice(oldPath.length)}`);
-    }
-  }
-  return paths;
-};
-
 export class DirtyPathTracker {
   private readonly versions = new Map<string, number>();
 
@@ -34,6 +19,20 @@ export class DirtyPathTracker {
 
   capture(): DirtyPathSnapshot {
     return new Map(this.versions);
+  }
+
+  changedPathSince(snapshot: DirtyPathSnapshot): string | undefined {
+    for (const [path, version] of this.versions) {
+      if (snapshot.get(path) !== version) {
+        return path;
+      }
+    }
+    for (const path of snapshot.keys()) {
+      if (!this.versions.has(path)) {
+        return path;
+      }
+    }
+    return undefined;
   }
 
   mark(path: string): void {

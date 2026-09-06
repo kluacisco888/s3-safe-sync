@@ -92,6 +92,10 @@ _Avoid_: Debug log, note history
 A device-local integrity pass that reads and hashes every eligible Vault file after cache loss, on manual request, or at least once every 24 hours. It is not shared history and does not contact S3 for file contents.
 _Avoid_: Sync Audit, remote verification
 
+**Pending Path Rename**:
+A device-local, persisted observation that a known Vault Entry moved from one path to another. It is retained until a serialized synchronization records the Entry at its new path, and carries the expected Entry identity so a newly created file at the old path cannot inherit its history.
+_Avoid_: Cache rewrite, path guess
+
 **Vault Key**:
 A randomly generated secret that encrypts one Vault's content and metadata independently from the user's password.
 _Avoid_: Password, S3 credential

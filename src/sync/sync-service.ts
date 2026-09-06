@@ -16,6 +16,7 @@ import {
   RemoteStore,
 } from "../storage/remote-store";
 import { LocalStateChangedError } from "./errors";
+import type { PersistedPathRename } from "./path-rename-tracker";
 import { sha256Content as sha256 } from "./content-hash";
 import { canonicalVaultPath } from "./canonical-path";
 
@@ -97,12 +98,20 @@ export interface SyncResult {
 export interface SyncScanOptions {
   forceHashPaths?: ReadonlySet<string>;
   fullHashVerification?: boolean;
+  retryHashMemo?: Map<string, VerifiedLocalFile>;
 }
 
-type HashedLocalFile = LocalFileInfo & { contentHash: string };
+export interface SynchronizeOptions extends SyncScanOptions {
+  assertLocalObservationCurrent?: () => void;
+  pathRenames?: ReadonlyMap<string, PersistedPathRename>;
+}
+
+export interface VerifiedLocalFile extends LocalFileInfo {
+  contentHash: string;
+}
 
 interface FileScanOptions extends SyncScanOptions {
-  hashHints?: ReadonlyMap<string, HashedLocalFile>;
+  hashHints?: ReadonlyMap<string, VerifiedLocalFile>;
 }
 
 export interface DeferredDownloadEntry {
@@ -827,7 +836,7 @@ export class SyncService {
 
   async synchronize(
     approvedBulkDeletionEntryIds: readonly string[] = [],
-    scanOptions: SyncScanOptions = { fullHashVerification: true },
+    syncOptions: SynchronizeOptions = { fullHashVerification: true },
   ): Promise<SyncResult> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
@@ -835,15 +844,32 @@ export class SyncService {
     }
     let remote = await this.options.remote.readSnapshot(versionedHead.value);
     const cached = await this.options.cache.load();
-    const scan = await this.scanFiles(cached, true, scanOptions);
+    const scan = await this.scanFiles(cached, true, syncOptions);
+    syncOptions.assertLocalObservationCurrent?.();
     const scanned = scan.files;
     const localPaths = new Set(scan.localPaths);
     const scannedByPath = new Map(
       scanned.map((file) => [file.path, file] as const),
     );
+    const applicablePathRenames = new Map(
+      [...(syncOptions.pathRenames ?? [])].filter(
+        ([fromPath, rename]) =>
+          cached?.files[fromPath]?.entryId === rename.entryId,
+      ),
+    );
+    const renamedSourcePaths = new Set(applicablePathRenames.keys());
+    const renameSourcesByTarget = new Map<string, string[]>();
+    for (const [fromPath, rename] of applicablePathRenames) {
+      const sources = renameSourcesByTarget.get(rename.toPath) ?? [];
+      sources.push(fromPath);
+      renameSourcesByTarget.set(rename.toPath, sources);
+    }
     const missingCachedByFingerprint = new Map<string, CachedFileState[]>();
     for (const cachedFile of Object.values(cached?.files ?? {})) {
-      if (localPaths.has(cachedFile.path)) {
+      if (
+        localPaths.has(cachedFile.path) &&
+        !renamedSourcePaths.has(cachedFile.path)
+      ) {
         continue;
       }
       const fingerprint = `${cachedFile.size}:${cachedFile.contentHash}`;
@@ -854,7 +880,10 @@ export class SyncService {
     const entryIdByPath = new Map<string, string>();
     const newFilesByFingerprint = new Map<string, LocalFileInfo[]>();
     for (const file of scanned) {
-      if (cached?.files[file.path]) {
+      if (
+        cached?.files[file.path] &&
+        !renamedSourcePaths.has(file.path)
+      ) {
         continue;
       }
       const fingerprint = `${file.size}:${file.contentHash}`;
@@ -863,6 +892,18 @@ export class SyncService {
       newFilesByFingerprint.set(fingerprint, claimants);
     }
     for (const file of scanned) {
+      const renameSources = renameSourcesByTarget.get(file.path);
+      const renamedFile =
+        renameSources?.length === 1 && renameSources[0]
+          ? cached?.files[renameSources[0]]
+          : undefined;
+      if (renamedFile) {
+        entryIdByPath.set(file.path, renamedFile.entryId);
+        continue;
+      }
+      if (renamedSourcePaths.has(file.path)) {
+        continue;
+      }
       const exact = cached?.files[file.path];
       if (exact) {
         entryIdByPath.set(file.path, exact.entryId);
@@ -1870,22 +1911,29 @@ export class SyncService {
     reportProgress = false,
     options: FileScanOptions = { fullHashVerification: true },
   ): Promise<{
-    files: HashedLocalFile[];
+    files: VerifiedLocalFile[];
     localPaths: string[];
     skippedTrackedEntryIds: string[];
     unsyncedLocalEntries: number;
     unsyncedLocalPaths: string[];
   }> {
-    const files: HashedLocalFile[] = [];
+    const files: VerifiedLocalFile[] = [];
     const skippedTrackedEntryIds: string[] = [];
     const unsyncedLocalPaths: string[] = [];
     let unsyncedLocalEntries = 0;
     const localFiles = await this.options.local.list();
     const reusableHash = (file: LocalFileInfo): string | undefined => {
+      if (options.fullHashVerification !== false) {
+        return undefined;
+      }
+      const retryHash = options.retryHashMemo?.get(file.path);
       if (
-        options.fullHashVerification !== false ||
-        options.forceHashPaths?.has(file.path)
+        retryHash?.modifiedAt === file.modifiedAt &&
+        retryHash.size === file.size
       ) {
+        return retryHash.contentHash;
+      }
+      if (options.forceHashPaths?.has(file.path)) {
         return undefined;
       }
       const hint = options.hashHints?.get(file.path);
@@ -1960,7 +2008,9 @@ export class SyncService {
       }
       const cachedContentHash = hashesByPath.get(file.path);
       if (cachedContentHash !== undefined) {
-        files.push({ ...file, contentHash: cachedContentHash });
+        const verifiedFile = { ...file, contentHash: cachedContentHash };
+        files.push(verifiedFile);
+        options.retryHashMemo?.set(file.path, verifiedFile);
         continue;
       }
       reportHashed(file);
@@ -1975,10 +2025,12 @@ export class SyncService {
         throw new LocalStateChangedError(file.path);
       }
       const contentHash = await sha256(content);
-      files.push({
+      const verifiedFile = {
         ...file,
         contentHash,
-      });
+      };
+      files.push(verifiedFile);
+      options.retryHashMemo?.set(file.path, verifiedFile);
       reportHashed(file, file.size);
     }
     return {
