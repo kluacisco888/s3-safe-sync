@@ -1,6 +1,7 @@
 import { App, Modal, Notice } from "obsidian";
 
 import type {
+  BulkDeletionPlan,
   ConflictedEntry,
   DeletedEntry,
   LiveEntry,
@@ -23,7 +24,7 @@ export interface StatusModalController {
   getDeletedRecoveries(): DeletedEntry[];
   getLocalIssues(): LocalSyncIssue[];
   getPendingBulkDeletion():
-    | { count: number; totalLiveEntries: number }
+    | BulkDeletionPlan
     | undefined;
   getStatusText(): string;
   importCandidate(path: string): Promise<void>;
