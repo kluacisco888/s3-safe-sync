@@ -406,6 +406,21 @@ export class SyncEngine {
           continue;
         }
       }
+      if (
+        baseEntry.kind === "deleted" &&
+        remoteEntry.kind === "live" &&
+        localFile &&
+        localFile.contentHash !== remoteEntry.revision.contentHash
+      ) {
+        conflicts.push({
+          entryId: remoteEntry.entryId,
+          kind: "edit-edit",
+          localFile,
+          path: remoteEntry.path,
+          remoteRevision: remoteEntry.revision,
+        });
+        continue;
+      }
       if (remoteEntry.kind === "live" && !isDeferred) {
         if (
           !localFile ||

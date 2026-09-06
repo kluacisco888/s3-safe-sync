@@ -968,6 +968,59 @@ describe("SyncService", () => {
     );
   });
 
+  it("does not overwrite the only good local copy when remote history is corrupted", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const desktopVault = new MemoryVault();
+    const phoneVault = new MemoryVault();
+    await desktopVault.write("notes/example.md", new TextEncoder().encode("v1"));
+    const desktop = new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: desktopRemote,
+      replicaId: "desktop",
+    });
+    const phone = new SyncService({
+      cache: new MemorySyncCache(),
+      local: phoneVault,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+    await desktop.initializeNew("vault-1");
+    await phone.synchronize();
+    const initialHead = await desktopRemote.readHead();
+    if (!initialHead) {
+      throw new Error("Expected initialized Head");
+    }
+    const initial = await desktopRemote.readSnapshot(initialHead.value);
+    const first = Object.values(initial.entries)[0];
+    if (first?.kind !== "live") {
+      throw new Error("Expected first live Revision");
+    }
+    await desktopVault.write("notes/example.md", new TextEncoder().encode("v2"));
+    await desktop.synchronize();
+    await objects.put(
+      `chosen-prefix/v1/blobs/${first.revision.blobId}`,
+      new TextEncoder().encode("corrupted ciphertext"),
+    );
+
+    await expect(phone.synchronize()).rejects.toThrow(
+      "No authenticated remote recovery exists",
+    );
+
+    expect(phoneVault.readText("notes/example.md")).toBe("v1");
+  });
+
   it("publishes a local edit as a new encrypted Revision", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
@@ -1723,6 +1776,49 @@ describe("SyncService", () => {
     expect(restored.revision.revisionId).not.toBe(oldRevisionId);
   });
 
+  it("does not restore history over the only good current local copy", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write("notes/example.md", new TextEncoder().encode("version one"));
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      remote,
+      replicaId: "desktop",
+    });
+    await service.initializeNew("vault-1");
+    await local.write("notes/example.md", new TextEncoder().encode("version two"));
+    await service.synchronize();
+    const currentHead = await remote.readHead();
+    if (!currentHead) {
+      throw new Error("Expected initialized Head");
+    }
+    const current = await remote.readSnapshot(currentHead.value);
+    const entry = Object.values(current.entries)[0];
+    if (entry?.kind !== "live" || !entry.history?.[0]) {
+      throw new Error("Expected Version History fixture");
+    }
+    await objects.put(
+      `chosen-prefix/v1/blobs/${entry.revision.blobId}`,
+      new TextEncoder().encode("corrupted ciphertext"),
+    );
+
+    await expect(
+      service.restoreRevision(entry.entryId, entry.history[0].revisionId),
+    ).rejects.toThrow("No authenticated remote recovery exists");
+
+    expect(local.readText("notes/example.md")).toBe("version two");
+    await expect(remote.readHead()).resolves.toMatchObject({
+      value: { commitId: currentHead.value.commitId },
+    });
+  });
+
   it("automatically merges non-overlapping Markdown edits", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
@@ -1960,6 +2056,82 @@ describe("SyncService", () => {
       kind: "live",
       path: "notes/example.md",
     });
+  });
+
+  it("preserves a new local draft when another Replica restores a deleted path", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const desktopVault = new MemoryVault();
+    const phoneVault = new MemoryVault();
+    await desktopVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("original"),
+    );
+    const desktop = new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: desktopRemote,
+      replicaId: "desktop",
+    });
+    const phone = new SyncService({
+      cache: new MemorySyncCache(),
+      local: phoneVault,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+    await desktop.initializeNew("vault-1");
+    await phone.synchronize();
+    const initialHead = await desktopRemote.readHead();
+    if (!initialHead) {
+      throw new Error("Expected initialized Head");
+    }
+    const initial = await desktopRemote.readSnapshot(initialHead.value);
+    const entryId = Object.values(initial.entries)[0]?.entryId;
+    if (!entryId) {
+      throw new Error("Expected initialized Entry");
+    }
+    await desktopVault.delete("notes/example.md");
+    await desktop.synchronize(await currentLiveEntryIds(desktopRemote));
+    await phone.synchronize();
+    await phoneVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("new phone draft"),
+    );
+
+    await desktop.restoreDeleted(entryId);
+    const result = await phone.synchronize();
+
+    expect(result.status).toBe("action-required");
+    expect(phoneVault.readText("notes/example.md")).toBe("new phone draft");
+    const conflictHead = await phoneRemote.readHead();
+    if (!conflictHead) {
+      throw new Error("Expected Conflict Head");
+    }
+    const conflictSnapshot = await phoneRemote.readSnapshot(conflictHead.value);
+    const conflicted = conflictSnapshot.entries[entryId];
+    if (conflicted?.kind !== "conflicted") {
+      throw new Error("Expected shared Conflict");
+    }
+    const candidateContents = await Promise.all(
+      conflicted.candidates.map(async (candidate) => {
+        const body = await phoneRemote.readBlob(candidate.blobId);
+        return body ? new TextDecoder().decode(body) : "missing";
+      }),
+    );
+    expect(candidateContents.sort()).toEqual([
+      "new phone draft",
+      "original",
+    ]);
   });
 
   it("propagates a rename while preserving one stable Entry identity", async () => {

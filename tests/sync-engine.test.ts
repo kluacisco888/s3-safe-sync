@@ -158,6 +158,72 @@ describe("SyncEngine", () => {
     ]);
   });
 
+  it("keeps a local draft as a Conflict when another Replica restores the path", () => {
+    const deleted: VaultSnapshot = {
+      commitId: "commit-deleted",
+      entries: {
+        "entry-1": {
+          deletedAt: "2026-09-02T00:00:00.000Z",
+          entryId: "entry-1",
+          kind: "deleted",
+          lastContentHash: "sha256:old",
+          lastRevisionId: "revision-1",
+          path: "notes/example.md",
+        },
+      },
+      protocolVersion: 1,
+      vaultId: "vault-1",
+    };
+    const restoredRevision = {
+      blobId: "blob-restored",
+      contentHash: "sha256:restored",
+      createdAt: "2026-09-03T00:00:00.000Z",
+      revisionId: "revision-restored",
+      size: 8,
+    };
+    const remote: VaultSnapshot = {
+      ...deleted,
+      commitId: "commit-restored",
+      entries: {
+        "entry-1": {
+          entryId: "entry-1",
+          kind: "live",
+          path: "notes/example.md",
+          revision: restoredRevision,
+        },
+      },
+    };
+    const local: ReplicaObservation = {
+      basedOnCommitId: deleted.commitId,
+      files: [
+        {
+          contentHash: "sha256:new-draft",
+          path: "notes/example.md",
+          size: 9,
+        },
+      ],
+      replicaId: "phone",
+    };
+
+    const plan = new SyncEngine().reconcile({
+      base: deleted,
+      local,
+      remote,
+    });
+
+    expect(plan.localActions).toEqual([]);
+    expect(plan.remoteChanges).toEqual([]);
+    expect(plan.conflicts).toEqual([
+      {
+        entryId: "entry-1",
+        kind: "edit-edit",
+        localFile: local.files[0],
+        path: "notes/example.md",
+        remoteRevision: restoredRevision,
+      },
+    ]);
+  });
+
   it("records a local deletion instead of downloading the remote Revision", () => {
     const base = liveSnapshot();
     const local: ReplicaObservation = {

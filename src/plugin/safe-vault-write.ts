@@ -11,6 +11,7 @@ export interface SafeWriteAdapter {
   remove(path: string): Promise<void>;
   rename(fromPath: string, toPath: string): Promise<void>;
   stat(path: string): Promise<{ type: string } | null>;
+  trashLocal(path: string): Promise<void>;
   write(path: string, body: string): Promise<void>;
   writeBinary(path: string, body: ArrayBuffer): Promise<void>;
 }
@@ -105,6 +106,22 @@ const removeFileIfPresent = async (
   await adapter.remove(path);
 };
 
+const trashFileIfPresent = async (
+  adapter: SafeWriteAdapter,
+  path: string,
+): Promise<void> => {
+  if (!(await adapter.exists(path))) {
+    return;
+  }
+  if ((await adapter.stat(path))?.type !== "file") {
+    throw new Error(`Refusing to trash a non-file staging path: ${path}`);
+  }
+  await adapter.trashLocal(path);
+  if (await adapter.exists(path)) {
+    throw new Error(`Local trash failed; preserving staged backup: ${path}`);
+  }
+};
+
 const recoverJournal = async (
   adapter: SafeWriteAdapter,
   journal: WriteJournal,
@@ -114,7 +131,16 @@ const recoverJournal = async (
   const targetHash = await readHash(adapter, journal.targetPath);
   if (backupExists) {
     if (targetHash === journal.expectedHash) {
-      await removeFileIfPresent(adapter, journal.backupPath);
+      const backupHash = await readHash(adapter, journal.backupPath);
+      if (
+        journal.originalHash === undefined ||
+        backupHash !== journal.originalHash
+      ) {
+        throw new Error(
+          `Staged backup needs review for ${journal.targetPath}; preserving ${journal.journalPath} and ${journal.backupPath}`,
+        );
+      }
+      await trashFileIfPresent(adapter, journal.backupPath);
     } else if (targetHash === undefined) {
       await adapter.rename(journal.backupPath, journal.targetPath);
     } else {
@@ -231,8 +257,7 @@ export const safeReplaceVaultFile = async (
       if ((await readHash(adapter, targetPath)) !== journal.expectedHash) {
         throw new Error(`Promoted file failed verification: ${targetPath}`);
       }
-      await removeFileIfPresent(adapter, journal.backupPath);
-      await removeFileIfPresent(adapter, journal.journalPath);
+      await recoverJournal(adapter, journal);
     } catch (error) {
       await recoverJournal(
         adapter,

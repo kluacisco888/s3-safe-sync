@@ -21,8 +21,10 @@ const hash = async (body: Uint8Array): Promise<string> => {
 class MemorySafeWriteAdapter implements SafeWriteAdapter {
   readonly directories = new Set<string>([STAGING]);
   readonly files = new Map<string, Uint8Array>();
+  readonly trashed: Uint8Array[] = [];
   failPromotion = false;
   beforeRename: ((fromPath: string, toPath: string) => void) | undefined;
+  onReadBinary: ((path: string) => void) | undefined;
   onWriteBinary: ((path: string) => Promise<void> | void) | undefined;
 
   exists(path: string): Promise<boolean> {
@@ -56,7 +58,9 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
     if (!body) {
       throw new Error(`Missing ${path}`);
     }
-    return Promise.resolve(body.slice().buffer);
+    const copy = body.slice().buffer;
+    this.onReadBinary?.(path);
+    return Promise.resolve(copy);
   }
 
   remove(path: string): Promise<void> {
@@ -89,6 +93,15 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
     return Promise.resolve(null);
   }
 
+  trashLocal(path: string): Promise<void> {
+    const body = this.files.get(path);
+    if (body) {
+      this.trashed.push(body.slice());
+      this.files.delete(path);
+    }
+    return Promise.resolve();
+  }
+
   write(path: string, body: string): Promise<void> {
     this.files.set(path, bytes(body));
     return Promise.resolve();
@@ -116,6 +129,9 @@ describe("safeReplaceVaultFile", () => {
     expect(new TextDecoder().decode(adapter.files.get("notes/example.md"))).toBe(
       "after",
     );
+    expect(adapter.trashed.map((body) => new TextDecoder().decode(body))).toEqual([
+      "before",
+    ]);
     expect([...adapter.files.keys()].filter((path) => path.startsWith(STAGING))).toEqual(
       [],
     );
@@ -156,6 +172,7 @@ describe("safeReplaceVaultFile", () => {
           expectedHash: await hash(bytes("after")),
           hadOriginal: true,
           journalPath,
+          originalHash: await hash(bytes("before")),
           targetPath: "notes/example.md",
           temporaryPath,
         }),
@@ -185,6 +202,7 @@ describe("safeReplaceVaultFile", () => {
           expectedHash: await hash(bytes("after")),
           hadOriginal: true,
           journalPath,
+          originalHash: await hash(bytes("before")),
           targetPath: "notes/example.md",
           temporaryPath,
         }),
@@ -197,6 +215,9 @@ describe("safeReplaceVaultFile", () => {
       "after",
     );
     expect(adapter.files.has(backupPath)).toBe(false);
+    expect(adapter.trashed.map((body) => new TextDecoder().decode(body))).toEqual([
+      "before",
+    ]);
   });
 
   it("refuses to replace content that changed after planning", async () => {
@@ -270,6 +291,36 @@ describe("safeReplaceVaultFile", () => {
     expect([...adapter.files.keys()].filter((path) => path.startsWith(STAGING))).toEqual(
       [],
     );
+  });
+
+  it("preserves a backup that changes after its first verification", async () => {
+    const adapter = new MemorySafeWriteAdapter();
+    adapter.files.set("notes/example.md", bytes("before"));
+    let backupReads = 0;
+    adapter.onReadBinary = (path) => {
+      if (path.endsWith("write-1.backup") && ++backupReads === 1) {
+        adapter.files.set(path, bytes("late local edit"));
+      }
+    };
+
+    await expect(
+      safeReplaceVaultFile(
+        adapter,
+        "notes/example.md",
+        bytes("remote"),
+        await hash(bytes("before")),
+        () => "write-1",
+      ),
+    ).rejects.toThrow("Staged backup needs review");
+
+    expect(new TextDecoder().decode(adapter.files.get("notes/example.md"))).toBe(
+      "remote",
+    );
+    expect(
+      new TextDecoder().decode(adapter.files.get(`${STAGING}/write-1.backup`)),
+    ).toBe("late local edit");
+    expect(adapter.files.has(`${STAGING}/write-1.json`)).toBe(true);
+    expect(adapter.trashed).toEqual([]);
   });
 
   it("preserves a user-edited target and its original backup during recovery", async () => {

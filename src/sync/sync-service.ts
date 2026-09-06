@@ -330,6 +330,11 @@ export class SyncService {
     const cached = await this.options.cache.load();
     const expectedContentHash = cached?.files[entry.path]?.contentHash ?? null;
     await this.assertLocalContent(entry.path, expectedContentHash);
+    await this.assertRemoteRecoveryForLocalContent(
+      snapshot,
+      entry.entryId,
+      expectedContentHash,
+    );
     const plaintext = await this.options.remote.readBlob(entry.revision.blobId);
     if (
       !plaintext ||
@@ -436,6 +441,11 @@ export class SyncService {
     if (conflicted?.kind !== "conflicted") {
       throw new Error(`Entry ${entryId} is not conflicted`);
     }
+    await this.assertRemoteEntriesBeforePublication(
+      snapshot,
+      new Set([entryId]),
+      [],
+    );
     const expectedMaterializedContentHash =
       conflicted.materializedContentHash ?? null;
     await this.assertLocalContent(
@@ -565,6 +575,11 @@ export class SyncService {
       throw new Error(`Historical Revision ${revisionId} does not exist`);
     }
     await this.assertLocalContent(entry.path, entry.revision.contentHash);
+    await this.assertRemoteRecoveryForLocalContent(
+      snapshot,
+      entry.entryId,
+      entry.revision.contentHash,
+    );
     const plaintext = await this.options.remote.readBlob(historical.blobId);
     if (
       !plaintext ||
@@ -675,6 +690,11 @@ export class SyncService {
     if (!selected) {
       throw new Error(`Deleted Revision ${revisionId ?? entryId} does not exist`);
     }
+    await this.assertRemoteEntriesBeforePublication(
+      snapshot,
+      new Set([entryId]),
+      [],
+    );
     const plaintext = await this.readDeletedRevisionCopy(
       deleted.entryId,
       selected,
@@ -1064,6 +1084,11 @@ export class SyncService {
         }
         const expectedContentHash =
           expectedLocalContentByPath.get(action.path) ?? null;
+        await this.assertRemoteRecoveryForLocalContent(
+          remote,
+          action.entryId,
+          expectedContentHash,
+        );
         await this.assertLocalContent(action.path, expectedContentHash);
         await this.options.local.write(
           action.path,
@@ -1256,21 +1281,28 @@ export class SyncService {
           unresolvedConflicts += 1;
         } else {
           const baseEntry = cached?.snapshot.entries[conflict.entryId];
-          if (remoteEntry?.kind !== "live" || baseEntry?.kind !== "live") {
-            throw new Error(`Expected live Entry ${conflict.entryId}`);
+          if (
+            remoteEntry?.kind !== "live" ||
+            (baseEntry?.kind !== "live" && baseEntry?.kind !== "deleted")
+          ) {
+            throw new Error(`Expected live or restored Entry ${conflict.entryId}`);
           }
-          const baseContent = await this.options.remote.readBlob(
-            baseEntry.revision.blobId,
-          );
+          const baseContent =
+            baseEntry.kind === "live"
+              ? await this.options.remote.readBlob(baseEntry.revision.blobId)
+              : undefined;
           const remoteContent = await this.options.remote.readBlob(
             remoteEntry.revision.blobId,
           );
-          if (!baseContent || !remoteContent) {
+          if ((baseEntry.kind === "live" && !baseContent) || !remoteContent) {
             throw new Error(`Conflict history is incomplete for ${conflict.path}`);
           }
           if (
-            baseContent.byteLength !== baseEntry.revision.size ||
-            (await sha256(baseContent)) !== baseEntry.revision.contentHash ||
+            (baseEntry.kind === "live" &&
+              (!baseContent ||
+                baseContent.byteLength !== baseEntry.revision.size ||
+                (await sha256(baseContent)) !==
+                  baseEntry.revision.contentHash)) ||
             remoteContent.byteLength !== remoteEntry.revision.size ||
             (await sha256(remoteContent)) !== remoteEntry.revision.contentHash
           ) {
@@ -1278,6 +1310,7 @@ export class SyncService {
           }
           let merged: Uint8Array | undefined;
           if (
+            baseContent &&
             conflict.path.toLowerCase().endsWith(".md") &&
             plaintext.byteLength <= 5 * 1024 * 1024 &&
             remoteContent.byteLength <= 5 * 1024 * 1024
@@ -1314,20 +1347,25 @@ export class SyncService {
               path: conflict.path,
             });
           } else {
+            const keepLocalMaterialized = baseEntry.kind === "deleted";
             changedEntry = {
               candidates: [remoteEntry.revision, localRevision],
               entryId: conflict.entryId,
               history: remoteEntry.history,
               kind: "conflicted",
-              materializedContentHash: remoteEntry.revision.contentHash,
+              materializedContentHash: keepLocalMaterialized
+                ? localRevision.contentHash
+                : remoteEntry.revision.contentHash,
               path: conflict.path,
               reason: "edit-edit",
             };
-            writeAfterCommit.push({
-              body: remoteContent,
-              expectedContentHash: conflict.localFile.contentHash,
-              path: conflict.path,
-            });
+            if (!keepLocalMaterialized) {
+              writeAfterCommit.push({
+                body: remoteContent,
+                expectedContentHash: conflict.localFile.contentHash,
+                path: conflict.path,
+              });
+            }
             unresolvedConflicts += 1;
           }
         }
@@ -1527,23 +1565,58 @@ export class SyncService {
       }
     }
     for (const revision of revisions.values()) {
-      let plaintext: Uint8Array | undefined;
+      await this.assertRemoteRevision(revision);
+    }
+  }
+
+  private async assertRemoteRecoveryForLocalContent(
+    snapshot: VaultSnapshot,
+    entryId: string,
+    expectedContentHash: string | null,
+  ): Promise<void> {
+    if (expectedContentHash === null) {
+      return;
+    }
+    const entry = snapshot.entries[entryId];
+    if (!entry) {
+      throw new Error(`Entry ${entryId} has no remote recovery for local content`);
+    }
+    const revisions: RevisionRef[] = [
+      ...(entry.kind === "live" ? [entry.revision] : []),
+      ...(entry.kind === "conflicted" ? entry.candidates : []),
+      ...(entry.kind !== "live" && entry.recovery ? [entry.recovery] : []),
+      ...(entry.history ?? []),
+    ].filter((revision) => revision.contentHash === expectedContentHash);
+    for (const revision of revisions) {
       try {
-        plaintext = await this.options.remote.readBlob(revision.blobId);
+        await this.assertRemoteRevision(revision);
+        return;
       } catch {
-        throw new Error(
-          `Remote Revision ${revision.revisionId} cannot be authenticated`,
-        );
+        // Another retained copy with the same plaintext hash may still be valid.
       }
-      if (
-        !plaintext ||
-        plaintext.byteLength !== revision.size ||
-        (await sha256(plaintext)) !== revision.contentHash
-      ) {
-        throw new Error(
-          `Remote Revision ${revision.revisionId} failed content verification`,
-        );
-      }
+    }
+    throw new Error(
+      `No authenticated remote recovery exists for local content of Entry ${entryId}`,
+    );
+  }
+
+  private async assertRemoteRevision(revision: RevisionRef): Promise<void> {
+    let plaintext: Uint8Array | undefined;
+    try {
+      plaintext = await this.options.remote.readBlob(revision.blobId);
+    } catch {
+      throw new Error(
+        `Remote Revision ${revision.revisionId} cannot be authenticated`,
+      );
+    }
+    if (
+      !plaintext ||
+      plaintext.byteLength !== revision.size ||
+      (await sha256(plaintext)) !== revision.contentHash
+    ) {
+      throw new Error(
+        `Remote Revision ${revision.revisionId} failed content verification`,
+      );
     }
   }
 
