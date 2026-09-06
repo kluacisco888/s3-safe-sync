@@ -1,6 +1,7 @@
 import { normalizePath, Platform, TFile, type Vault } from "obsidian";
 
 import type { LocalFileInfo, LocalVaultPort } from "../sync/sync-service";
+import { LocalStateChangedError } from "../sync/errors";
 import { deleteVaultPath } from "./vault-delete";
 import {
   recoverPendingVaultWrites,
@@ -33,6 +34,14 @@ export const isInSyncScope = (path: string): boolean => {
 };
 
 const ANDROID_UNSUPPORTED_PATH_CHARACTERS = /[*"<>:|?]/u;
+
+const sha256 = async (body: ArrayBuffer): Promise<string> => {
+  const digest = await crypto.subtle.digest("SHA-256", body);
+  const hex = Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  return `sha256:${hex}`;
+};
 
 export class ObsidianVaultPort implements LocalVaultPort {
   private recovery: Promise<void> | undefined;
@@ -67,21 +76,59 @@ export class ObsidianVaultPort implements LocalVaultPort {
       .sort((left, right) => left.path.localeCompare(right.path));
   }
 
-  async move(fromPath: string, toPath: string): Promise<void> {
+  async move(
+    fromPath: string,
+    toPath: string,
+    expectedSourceHash?: string,
+    expectedTargetHash?: string | null,
+  ): Promise<void> {
     await this.ensureRecovered();
     await withVaultMutationLock(this.vault.adapter, async () => {
-      const file = this.vault.getAbstractFileByPath(normalizePath(fromPath));
+      const normalizedSource = normalizePath(fromPath);
+      const file = this.vault.getAbstractFileByPath(normalizedSource);
       if (!(file instanceof TFile)) {
         throw new Error(`Local Vault path does not exist: ${fromPath}`);
       }
       const normalizedTarget = normalizePath(toPath);
+      if (
+        expectedSourceHash !== undefined &&
+        (await this.readAdapterHash(normalizedSource)) !== expectedSourceHash
+      ) {
+        throw new LocalStateChangedError(fromPath);
+      }
+      const targetHash = await this.readAdapterHash(normalizedTarget);
+      if (
+        (expectedTargetHash === null && targetHash !== undefined) ||
+        (typeof expectedTargetHash === "string" &&
+          targetHash !== expectedTargetHash)
+      ) {
+        throw new LocalStateChangedError(toPath);
+      }
       const parent = normalizedTarget.includes("/")
         ? normalizedTarget.slice(0, normalizedTarget.lastIndexOf("/"))
         : "";
       if (parent) {
         await this.ensureFolder(parent);
       }
-      await this.vault.rename(file, normalizedTarget);
+      try {
+        await this.vault.adapter.copy(normalizedSource, normalizedTarget);
+      } catch (error) {
+        if (await this.vault.adapter.exists(normalizedTarget)) {
+          throw new LocalStateChangedError(toPath);
+        }
+        throw error;
+      }
+      const copiedHash = await this.readAdapterHash(normalizedTarget);
+      const sourceHash = expectedSourceHash ?? (await this.readAdapterHash(normalizedSource));
+      if (!sourceHash || copiedHash !== sourceHash) {
+        throw new Error(`Copied local file failed verification: ${toPath}`);
+      }
+      await deleteVaultPath(
+        this.vault,
+        normalizedSource,
+        (candidate) => candidate instanceof TFile,
+        sourceHash,
+      );
     });
   }
 
@@ -137,6 +184,16 @@ export class ObsidianVaultPort implements LocalVaultPort {
   private ensureRecovered(): Promise<void> {
     this.recovery ??= recoverPendingVaultWrites(this.vault.adapter);
     return this.recovery;
+  }
+
+  private async readAdapterHash(path: string): Promise<string | undefined> {
+    if (!(await this.vault.adapter.exists(path))) {
+      return undefined;
+    }
+    if ((await this.vault.adapter.stat(path))?.type !== "file") {
+      throw new Error(`Expected local file path: ${path}`);
+    }
+    return sha256(await this.vault.adapter.readBinary(path));
   }
 
   private async ensureFolder(path: string): Promise<void> {

@@ -790,6 +790,49 @@ describe("SyncEngine", () => {
     ]);
   });
 
+  it("blocks a remote rename whose target is occupied by another local file", () => {
+    const base = liveSnapshot();
+    const baseEntry = base.entries["entry-1"];
+    if (baseEntry?.kind !== "live") {
+      throw new Error("Expected live fixture");
+    }
+    const remote: VaultSnapshot = {
+      ...base,
+      commitId: "commit-2",
+      entries: {
+        "entry-1": { ...baseEntry, path: "notes/occupied.md" },
+      },
+    };
+    const local: ReplicaObservation = {
+      basedOnCommitId: base.commitId,
+      files: [
+        {
+          contentHash: baseEntry.revision.contentHash,
+          entryId: baseEntry.entryId,
+          path: baseEntry.path,
+          size: baseEntry.revision.size,
+        },
+        {
+          contentHash: "sha256:local-draft",
+          path: "notes/occupied.md",
+          size: 11,
+        },
+      ],
+      replicaId: "phone",
+    };
+
+    const plan = new SyncEngine().reconcile({ base, local, remote });
+
+    expect(plan.localActions).toEqual([]);
+    expect(plan.remoteChanges).toEqual([]);
+    expect(plan.conflicts).toEqual([
+      {
+        kind: "path-collision",
+        paths: ["notes/occupied.md"],
+      },
+    ]);
+  });
+
   it("moves then downloads when an Entry was renamed and edited remotely", () => {
     const base = liveSnapshot();
     const baseEntry = base.entries["entry-1"];

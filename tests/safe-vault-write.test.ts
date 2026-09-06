@@ -23,12 +23,30 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
   readonly files = new Map<string, Uint8Array>();
   readonly trashed: Uint8Array[] = [];
   failPromotion = false;
+  beforeCopy: ((fromPath: string, toPath: string) => void) | undefined;
   beforeRename: ((fromPath: string, toPath: string) => void) | undefined;
   onReadBinary: ((path: string) => void) | undefined;
   onWriteBinary: ((path: string) => Promise<void> | void) | undefined;
 
   exists(path: string): Promise<boolean> {
     return Promise.resolve(this.files.has(path) || this.directories.has(path));
+  }
+
+  copy(fromPath: string, toPath: string): Promise<void> {
+    this.beforeCopy?.(fromPath, toPath);
+    if (this.failPromotion && fromPath.endsWith(".new")) {
+      this.failPromotion = false;
+      throw new Error("Promotion interrupted");
+    }
+    if (this.files.has(toPath)) {
+      throw new Error(`Destination already exists: ${toPath}`);
+    }
+    const body = this.files.get(fromPath);
+    if (!body) {
+      throw new Error(`Missing ${fromPath}`);
+    }
+    this.files.set(toPath, body.slice());
+    return Promise.resolve();
   }
 
   list(path: string): Promise<{ files: string[]; folders: string[] }> {
@@ -70,10 +88,6 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
 
   rename(fromPath: string, toPath: string): Promise<void> {
     this.beforeRename?.(fromPath, toPath);
-    if (this.failPromotion && fromPath.endsWith(".new")) {
-      this.failPromotion = false;
-      throw new Error("Promotion interrupted");
-    }
     const body = this.files.get(fromPath);
     if (!body) {
       throw new Error(`Missing ${fromPath}`);
@@ -187,6 +201,40 @@ describe("safeReplaceVaultFile", () => {
     expect(adapter.files.has(journalPath)).toBe(false);
   });
 
+  it("does not restore or discard a damaged backup when the target is missing", async () => {
+    const adapter = new MemorySafeWriteAdapter();
+    const journalPath = `${STAGING}/write-1.json`;
+    const backupPath = `${STAGING}/write-1.backup`;
+    const temporaryPath = `${STAGING}/write-1.new`;
+    adapter.files.set(backupPath, bytes("damaged backup"));
+    adapter.files.set(temporaryPath, bytes("remote"));
+    adapter.files.set(
+      journalPath,
+      bytes(
+        JSON.stringify({
+          backupPath,
+          expectedHash: await hash(bytes("remote")),
+          hadOriginal: true,
+          journalPath,
+          originalHash: await hash(bytes("before")),
+          targetPath: "notes/example.md",
+          temporaryPath,
+        }),
+      ),
+    );
+
+    await expect(recoverPendingVaultWrites(adapter)).rejects.toThrow(
+      "Staged backup needs review",
+    );
+
+    expect(adapter.files.has("notes/example.md")).toBe(false);
+    expect(new TextDecoder().decode(adapter.files.get(backupPath))).toBe(
+      "damaged backup",
+    );
+    expect(adapter.files.has(temporaryPath)).toBe(true);
+    expect(adapter.files.has(journalPath)).toBe(true);
+  });
+
   it("keeps a verified promoted target when a backup remains", async () => {
     const adapter = new MemorySafeWriteAdapter();
     const journalPath = `${STAGING}/write-1.json`;
@@ -283,14 +331,44 @@ describe("safeReplaceVaultFile", () => {
         await hash(bytes("before")),
         () => "write-1",
       ),
-    ).rejects.toThrow("Local file changed during synchronization");
+    ).rejects.toThrow("Staged backup needs review");
 
     expect(new TextDecoder().decode(adapter.files.get("notes/example.md"))).toBe(
       "new local edit",
     );
-    expect([...adapter.files.keys()].filter((path) => path.startsWith(STAGING))).toEqual(
-      [],
+    expect(adapter.files.has(`${STAGING}/write-1.json`)).toBe(true);
+    expect(adapter.files.has(`${STAGING}/write-1.new`)).toBe(true);
+  });
+
+  it("never overwrites a target recreated in the final promotion window", async () => {
+    const adapter = new MemorySafeWriteAdapter();
+    adapter.files.set("notes/example.md", bytes("before"));
+    adapter.beforeCopy = (fromPath, toPath) => {
+      if (fromPath.endsWith("write-1.new")) {
+        adapter.files.set(toPath, bytes("last-moment local edit"));
+      }
+    };
+
+    await expect(
+      safeReplaceVaultFile(
+        adapter,
+        "notes/example.md",
+        bytes("remote"),
+        await hash(bytes("before")),
+        () => "write-1",
+      ),
+    ).rejects.toThrow("Staged write needs review");
+
+    expect(new TextDecoder().decode(adapter.files.get("notes/example.md"))).toBe(
+      "last-moment local edit",
     );
+    expect(
+      new TextDecoder().decode(adapter.files.get(`${STAGING}/write-1.backup`)),
+    ).toBe("before");
+    expect(
+      new TextDecoder().decode(adapter.files.get(`${STAGING}/write-1.new`)),
+    ).toBe("remote");
+    expect(adapter.files.has(`${STAGING}/write-1.json`)).toBe(true);
   });
 
   it("preserves a backup that changes after its first verification", async () => {

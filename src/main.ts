@@ -268,16 +268,9 @@ export default class S3VaultSyncPlugin
 
   async importCandidate(path: string): Promise<void> {
     try {
-      const vaultKey = this.credentials.loadVaultKey();
-      if (!vaultKey) {
-        throw new Error("Unlock the encrypted Vault first");
-      }
-      const remote = await RemoteStore.open({
-        objects: this.createObjectStore(),
-        prefix: this.data.settings.prefix,
-        vaultKey,
-      });
-      await this.createSyncService(remote).importCandidate(path);
+      await this.runExclusiveSyncService((service) =>
+        service.importCandidate(path),
+      );
       this.pendingLocalIssues = this.pendingLocalIssues.filter(
         (issue) => issue.kind !== "import-candidate" || issue.path !== path,
       );
@@ -289,16 +282,9 @@ export default class S3VaultSyncPlugin
 
   async downloadDeferred(entryId: string): Promise<void> {
     try {
-      const vaultKey = this.credentials.loadVaultKey();
-      if (!vaultKey) {
-        throw new Error("Unlock the encrypted Vault first");
-      }
-      const remote = await RemoteStore.open({
-        objects: this.createObjectStore(),
-        prefix: this.data.settings.prefix,
-        vaultKey,
-      });
-      await this.createSyncService(remote).downloadDeferred(entryId);
+      await this.runExclusiveSyncService((service) =>
+        service.downloadDeferred(entryId),
+      );
       this.pendingDeferredDownloads = this.pendingDeferredDownloads.filter(
         (entry) => entry.entryId !== entryId,
       );
@@ -317,16 +303,9 @@ export default class S3VaultSyncPlugin
 
   async restoreRevision(entryId: string, revisionId: string): Promise<void> {
     try {
-      const vaultKey = this.credentials.loadVaultKey();
-      if (!vaultKey) {
-        throw new Error("Unlock the encrypted Vault first");
-      }
-      const remote = await RemoteStore.open({
-        objects: this.createObjectStore(),
-        prefix: this.data.settings.prefix,
-        vaultKey,
-      });
-      await this.createSyncService(remote).restoreRevision(entryId, revisionId);
+      await this.runExclusiveSyncService((service) =>
+        service.restoreRevision(entryId, revisionId),
+      );
       this.setStatus("Idle", "Historical Revision restored.");
     } catch (error) {
       this.showError(error);
@@ -337,33 +316,16 @@ export default class S3VaultSyncPlugin
     entryId: string,
     revisionId?: string,
   ): Promise<Uint8Array> {
-    const vaultKey = this.credentials.loadVaultKey();
-    if (!vaultKey) {
-      throw new Error("Unlock the encrypted Vault first");
-    }
-    const remote = await RemoteStore.open({
-      objects: this.createObjectStore(),
-      prefix: this.data.settings.prefix,
-      vaultKey,
-    });
-    return this.createSyncService(remote).readDeletedRecovery(
-      entryId,
-      revisionId,
+    return this.runExclusiveSyncService((service) =>
+      service.readDeletedRecovery(entryId, revisionId),
     );
   }
 
   async restoreDeleted(entryId: string, revisionId?: string): Promise<void> {
     try {
-      const vaultKey = this.credentials.loadVaultKey();
-      if (!vaultKey) {
-        throw new Error("Unlock the encrypted Vault first");
-      }
-      const remote = await RemoteStore.open({
-        objects: this.createObjectStore(),
-        prefix: this.data.settings.prefix,
-        vaultKey,
-      });
-      await this.createSyncService(remote).restoreDeleted(entryId, revisionId);
+      await this.runExclusiveSyncService((service) =>
+        service.restoreDeleted(entryId, revisionId),
+      );
       this.setStatus("Idle", "Deleted file restored as a new Revision.");
     } catch (error) {
       this.showError(error);
@@ -371,6 +333,12 @@ export default class S3VaultSyncPlugin
   }
 
   async initializeOrUnlock(password: string): Promise<void> {
+    return this.syncRequests.runExclusive(() =>
+      this.initializeOrUnlockExclusive(password),
+    );
+  }
+
+  private async initializeOrUnlockExclusive(password: string): Promise<void> {
     try {
       if (!password) {
         throw new Error("Enter the Vault password first");
@@ -541,6 +509,23 @@ export default class S3VaultSyncPlugin
     });
   }
 
+  private runExclusiveSyncService<T>(
+    operation: (service: SyncService) => Promise<T>,
+  ): Promise<T> {
+    return this.syncRequests.runExclusive(async () => {
+      const vaultKey = this.credentials.loadVaultKey();
+      if (!vaultKey) {
+        throw new Error("Unlock the encrypted Vault first");
+      }
+      const remote = await RemoteStore.open({
+        objects: this.createObjectStore(),
+        prefix: this.data.settings.prefix,
+        vaultKey,
+      });
+      return operation(this.createSyncService(remote));
+    });
+  }
+
   private async loadPluginData(): Promise<void> {
     const stored = (await this.loadData()) as Partial<PersistedPluginData> | null;
     this.data = {
@@ -663,16 +648,9 @@ export default class S3VaultSyncPlugin
       | { kind: "restore-candidate"; revisionId: string },
   ): Promise<void> {
     try {
-      const vaultKey = this.credentials.loadVaultKey();
-      if (!vaultKey) {
-        throw new Error("Unlock the encrypted Vault first");
-      }
-      const remote = await RemoteStore.open({
-        objects: this.createObjectStore(),
-        prefix: this.data.settings.prefix,
-        vaultKey,
-      });
-      await this.createSyncService(remote).resolveConflict(entryId, resolution);
+      await this.runExclusiveSyncService((service) =>
+        service.resolveConflict(entryId, resolution),
+      );
       this.setStatus("Idle", "Conflict resolved and shared with every device.");
     } catch (error) {
       this.showError(error);

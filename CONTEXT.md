@@ -81,7 +81,7 @@ One immutable encrypted content version of a Vault Entry; superseded Revisions r
 _Avoid_: Backup, copy
 
 **Sync Cache**:
-Rebuildable device-local state that accelerates synchronization but never determines whether a deletion remains valid.
+Rebuildable device-local state that accelerates synchronization but never determines whether a deletion remains valid. For an unmaterialized deferred Entry it retains the last accepted local Revision as the three-way merge base, separately from current local bytes.
 _Avoid_: Source of truth, deletion history
 
 **Sync Audit**:

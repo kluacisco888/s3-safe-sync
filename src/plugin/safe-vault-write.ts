@@ -3,6 +3,7 @@ import { LocalStateChangedError } from "../sync/errors";
 const STAGING_DIRECTORY = ".obsidian/plugins/s3-vault-sync/staging";
 
 export interface SafeWriteAdapter {
+  copy(fromPath: string, toPath: string): Promise<void>;
   exists(path: string): Promise<boolean>;
   list(path: string): Promise<{ files: string[]; folders: string[] }>;
   mkdir(path: string): Promise<void>;
@@ -136,12 +137,27 @@ const recoverJournal = async (
         journal.originalHash === undefined ||
         backupHash !== journal.originalHash
       ) {
+        if (allowUnknownTarget) {
+          await adapter.rename(journal.backupPath, journal.targetPath);
+        }
         throw new Error(
-          `Staged backup needs review for ${journal.targetPath}; preserving ${journal.journalPath} and ${journal.backupPath}`,
+          `Staged backup needs review for ${journal.targetPath}; preserving ${journal.journalPath} and staged content`,
         );
       }
       await trashFileIfPresent(adapter, journal.backupPath);
     } else if (targetHash === undefined) {
+      const backupHash = await readHash(adapter, journal.backupPath);
+      if (
+        journal.originalHash === undefined ||
+        backupHash !== journal.originalHash
+      ) {
+        if (allowUnknownTarget) {
+          await adapter.rename(journal.backupPath, journal.targetPath);
+        }
+        throw new Error(
+          `Staged backup needs review for ${journal.targetPath}; preserving ${journal.journalPath} and staged content`,
+        );
+      }
       await adapter.rename(journal.backupPath, journal.targetPath);
     } else {
       throw new Error(
@@ -253,7 +269,7 @@ export const safeReplaceVaultFile = async (
       if ((await readHash(adapter, targetPath)) !== undefined) {
         throw new LocalStateChangedError(targetPath);
       }
-      await adapter.rename(journal.temporaryPath, targetPath);
+      await adapter.copy(journal.temporaryPath, targetPath);
       if ((await readHash(adapter, targetPath)) !== journal.expectedHash) {
         throw new Error(`Promoted file failed verification: ${targetPath}`);
       }

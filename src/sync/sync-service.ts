@@ -4,6 +4,7 @@ import {
   SyncEngine,
   type BulkDeletionPlan,
   type DeletedEntry,
+  type LiveEntry,
   type ReplicaObservation,
   type RevisionRef,
   type VaultEntry,
@@ -28,7 +29,12 @@ export interface LocalVaultPort {
     expectedContentHash?: string | null,
   ): Promise<void>;
   list(): Promise<LocalFileInfo[]>;
-  move(fromPath: string, toPath: string): Promise<void>;
+  move(
+    fromPath: string,
+    toPath: string,
+    expectedSourceHash?: string,
+    expectedTargetHash?: string | null,
+  ): Promise<void>;
   read(path: string): Promise<Uint8Array>;
   stat(path: string): Promise<LocalFileInfo | undefined>;
   supportsPath?(path: string): boolean;
@@ -94,6 +100,7 @@ export interface DeferredDownloadEntry {
 
 export type LocalSyncIssue =
   | { kind: "bootstrap-mismatch"; path: string }
+  | { kind: "deferred-local-edit"; path: string }
   | { kind: "import-candidate"; path: string }
   | { kind: "path-collision"; paths: string[] }
   | { kind: "possible-rename"; newPaths: string[]; oldPaths: string[] }
@@ -198,6 +205,21 @@ export class SyncService {
     }
     const scan = await this.scanFiles(undefined, true);
     const files = scan.files;
+    const pathsByCanonicalForm = new Map<string, string[]>();
+    for (const file of files) {
+      const canonical = file.path.normalize("NFC").toLocaleLowerCase("en-US");
+      const paths = pathsByCanonicalForm.get(canonical) ?? [];
+      paths.push(file.path);
+      pathsByCanonicalForm.set(canonical, paths);
+    }
+    const collision = [...pathsByCanonicalForm.values()].find(
+      (paths) => paths.length > 1,
+    );
+    if (collision) {
+      throw new Error(
+        `Migration Baseline contains a cross-platform path collision: ${collision.join(", ")}`,
+      );
+    }
     if (scan.unsyncedLocalEntries > 0) {
       throw new Error("The Migration Baseline contains files above the device limit");
     }
@@ -460,6 +482,11 @@ export class SyncService {
     let materializedContent: Uint8Array | undefined;
     let resolvedEntry: VaultEntry;
     if (resolution.kind === "restore-candidate") {
+      this.assertRemotePathAvailable(
+        snapshot,
+        conflicted.entryId,
+        conflicted.path,
+      );
       const candidate = conflicted.candidates.find(
         (revision) => revision.revisionId === resolution.revisionId,
       );
@@ -668,7 +695,6 @@ export class SyncService {
     if (!revision) {
       throw new Error(`Deleted Revision ${revisionId ?? entryId} does not exist`);
     }
-    await this.assertLocalContent(deleted.path, null);
     return this.readDeletedRevisionCopy(
       deleted.entryId,
       revision,
@@ -694,6 +720,7 @@ export class SyncService {
     if (!selected) {
       throw new Error(`Deleted Revision ${revisionId ?? entryId} does not exist`);
     }
+    this.assertRemotePathAvailable(snapshot, deleted.entryId, deleted.path);
     await this.assertRemoteEntriesBeforePublication(
       snapshot,
       new Set([entryId]),
@@ -705,8 +732,6 @@ export class SyncService {
       versionedHead.serverDate,
     );
     await this.assertLocalContent(deleted.path, null);
-    await this.options.local.write(deleted.path, plaintext, null);
-    await this.assertLocalContent(deleted.path, selected.contentHash);
     const createdAt = versionedHead.serverDate;
     const restoredEntry: VaultEntry = {
       entryId,
@@ -746,6 +771,8 @@ export class SyncService {
         vaultId: snapshot.vaultId,
       },
     });
+    await this.assertLocalContent(deleted.path, null);
+    await this.options.local.write(deleted.path, plaintext, null);
     await this.options.cache.save(
       await this.buildCache({
         commitId,
@@ -819,6 +846,16 @@ export class SyncService {
       missingCachedByFingerprint.set(fingerprint, candidates);
     }
     const entryIdByPath = new Map<string, string>();
+    const newFilesByFingerprint = new Map<string, LocalFileInfo[]>();
+    for (const file of scanned) {
+      if (cached?.files[file.path]) {
+        continue;
+      }
+      const fingerprint = `${file.size}:${file.contentHash}`;
+      const claimants = newFilesByFingerprint.get(fingerprint) ?? [];
+      claimants.push(file);
+      newFilesByFingerprint.set(fingerprint, claimants);
+    }
     for (const file of scanned) {
       const exact = cached?.files[file.path];
       if (exact) {
@@ -828,7 +865,14 @@ export class SyncService {
       const renameCandidates = missingCachedByFingerprint.get(
         `${file.size}:${file.contentHash}`,
       );
-      if (renameCandidates?.length === 1 && renameCandidates[0]) {
+      const newClaimants = newFilesByFingerprint.get(
+        `${file.size}:${file.contentHash}`,
+      );
+      if (
+        renameCandidates?.length === 1 &&
+        renameCandidates[0] &&
+        newClaimants?.length === 1
+      ) {
         entryIdByPath.set(file.path, renameCandidates[0].entryId);
       }
     }
@@ -890,6 +934,21 @@ export class SyncService {
         deferredEntryIds.add(knownEntry.entryId);
       }
     }
+    const cachedFilesByEntryId = new Map(
+      Object.values(cached?.files ?? {}).map((file) => [file.entryId, file]),
+    );
+    const deferredLocalEditPaths = scanned.flatMap((file) => {
+      const entryId = entryIdByPath.get(file.path);
+      const accepted = entryId
+        ? cachedFilesByEntryId.get(entryId)
+        : undefined;
+      return entryId &&
+        deferredEntryIds.has(entryId) &&
+        accepted &&
+        file.contentHash !== accepted.contentHash
+        ? [file.path]
+        : [];
+    });
     const materializedEntryIds = new Set(
       Object.values(cached?.files ?? {}).map((file) => file.entryId),
     );
@@ -921,8 +980,9 @@ export class SyncService {
     const expectedLocalContentByPath = new Map(
       observation.files.map((file) => [file.path, file.contentHash] as const),
     );
+    const reconciliationBase = this.buildReconciliationBase(cached);
     const plan = this.engine.reconcile({
-      base: cached?.snapshot,
+      base: reconciliationBase,
       local: observation,
       remote,
     });
@@ -953,6 +1013,9 @@ export class SyncService {
       }),
       ...scan.unsyncedLocalPaths.map(
         (path): LocalSyncIssue => ({ kind: "unsynced-local", path }),
+      ),
+      ...deferredLocalEditPaths.map(
+        (path): LocalSyncIssue => ({ kind: "deferred-local-edit", path }),
       ),
       ...deferredDownloadEntries.flatMap((entry): LocalSyncIssue[] =>
         entry.reason === "unsupported-path"
@@ -1060,7 +1123,12 @@ export class SyncService {
         const expectedContentHash =
           expectedLocalContentByPath.get(action.fromPath) ?? null;
         await this.assertLocalContent(action.fromPath, expectedContentHash);
-        await this.options.local.move(action.fromPath, action.toPath);
+        await this.options.local.move(
+          action.fromPath,
+          action.toPath,
+          expectedContentHash ?? undefined,
+          null,
+        );
         expectedLocalContentByPath.delete(action.fromPath);
         if (expectedContentHash) {
           expectedLocalContentByPath.set(action.toPath, expectedContentHash);
@@ -1159,7 +1227,7 @@ export class SyncService {
       }> = [];
       const writeAfterCommit: Array<{
         body: Uint8Array;
-        expectedContentHash: string;
+        expectedContentHash: string | null;
         path: string;
       }> = [];
       for (const change of plan.remoteChanges) {
@@ -1247,13 +1315,14 @@ export class SyncService {
           changedEntries.push(changedEntry);
           continue;
         }
-        reportUpload(conflict.path);
-        const plaintext = await this.options.local.read(conflict.path);
+        const localPath = conflict.localFile.path;
+        reportUpload(localPath);
+        const plaintext = await this.options.local.read(localPath);
         if (
           plaintext.byteLength !== conflict.localFile.size ||
           (await sha256(plaintext)) !== conflict.localFile.contentHash
         ) {
-          throw new Error(`Local file changed while reading ${conflict.path}`);
+          throw new Error(`Local file changed while reading ${localPath}`);
         }
         const blobId = crypto.randomUUID();
         await this.options.remote.writeBlob(blobId, plaintext);
@@ -1283,11 +1352,11 @@ export class SyncService {
           };
           deleteAfterCommit.push({
             expectedContentHash: conflict.localFile.contentHash,
-            path: conflict.path,
+            path: localPath,
           });
           unresolvedConflicts += 1;
         } else {
-          const baseEntry = cached?.snapshot.entries[conflict.entryId];
+          const baseEntry = reconciliationBase?.entries[conflict.entryId];
           if (
             remoteEntry?.kind !== "live" ||
             (baseEntry?.kind !== "live" && baseEntry?.kind !== "deleted")
@@ -1350,9 +1419,18 @@ export class SyncService {
               path: conflict.path,
               revision: mergedRevision,
             };
+            if (localPath !== conflict.path) {
+              deleteAfterCommit.push({
+                expectedContentHash: conflict.localFile.contentHash,
+                path: localPath,
+              });
+            }
             writeAfterCommit.push({
               body: merged,
-              expectedContentHash: conflict.localFile.contentHash,
+              expectedContentHash:
+                localPath === conflict.path
+                  ? conflict.localFile.contentHash
+                  : null,
               path: conflict.path,
             });
           } else {
@@ -1368,17 +1446,36 @@ export class SyncService {
               path: conflict.path,
               reason: "edit-edit",
             };
-            if (!keepLocalMaterialized) {
+            if (keepLocalMaterialized && localPath !== conflict.path) {
+              deleteAfterCommit.push({
+                expectedContentHash: conflict.localFile.contentHash,
+                path: localPath,
+              });
+              writeAfterCommit.push({
+                body: plaintext,
+                expectedContentHash: null,
+                path: conflict.path,
+              });
+            } else if (!keepLocalMaterialized) {
+              if (localPath !== conflict.path) {
+                deleteAfterCommit.push({
+                  expectedContentHash: conflict.localFile.contentHash,
+                  path: localPath,
+                });
+              }
               writeAfterCommit.push({
                 body: remoteContent,
-                expectedContentHash: conflict.localFile.contentHash,
+                expectedContentHash:
+                  localPath === conflict.path
+                    ? conflict.localFile.contentHash
+                    : null,
                 path: conflict.path,
               });
             }
             unresolvedConflicts += 1;
           }
         }
-        reportUpload(conflict.path, conflict.localFile.size);
+        reportUpload(localPath, conflict.localFile.size);
         nextEntries[conflict.entryId] = changedEntry;
         changedEntries.push(changedEntry);
       }
@@ -1412,6 +1509,11 @@ export class SyncService {
           vaultId: head.vaultId,
         });
         head.snapshotId = snapshotId;
+      }
+      for (const change of plan.remoteChanges) {
+        if (change.kind === "delete-remote") {
+          await this.assertLocalContent(change.path, null);
+        }
       }
       this.reportProgress({
         completed: uploadCompleted,
@@ -1469,6 +1571,7 @@ export class SyncService {
       status:
         unresolvedConflicts > 0 ||
         scan.unsyncedLocalEntries > 0 ||
+        deferredLocalEditPaths.length > 0 ||
         deferredDownloadEntries.some(
           (entry) => entry.reason === "unsupported-path",
         )
@@ -1486,6 +1589,10 @@ export class SyncService {
     const current = await this.options.cache.load();
     const scan = await this.scanFiles(current);
     const files: Record<string, CachedFileState> = {};
+    const pendingUnmaterializedEntryIds = new Set([
+      ...(current?.unmaterializedEntryIds ?? []),
+      ...additionalUnmaterializedEntryIds,
+    ]);
     const liveEntriesByPath = new Map(
       Object.values(snapshot.entries).flatMap((entry) =>
         entry.kind === "live" ? ([[entry.path, entry]] as const) : [],
@@ -1494,7 +1601,33 @@ export class SyncService {
     for (const file of scan.files) {
       const entry = liveEntriesByPath.get(file.path);
       if (entry) {
-        files[file.path] = { ...file, entryId: entry.entryId };
+        const prior = current?.files[file.path];
+        files[file.path] =
+          pendingUnmaterializedEntryIds.has(entry.entryId) &&
+          prior?.entryId === entry.entryId &&
+          file.contentHash !== entry.revision.contentHash
+            ? prior
+            : { ...file, entryId: entry.entryId };
+      }
+    }
+    const physicallyPresentPaths = new Set(scan.localPaths);
+    const alreadyMaterializedEntryIds = new Set(
+      Object.values(files).flatMap((file) => {
+        const entry = snapshot.entries[file.entryId];
+        return entry?.kind === "live" &&
+          entry.revision.contentHash === file.contentHash
+          ? [file.entryId]
+          : [];
+      }),
+    );
+    for (const cachedFile of Object.values(current?.files ?? {})) {
+      if (
+        pendingUnmaterializedEntryIds.has(cachedFile.entryId) &&
+        !alreadyMaterializedEntryIds.has(cachedFile.entryId) &&
+        physicallyPresentPaths.has(cachedFile.path) &&
+        snapshot.entries[cachedFile.entryId]?.kind === "live"
+      ) {
+        files[cachedFile.path] = cachedFile;
       }
     }
     const skippedTrackedEntryIds = new Set(scan.skippedTrackedEntryIds);
@@ -1507,21 +1640,61 @@ export class SyncService {
       }
     }
     const materializedEntryIds = new Set(
-      Object.values(files).map((file) => file.entryId),
+      Object.values(files).flatMap((file) => {
+        const entry = snapshot.entries[file.entryId];
+        return entry?.kind === "live" &&
+          entry.revision.contentHash === file.contentHash
+          ? [file.entryId]
+          : [];
+      }),
     );
-    const unmaterializedEntryIds = new Set([
-      ...(current?.unmaterializedEntryIds ?? []),
-      ...additionalUnmaterializedEntryIds,
-    ]);
     return {
       files,
       snapshot,
-      unmaterializedEntryIds: [...unmaterializedEntryIds].filter(
+      unmaterializedEntryIds: [...pendingUnmaterializedEntryIds].filter(
         (entryId) =>
           snapshot.entries[entryId]?.kind === "live" &&
           !materializedEntryIds.has(entryId),
       ),
     };
+  }
+
+  private buildReconciliationBase(
+    cached: CachedSyncState | undefined,
+  ): VaultSnapshot | undefined {
+    if (!cached) {
+      return undefined;
+    }
+    const entries = { ...cached.snapshot.entries };
+    const unmaterializedEntryIds = new Set(
+      cached.unmaterializedEntryIds ?? [],
+    );
+    for (const cachedFile of Object.values(cached.files)) {
+      const entry = cached.snapshot.entries[cachedFile.entryId];
+      if (
+        entry?.kind !== "live" ||
+        (!unmaterializedEntryIds.has(entry.entryId) &&
+          entry.revision.contentHash === cachedFile.contentHash)
+      ) {
+        continue;
+      }
+      const priorRevision =
+        entry.revision.contentHash === cachedFile.contentHash
+          ? entry.revision
+          : entry.history?.find(
+              (revision) => revision.contentHash === cachedFile.contentHash,
+            );
+      if (!priorRevision) {
+        continue;
+      }
+      const priorEntry: LiveEntry = {
+        ...entry,
+        path: cachedFile.path,
+        revision: priorRevision,
+      };
+      entries[entry.entryId] = priorEntry;
+    }
+    return { ...cached.snapshot, entries };
   }
 
   private async assertLocalContent(
@@ -1575,6 +1748,26 @@ export class SyncService {
     }
     for (const revision of revisions.values()) {
       await this.assertRemoteRevision(revision);
+    }
+  }
+
+  private assertRemotePathAvailable(
+    snapshot: VaultSnapshot,
+    entryId: string,
+    path: string,
+  ): void {
+    const canonicalPath = path.normalize("NFC").toLocaleLowerCase("en-US");
+    const occupyingEntry = Object.values(snapshot.entries).find(
+      (entry) =>
+        entry.entryId !== entryId &&
+        entry.kind !== "deleted" &&
+        entry.path.normalize("NFC").toLocaleLowerCase("en-US") ===
+          canonicalPath,
+    );
+    if (occupyingEntry) {
+      throw new Error(
+        `Cannot restore ${path}; it is owned by Entry ${occupyingEntry.entryId}`,
+      );
     }
   }
 

@@ -364,7 +364,9 @@ export class StatusModal extends Modal {
       item.createEl("div", {
         text:
           issue.kind === "import-candidate"
-            ? "Local file requires import confirmation."
+              ? "Local file requires import confirmation."
+            : issue.kind === "deferred-local-edit"
+              ? "This local edit is waiting for the deferred remote Revision before it can be reconciled safely."
             : issue.kind === "bootstrap-mismatch"
               ? "Local content differs from the encrypted remote Revision after cache loss."
               : issue.kind === "resolution-mismatch"

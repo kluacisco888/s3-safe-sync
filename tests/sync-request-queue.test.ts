@@ -25,6 +25,48 @@ describe("SyncRequestQueue", () => {
     expect(run).toHaveBeenCalledTimes(2);
   });
 
+  it("serializes direct operations with queued synchronization", async () => {
+    const events: string[] = [];
+    let releaseDirect = (): void => undefined;
+    const directGate = new Promise<void>((resolve) => {
+      releaseDirect = resolve;
+    });
+    let directStarted = (): void => undefined;
+    const started = new Promise<void>((resolve) => {
+      directStarted = resolve;
+    });
+    const queue = new SyncRequestQueue(async () => {
+      events.push("sync");
+    });
+    const direct = queue.runExclusive(async () => {
+      events.push("direct-start");
+      directStarted();
+      await directGate;
+      events.push("direct-end");
+    });
+    await started;
+
+    const sync = queue.request();
+    await Promise.resolve();
+    expect(events).toEqual(["direct-start"]);
+    releaseDirect();
+    await Promise.all([direct, sync]);
+
+    expect(events).toEqual(["direct-start", "direct-end", "sync"]);
+  });
+
+  it("continues after an exclusive operation fails", async () => {
+    const run = vi.fn(async () => undefined);
+    const queue = new SyncRequestQueue(run);
+
+    await expect(
+      queue.runExclusive(() => Promise.reject(new Error("direct failure"))),
+    ).rejects.toThrow("direct failure");
+    await queue.request();
+
+    expect(run).toHaveBeenCalledOnce();
+  });
+
   it("does not lose a request at the runner completion boundary", async () => {
     let finishFirstSync: (() => void) | undefined;
     const firstSync = new Promise<void>((resolve) => {

@@ -242,6 +242,57 @@ export class SyncEngine {
         pathCollisions.push({ kind: "path-collision", paths });
       }
     }
+    const liveRemoteEntries = Object.values(remote.entries).filter(
+      (entry): entry is LiveEntry => entry.kind === "live",
+    );
+    const remoteEntriesByCanonicalPath = new Map<string, LiveEntry[]>();
+    for (const entry of liveRemoteEntries) {
+      const canonical = entry.path.normalize("NFC").toLocaleLowerCase("en-US");
+      const owners = remoteEntriesByCanonicalPath.get(canonical) ?? [];
+      owners.push(entry);
+      remoteEntriesByCanonicalPath.set(canonical, owners);
+    }
+    for (const [canonical, owners] of remoteEntriesByCanonicalPath) {
+      if (owners.length > 1) {
+        pathCollisions.push({
+          kind: "path-collision",
+          paths: owners.map((entry) => entry.path),
+        });
+        continue;
+      }
+      const remoteEntry = owners[0];
+      if (!remoteEntry) {
+        continue;
+      }
+      const baseEntry = base?.entries[remoteEntry.entryId];
+      const hasBoundLocalClaimant = local.files.some(
+        (file) => file.entryId === remoteEntry.entryId,
+      );
+      for (const file of local.files.filter(
+        (candidate) =>
+          candidate.path.normalize("NFC").toLocaleLowerCase("en-US") ===
+          canonical,
+      )) {
+        const belongsToRemoteEntry = file.entryId === remoteEntry.entryId;
+        const occupiesItsPreviousPath =
+          file.entryId === undefined &&
+          !hasBoundLocalClaimant &&
+          baseEntry !== undefined &&
+          baseEntry.path.normalize("NFC").toLocaleLowerCase("en-US") ===
+            canonical;
+        const cachelessSamePath = file.entryId === undefined && !baseEntry;
+        if (
+          !belongsToRemoteEntry &&
+          !occupiesItsPreviousPath &&
+          !cachelessSamePath
+        ) {
+          pathCollisions.push({
+            kind: "path-collision",
+            paths: [...new Set([file.path, remoteEntry.path])],
+          });
+        }
+      }
+    }
     if (pathCollisions.length > 0) {
       return {
         conflicts: pathCollisions,
@@ -273,6 +324,24 @@ export class SyncEngine {
       const remoteEntry = file.entryId
         ? remote.entries[file.entryId]
         : remoteByPath.get(file.path);
+      const baseEntry = remoteEntry
+        ? base?.entries[remoteEntry.entryId]
+        : undefined;
+      if (
+        remoteEntry?.kind === "live" &&
+        (!base ||
+          (!baseEntry && !file.entryId) ||
+          (unmaterializedEntryIds.has(remoteEntry.entryId) && !file.entryId)) &&
+        file.contentHash !== remoteEntry.revision.contentHash
+      ) {
+        conflicts.push({
+          kind: "bootstrap-mismatch",
+          localFile: file,
+          path: remoteEntry.path,
+          remoteRevision: remoteEntry.revision,
+        });
+        continue;
+      }
       if (
         remoteEntry?.kind === "live" &&
         deferredEntryIds.has(remoteEntry.entryId)
@@ -297,23 +366,29 @@ export class SyncEngine {
           path: remoteEntry.path,
         });
       } else if (remoteEntry?.kind === "live") {
-        const baseEntry = base?.entries[remoteEntry.entryId];
         if (
-          (!base || (!baseEntry && !file.entryId)) &&
-          file.contentHash !== remoteEntry.revision.contentHash
+          baseEntry?.kind === "live" &&
+          file.path !== baseEntry.path &&
+          remoteEntry.path !== baseEntry.path &&
+          file.path !== remoteEntry.path &&
+          !(
+            file.contentHash !== baseEntry.revision.contentHash &&
+            remoteEntry.revision.contentHash !==
+              baseEntry.revision.contentHash &&
+            file.contentHash !== remoteEntry.revision.contentHash
+          )
         ) {
           conflicts.push({
-            kind: "bootstrap-mismatch",
-            localFile: file,
-            path: remoteEntry.path,
-            remoteRevision: remoteEntry.revision,
+            kind: "path-collision",
+            paths: [file.path, remoteEntry.path],
           });
-        } else if (
+          continue;
+        }
+        if (
           baseEntry?.kind === "live" &&
           file.path === baseEntry.path &&
           remoteEntry.path !== baseEntry.path &&
-          file.contentHash === baseEntry.revision.contentHash &&
-          remoteEntry.revision.contentHash === baseEntry.revision.contentHash
+          file.contentHash === remoteEntry.revision.contentHash
         ) {
           localActions.push({
             entryId: remoteEntry.entryId,
@@ -325,8 +400,7 @@ export class SyncEngine {
           baseEntry?.kind === "live" &&
           file.path !== baseEntry.path &&
           remoteEntry.path === baseEntry.path &&
-          file.contentHash === baseEntry.revision.contentHash &&
-          remoteEntry.revision.contentHash === baseEntry.revision.contentHash
+          file.contentHash === remoteEntry.revision.contentHash
         ) {
           remoteChanges.push({
             entryId: remoteEntry.entryId,
@@ -352,11 +426,23 @@ export class SyncEngine {
           file.contentHash !== baseEntry.revision.contentHash &&
           remoteEntry.revision.contentHash === baseEntry.revision.contentHash
         ) {
+          const targetPath =
+            remoteEntry.path !== baseEntry.path
+              ? remoteEntry.path
+              : file.path;
+          if (file.path !== targetPath) {
+            localActions.push({
+              entryId: remoteEntry.entryId,
+              fromPath: file.path,
+              kind: "move-local",
+              toPath: targetPath,
+            });
+          }
           remoteChanges.push({
             entryId: remoteEntry.entryId,
             file,
             kind: "upload-local",
-            path: file.path,
+            path: targetPath,
             replacesRevisionId: remoteEntry.revision.revisionId,
           });
         } else if (
@@ -365,17 +451,33 @@ export class SyncEngine {
           remoteEntry.revision.contentHash !== baseEntry.revision.contentHash
         ) {
           if (file.path !== remoteEntry.path) {
-            localActions.push({
-              entryId: remoteEntry.entryId,
-              fromPath: file.path,
-              kind: "move-local",
-              toPath: remoteEntry.path,
-            });
+            if (
+              file.path !== baseEntry.path &&
+              remoteEntry.path === baseEntry.path
+            ) {
+              remoteChanges.push({
+                entryId: remoteEntry.entryId,
+                fromPath: remoteEntry.path,
+                kind: "move-remote",
+                toPath: file.path,
+              });
+            } else {
+              localActions.push({
+                entryId: remoteEntry.entryId,
+                fromPath: file.path,
+                kind: "move-local",
+                toPath: remoteEntry.path,
+              });
+            }
           }
           localActions.push({
             entryId: remoteEntry.entryId,
             kind: "download-remote",
-            path: remoteEntry.path,
+            path:
+              file.path !== baseEntry.path &&
+              remoteEntry.path === baseEntry.path
+                ? file.path
+                : remoteEntry.path,
             revision: remoteEntry.revision,
           });
         }
@@ -581,6 +683,47 @@ export class SyncEngine {
           change?.kind === "upload-new"
         ) {
           remoteChanges.splice(index, 1);
+        }
+      }
+    }
+
+    const remoteChangeCounts = new Map<string, number>();
+    for (const change of remoteChanges) {
+      remoteChangeCounts.set(
+        change.entryId,
+        (remoteChangeCounts.get(change.entryId) ?? 0) + 1,
+      );
+    }
+    const duplicateRemoteChangeEntryIds = new Set(
+      [...remoteChangeCounts].flatMap(([entryId, count]) =>
+        count > 1 ? [entryId] : [],
+      ),
+    );
+    for (const entryId of duplicateRemoteChangeEntryIds) {
+      const paths = remoteChanges.flatMap((change) => {
+        if (change.entryId !== entryId) {
+          return [];
+        }
+        return change.kind === "move-remote"
+          ? [change.fromPath, change.toPath]
+          : [change.path];
+      });
+      conflicts.push({
+        kind: "path-collision",
+        paths: [...new Set(paths)],
+      });
+    }
+    if (duplicateRemoteChangeEntryIds.size > 0) {
+      for (let index = remoteChanges.length - 1; index >= 0; index -= 1) {
+        const change = remoteChanges[index];
+        if (change && duplicateRemoteChangeEntryIds.has(change.entryId)) {
+          remoteChanges.splice(index, 1);
+        }
+      }
+      for (let index = localActions.length - 1; index >= 0; index -= 1) {
+        const action = localActions[index];
+        if (action && duplicateRemoteChangeEntryIds.has(action.entryId)) {
+          localActions.splice(index, 1);
         }
       }
     }

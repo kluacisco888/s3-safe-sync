@@ -22,6 +22,7 @@ class MemoryObjectStore implements ObjectStore {
   private readonly objects = new Map<string, StoredObject>();
   corruptNextBlobPut = false;
   onGet: ((key: string) => Promise<void> | void) | undefined;
+  onPut: ((key: string) => Promise<void> | void) | undefined;
 
   async delete(key: string): Promise<void> {
     this.objects.delete(key);
@@ -41,6 +42,7 @@ class MemoryObjectStore implements ObjectStore {
     body: Uint8Array,
     options: ObjectPutOptions = {},
   ): Promise<StoredObject> {
+    await this.onPut?.(key);
     const current = this.objects.get(key);
     if (options.ifNoneMatch && current) {
       throw new ObjectPreconditionError();
@@ -71,6 +73,7 @@ class MemoryVault implements LocalVaultPort {
     { bytes: Uint8Array; modifiedAt: number }
   >();
   readonly listedSizeOverrides = new Map<string, number>();
+  beforeMove: ((fromPath: string, toPath: string) => Promise<void> | void) | undefined;
   beforeStat: ((path: string) => Promise<void> | void) | undefined;
   readCount = 0;
   readonly unsupportedPaths = new Set<string>();
@@ -90,14 +93,36 @@ class MemoryVault implements LocalVaultPort {
     );
   }
 
-  move(fromPath: string, toPath: string): Promise<void> {
+  async move(
+    fromPath: string,
+    toPath: string,
+    expectedSourceHash?: string,
+    expectedTargetHash?: string | null,
+  ): Promise<void> {
+    await this.beforeMove?.(fromPath, toPath);
     const file = this.files.get(fromPath);
     if (!file) {
       throw new Error(`Missing local file ${fromPath}`);
     }
+    const sourceDigest = await crypto.subtle.digest(
+      "SHA-256",
+      file.bytes.slice().buffer,
+    );
+    const sourceHash = `sha256:${Array.from(new Uint8Array(sourceDigest), (byte) =>
+      byte.toString(16).padStart(2, "0"),
+    ).join("")}`;
+    if (
+      expectedSourceHash !== undefined &&
+      sourceHash !== expectedSourceHash
+    ) {
+      throw new Error(`Local file changed during synchronization: ${fromPath}`);
+    }
+    const target = this.files.get(toPath);
+    if (expectedTargetHash === null && target) {
+      throw new Error(`Local file changed during synchronization: ${toPath}`);
+    }
     this.files.delete(fromPath);
     this.files.set(toPath, { bytes: file.bytes, modifiedAt: ++this.clock });
-    return Promise.resolve();
   }
 
   read(path: string): Promise<Uint8Array> {
@@ -172,6 +197,31 @@ const currentLiveEntryIds = async (remote: RemoteStore): Promise<string[]> => {
 };
 
 describe("SyncService", () => {
+  it("rejects a cross-platform path collision before initializing Head", async () => {
+    const objects = new MemoryObjectStore();
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey: Uint8Array.from({ length: 32 }, (_, index) => index),
+    });
+    const local = new MemoryVault();
+    await local.write("notes/Foo.md", new TextEncoder().encode("upper"));
+    await local.write("notes/foo.md", new TextEncoder().encode("lower"));
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      remote,
+      replicaId: "android-first",
+    });
+
+    await expect(service.initializeNew("vault-1")).rejects.toThrow(
+      "cross-platform path collision",
+    );
+
+    await expect(remote.readHead()).resolves.toBeUndefined();
+    expect(await objects.list("chosen-prefix/v1/blobs/")).toEqual([]);
+  });
+
   it("reports initialization progress for every encrypted upload", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
@@ -431,8 +481,9 @@ describe("SyncService", () => {
       "notes/example.md",
       new TextEncoder().encode("hello from desktop"),
     );
+    const desktopCache = new MemorySyncCache();
     const desktop = new SyncService({
-      cache: new MemorySyncCache(),
+      cache: desktopCache,
       local: desktopVault,
       remote: desktopRemote,
       replicaId: "desktop",
@@ -495,6 +546,103 @@ describe("SyncService", () => {
       path: "notes/example.md",
     });
     expect(local.readText("notes/example.md")).toBe("local version");
+    expect((await remote.readHead())?.value.generation).toBe(1);
+  });
+
+  it("does not bind a cache-loss mismatch to an oversized remote Entry", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const desktopVault = new MemoryVault();
+    await desktopVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("remote content above limit"),
+    );
+    await new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote,
+      replicaId: "desktop",
+    }).initializeNew("vault-1");
+    const local = new MemoryVault();
+    await local.write("notes/example.md", new TextEncoder().encode("local"));
+    const cache = new MemorySyncCache();
+    const limited = new SyncService({
+      cache,
+      local,
+      maxAutomaticFileBytes: 10,
+      remote,
+      replicaId: "reinstalled-phone",
+    });
+
+    const first = await limited.synchronize();
+
+    expect(first.localIssues).toContainEqual({
+      kind: "bootstrap-mismatch",
+      path: "notes/example.md",
+    });
+    expect(first.uploaded).toBe(0);
+    expect(cache.state).toBeUndefined();
+    const unlimited = new SyncService({
+      cache,
+      local,
+      remote,
+      replicaId: "reinstalled-phone",
+    });
+    const second = await unlimited.synchronize();
+    expect(second.localIssues).toContainEqual({
+      kind: "bootstrap-mismatch",
+      path: "notes/example.md",
+    });
+    expect(local.readText("notes/example.md")).toBe("local");
+    expect((await remote.readHead())?.value.generation).toBe(1);
+  });
+
+  it("does not bind a draft created at an unmaterialized deferred path", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const desktopVault = new MemoryVault();
+    await desktopVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("remote content above limit"),
+    );
+    await new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote,
+      replicaId: "desktop",
+    }).initializeNew("vault-1");
+    const local = new MemoryVault();
+    const cache = new MemorySyncCache();
+    const limited = new SyncService({
+      cache,
+      local,
+      maxAutomaticFileBytes: 10,
+      remote,
+      replicaId: "phone",
+    });
+    const deferred = await limited.synchronize();
+    expect(deferred.deferredDownloads).toBe(1);
+    expect(cache.state?.unmaterializedEntryIds).toHaveLength(1);
+    await local.write("notes/example.md", new TextEncoder().encode("draft"));
+
+    const result = await limited.synchronize();
+
+    expect(result.status).toBe("action-required");
+    expect(result.localIssues).toContainEqual({
+      kind: "bootstrap-mismatch",
+      path: "notes/example.md",
+    });
+    expect(local.readText("notes/example.md")).toBe("draft");
     expect((await remote.readHead())?.value.generation).toBe(1);
   });
 
@@ -592,6 +740,239 @@ describe("SyncService", () => {
 
     expect(phoneVault.readText("notes/example.md")).toBe(
       "remote content above limit",
+    );
+  });
+
+  it("downloads a deferred remote update after the device limit is raised", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopVault = new MemoryVault();
+    const desktopRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    await desktopVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("small"),
+    );
+    const desktop = new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: desktopRemote,
+      replicaId: "desktop",
+    });
+    await desktop.initializeNew("vault-1");
+    const phoneVault = new MemoryVault();
+    const phoneCache = new MemorySyncCache();
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const limitedPhone = new SyncService({
+      cache: phoneCache,
+      local: phoneVault,
+      maxAutomaticFileBytes: 10,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+    await limitedPhone.synchronize();
+    await desktopVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("remote content above limit"),
+    );
+    await desktop.synchronize();
+    const deferred = await limitedPhone.synchronize();
+    expect(deferred).toMatchObject({ deferredDownloads: 1, downloaded: 0 });
+    expect(phoneVault.readText("notes/example.md")).toBe("small");
+    const generationBefore = (await phoneRemote.readHead())?.value.generation;
+    const unlimitedPhone = new SyncService({
+      cache: phoneCache,
+      local: phoneVault,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+
+    const resumed = await unlimitedPhone.synchronize();
+
+    expect(resumed).toMatchObject({ downloaded: 1, uploaded: 0 });
+    expect(phoneVault.readText("notes/example.md")).toBe(
+      "remote content above limit",
+    );
+    expect((await phoneRemote.readHead())?.value.generation).toBe(
+      generationBefore,
+    );
+  });
+
+  it("conflicts instead of rolling back a remote update edited while deferred", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopVault = new MemoryVault();
+    const desktopRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    await desktopVault.write("notes/example.md", new TextEncoder().encode("small"));
+    const desktop = new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: desktopRemote,
+      replicaId: "desktop",
+    });
+    await desktop.initializeNew("vault-1");
+    const phoneVault = new MemoryVault();
+    const phoneCache = new MemorySyncCache();
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const limitedPhone = new SyncService({
+      cache: phoneCache,
+      local: phoneVault,
+      maxAutomaticFileBytes: 10,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+    await limitedPhone.synchronize();
+    const acceptedLocalHash =
+      phoneCache.state?.files["notes/example.md"]?.contentHash;
+    if (!acceptedLocalHash) {
+      throw new Error("Expected initial phone cache");
+    }
+    await desktopVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("remote content above limit"),
+    );
+    await desktop.synchronize();
+    await limitedPhone.synchronize();
+    await phoneVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("phone edit"),
+    );
+    const editedWhileDeferred = await limitedPhone.synchronize();
+    expect(editedWhileDeferred.status).toBe("action-required");
+    expect(editedWhileDeferred.localIssues).toContainEqual({
+      kind: "deferred-local-edit",
+      path: "notes/example.md",
+    });
+    expect(phoneCache.state?.files["notes/example.md"]?.contentHash).toBe(
+      acceptedLocalHash,
+    );
+    expect(phoneCache.state?.unmaterializedEntryIds).toHaveLength(1);
+    const unlimitedPhone = new SyncService({
+      cache: phoneCache,
+      local: phoneVault,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+
+    const result = await unlimitedPhone.synchronize();
+
+    expect(result.status).toBe("action-required");
+    const head = await phoneRemote.readHead();
+    if (!head) {
+      throw new Error("Expected Conflict Head");
+    }
+    const snapshot = await phoneRemote.readSnapshot(head.value);
+    const entry = Object.values(snapshot.entries)[0];
+    if (entry?.kind !== "conflicted") {
+      throw new Error("Expected deferred edit Conflict");
+    }
+    const candidateContents = await Promise.all(
+      entry.candidates.map(async (candidate) => {
+        const body = await phoneRemote.readBlob(candidate.blobId);
+        return body ? new TextDecoder().decode(body) : "missing";
+      }),
+    );
+    expect(candidateContents.sort()).toEqual([
+      "phone edit",
+      "remote content above limit",
+    ]);
+  });
+
+  it("keeps a renamed deferred Entry tied to its old local materialization", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopVault = new MemoryVault();
+    const desktopRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    await desktopVault.write("notes/old.md", new TextEncoder().encode("small"));
+    const desktopCache = new MemorySyncCache();
+    const desktop = new SyncService({
+      cache: desktopCache,
+      local: desktopVault,
+      remote: desktopRemote,
+      replicaId: "desktop",
+    });
+    await desktop.initializeNew("vault-1");
+    const phoneVault = new MemoryVault();
+    const phoneCache = new MemorySyncCache();
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const limitedPhone = new SyncService({
+      cache: phoneCache,
+      local: phoneVault,
+      maxAutomaticFileBytes: 10,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+    await limitedPhone.synchronize();
+    await desktopVault.move("notes/old.md", "notes/renamed.md");
+    const cachedOld = desktopCache.state?.files["notes/old.md"];
+    if (!desktopCache.state || !cachedOld) {
+      throw new Error("Expected desktop rename cache");
+    }
+    delete desktopCache.state.files["notes/old.md"];
+    desktopCache.state.files["notes/renamed.md"] = {
+      ...cachedOld,
+      path: "notes/renamed.md",
+    };
+    await desktopVault.write(
+      "notes/renamed.md",
+      new TextEncoder().encode("renamed remote content above limit"),
+    );
+    await desktop.synchronize();
+    const renamedHead = await desktopRemote.readHead();
+    if (!renamedHead) {
+      throw new Error("Expected renamed Head");
+    }
+    const renamedSnapshot = await desktopRemote.readSnapshot(renamedHead.value);
+    expect(Object.values(renamedSnapshot.entries)[0]).toMatchObject({
+      kind: "live",
+      path: "notes/renamed.md",
+      revision: { size: 34 },
+    });
+
+    const first = await limitedPhone.synchronize();
+    const generation = (await phoneRemote.readHead())?.value.generation;
+    const second = await limitedPhone.synchronize();
+
+    expect(first.deferredDownloads).toBe(1);
+    expect(second).toMatchObject({ downloaded: 0, uploaded: 0 });
+    expect((await phoneRemote.readHead())?.value.generation).toBe(generation);
+    expect(phoneVault.readText("notes/old.md")).toBe("small");
+    const unlimitedPhone = new SyncService({
+      cache: phoneCache,
+      local: phoneVault,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+
+    const resumed = await unlimitedPhone.synchronize();
+
+    expect(resumed).toMatchObject({ downloaded: 1, uploaded: 0 });
+    expect(phoneVault.readText("notes/old.md")).toBeUndefined();
+    expect(phoneVault.readText("notes/renamed.md")).toBe(
+      "renamed remote content above limit",
     );
   });
 
@@ -819,6 +1200,49 @@ describe("SyncService", () => {
     expect(Object.values(current.entries)).toEqual([
       expect.objectContaining({ kind: "deleted", path: "notes/example.md" }),
     ]);
+  });
+
+  it("does not publish a deletion when the local path reappears before Head", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write("notes/example.md", new TextEncoder().encode("original"));
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      remote,
+      replicaId: "desktop",
+    });
+    await service.initializeNew("vault-1");
+    const initialHead = await remote.readHead();
+    if (!initialHead) {
+      throw new Error("Expected initialized Head");
+    }
+    const entryIds = await currentLiveEntryIds(remote);
+    await local.delete("notes/example.md");
+    objects.onGet = async (key) => {
+      if (key.includes("/blobs/")) {
+        objects.onGet = undefined;
+        await local.write(
+          "notes/example.md",
+          new TextEncoder().encode("recreated draft"),
+        );
+      }
+    };
+
+    await expect(service.synchronize(entryIds)).rejects.toThrow(
+      "Local file changed during synchronization",
+    );
+
+    expect(local.readText("notes/example.md")).toBe("recreated draft");
+    await expect(remote.readHead()).resolves.toMatchObject({
+      value: { commitId: initialHead.value.commitId },
+    });
   });
 
   it("does not delete an edit made after the deletion plan was scanned", async () => {
@@ -1191,6 +1615,74 @@ describe("SyncService", () => {
     await desktop.synchronize();
 
     expect(desktopVault.readText("notes/example.md")).toBe("offline phone edit");
+  });
+
+  it("publishes a renamed offline edit when the old remote path was deleted", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const desktopVault = new MemoryVault();
+    const phoneVault = new MemoryVault();
+    await desktopVault.write("notes/old.md", new TextEncoder().encode("base"));
+    const desktop = new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: desktopRemote,
+      replicaId: "desktop",
+    });
+    const phoneCache = new MemorySyncCache();
+    const phone = new SyncService({
+      cache: phoneCache,
+      local: phoneVault,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+    await desktop.initializeNew("vault-1");
+    await phone.synchronize();
+    const entryIds = await currentLiveEntryIds(desktopRemote);
+    await phoneVault.move("notes/old.md", "notes/renamed.md");
+    const cachedFile = phoneCache.state?.files["notes/old.md"];
+    if (!phoneCache.state || !cachedFile) {
+      throw new Error("Expected phone rename cache");
+    }
+    delete phoneCache.state.files["notes/old.md"];
+    phoneCache.state.files["notes/renamed.md"] = {
+      ...cachedFile,
+      path: "notes/renamed.md",
+    };
+    await phoneVault.write(
+      "notes/renamed.md",
+      new TextEncoder().encode("renamed phone edit"),
+    );
+    await desktopVault.delete("notes/old.md");
+    await desktop.synchronize(entryIds);
+
+    const result = await phone.synchronize();
+
+    expect(result.status).toBe("action-required");
+    expect(phoneVault.readText("notes/renamed.md")).toBeUndefined();
+    const head = await phoneRemote.readHead();
+    if (!head) {
+      throw new Error("Expected Conflict Head");
+    }
+    const snapshot = await phoneRemote.readSnapshot(head.value);
+    const entry = Object.values(snapshot.entries)[0];
+    if (entry?.kind !== "conflicted" || !entry.candidates[0]) {
+      throw new Error("Expected renamed edit-delete candidate");
+    }
+    const candidate = await phoneRemote.readBlob(entry.candidates[0].blobId);
+    expect(candidate && new TextDecoder().decode(candidate)).toBe(
+      "renamed phone edit",
+    );
   });
 
   it("defers an oversized mobile download without turning it into a deletion", async () => {
@@ -1938,6 +2430,91 @@ describe("SyncService", () => {
     ]);
   });
 
+  it("preserves both candidates when concurrent renames are also edited", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const desktopVault = new MemoryVault();
+    const phoneVault = new MemoryVault();
+    await desktopVault.write("notes/old.md", new TextEncoder().encode("base"));
+    const desktopCache = new MemorySyncCache();
+    const phoneCache = new MemorySyncCache();
+    const desktop = new SyncService({
+      cache: desktopCache,
+      local: desktopVault,
+      remote: desktopRemote,
+      replicaId: "desktop",
+    });
+    const phone = new SyncService({
+      cache: phoneCache,
+      local: phoneVault,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+    await desktop.initializeNew("vault-1");
+    await phone.synchronize();
+    await phoneVault.move("notes/old.md", "notes/phone.md");
+    const phoneCached = phoneCache.state?.files["notes/old.md"];
+    if (!phoneCache.state || !phoneCached) {
+      throw new Error("Expected phone cache");
+    }
+    delete phoneCache.state.files["notes/old.md"];
+    phoneCache.state.files["notes/phone.md"] = {
+      ...phoneCached,
+      path: "notes/phone.md",
+    };
+    await phoneVault.write(
+      "notes/phone.md",
+      new TextEncoder().encode("phone edit"),
+    );
+    await desktopVault.move("notes/old.md", "notes/desktop.md");
+    const desktopCached = desktopCache.state?.files["notes/old.md"];
+    if (!desktopCache.state || !desktopCached) {
+      throw new Error("Expected desktop cache");
+    }
+    delete desktopCache.state.files["notes/old.md"];
+    desktopCache.state.files["notes/desktop.md"] = {
+      ...desktopCached,
+      path: "notes/desktop.md",
+    };
+    await desktopVault.write(
+      "notes/desktop.md",
+      new TextEncoder().encode("desktop edit"),
+    );
+    await desktop.synchronize();
+
+    const result = await phone.synchronize();
+
+    expect(result.status).toBe("action-required");
+    expect(phoneVault.readText("notes/phone.md")).toBeUndefined();
+    expect(phoneVault.readText("notes/desktop.md")).toBe("desktop edit");
+    const head = await phoneRemote.readHead();
+    if (!head) {
+      throw new Error("Expected Conflict Head");
+    }
+    const snapshot = await phoneRemote.readSnapshot(head.value);
+    const entry = Object.values(snapshot.entries)[0];
+    if (entry?.kind !== "conflicted") {
+      throw new Error("Expected rename/edit Conflict");
+    }
+    const candidates = await Promise.all(
+      entry.candidates.map(async (candidate) => {
+        const body = await phoneRemote.readBlob(candidate.blobId);
+        return body ? new TextDecoder().decode(body) : "missing";
+      }),
+    );
+    expect(candidates.sort()).toEqual(["desktop edit", "phone edit"]);
+  });
+
   it("does not publish or replace a local Conflict candidate until its upload authenticates", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
@@ -2105,6 +2682,46 @@ describe("SyncService", () => {
     });
     await local.delete("notes/example.md");
 
+    const competingRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const competingHead = await competingRemote.readHead();
+    if (!competingHead) {
+      throw new Error("Expected competing Head");
+    }
+    objects.onPut = async (key) => {
+      if (key.includes("/commits/")) {
+        objects.onPut = undefined;
+        await competingRemote.advance({
+          commit: {
+            changes: [],
+            commitId: "competing-commit",
+            createdAt: competingHead.serverDate,
+            parentIds: [competingHead.value.commitId],
+            protocolVersion: 1,
+            replicaId: "other-device",
+            vaultId: competingHead.value.vaultId,
+          },
+          expectedHeadEtag: competingHead.etag,
+          head: {
+            commitId: "competing-commit",
+            generation: competingHead.value.generation + 1,
+            protocolVersion: 1,
+            snapshotId: competingHead.value.snapshotId,
+            vaultId: competingHead.value.vaultId,
+          },
+        });
+      }
+    };
+
+    await expect(service.restoreDeleted(entryId)).rejects.toThrow(
+      "Head changed",
+    );
+
+    expect(local.readText("notes/example.md")).toBeUndefined();
+
     await service.restoreDeleted(entryId);
 
     expect(local.readText("notes/example.md")).toBe("recover me");
@@ -2117,6 +2734,65 @@ describe("SyncService", () => {
       entryId,
       kind: "live",
       path: "notes/example.md",
+    });
+  });
+
+  it("refuses to restore a deleted Entry whose path belongs to another live Entry", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write("notes/foo.md", new TextEncoder().encode("foo"));
+    await local.write("notes/bar.md", new TextEncoder().encode("bar"));
+    const cache = new MemorySyncCache();
+    const service = new SyncService({
+      cache,
+      local,
+      remote,
+      replicaId: "desktop",
+    });
+    await service.initializeNew("vault-1");
+    const initialHead = await remote.readHead();
+    if (!initialHead) {
+      throw new Error("Expected initialized Head");
+    }
+    const initial = await remote.readSnapshot(initialHead.value);
+    const foo = Object.values(initial.entries).find(
+      (entry) => entry.path === "notes/foo.md",
+    );
+    if (foo?.kind !== "live") {
+      throw new Error("Expected foo Entry");
+    }
+    await local.delete("notes/foo.md");
+    await service.synchronize([foo.entryId]);
+    await local.move("notes/bar.md", "notes/foo.md");
+    await service.synchronize();
+    expect(
+      new TextDecoder().decode(await service.readDeletedRecovery(foo.entryId)),
+    ).toBe("foo");
+    const occupiedHead = await remote.readHead();
+    if (!occupiedHead) {
+      throw new Error("Expected occupied Head");
+    }
+    const emptyLocal = new MemoryVault();
+    const restoringReplica = new SyncService({
+      cache: new MemorySyncCache(),
+      local: emptyLocal,
+      remote,
+      replicaId: "restoring-device",
+    });
+
+    await expect(restoringReplica.restoreDeleted(foo.entryId)).rejects.toThrow(
+      "it is owned by Entry",
+    );
+
+    expect(emptyLocal.readText("notes/foo.md")).toBeUndefined();
+    await expect(remote.readHead()).resolves.toMatchObject({
+      value: { commitId: occupiedHead.value.commitId },
     });
   });
 
@@ -2246,6 +2922,302 @@ describe("SyncService", () => {
       kind: "live",
       path: "notes/renamed.md",
     });
+  });
+
+  it("combines a local rename with a concurrent remote edit", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const desktopVault = new MemoryVault();
+    const phoneVault = new MemoryVault();
+    await desktopVault.write("notes/old.md", new TextEncoder().encode("base"));
+    const desktop = new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: desktopRemote,
+      replicaId: "desktop",
+    });
+    const phoneCache = new MemorySyncCache();
+    const phone = new SyncService({
+      cache: phoneCache,
+      local: phoneVault,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+    await desktop.initializeNew("vault-1");
+    await phone.synchronize();
+    await phoneVault.move("notes/old.md", "notes/phone-name.md");
+    const cachedFile = phoneCache.state?.files["notes/old.md"];
+    if (!phoneCache.state || !cachedFile) {
+      throw new Error("Expected phone cache");
+    }
+    delete phoneCache.state.files["notes/old.md"];
+    phoneCache.state.files["notes/phone-name.md"] = {
+      ...cachedFile,
+      path: "notes/phone-name.md",
+    };
+    await desktopVault.write(
+      "notes/old.md",
+      new TextEncoder().encode("desktop edit"),
+    );
+    await desktop.synchronize();
+
+    const result = await phone.synchronize();
+
+    expect(result.status).toBe("complete");
+    expect(phoneVault.readText("notes/old.md")).toBeUndefined();
+    expect(phoneVault.readText("notes/phone-name.md")).toBe("desktop edit");
+    const head = await phoneRemote.readHead();
+    if (!head) {
+      throw new Error("Expected merged rename Head");
+    }
+    const snapshot = await phoneRemote.readSnapshot(head.value);
+    expect(Object.values(snapshot.entries)[0]).toMatchObject({
+      kind: "live",
+      path: "notes/phone-name.md",
+      revision: { size: 12 },
+    });
+  });
+
+  it("combines a local edit with a concurrent remote rename", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const desktopVault = new MemoryVault();
+    const phoneVault = new MemoryVault();
+    await desktopVault.write("notes/old.md", new TextEncoder().encode("base"));
+    const desktopCache = new MemorySyncCache();
+    const desktop = new SyncService({
+      cache: desktopCache,
+      local: desktopVault,
+      remote: desktopRemote,
+      replicaId: "desktop",
+    });
+    const phone = new SyncService({
+      cache: new MemorySyncCache(),
+      local: phoneVault,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+    await desktop.initializeNew("vault-1");
+    await phone.synchronize();
+    await phoneVault.write("notes/old.md", new TextEncoder().encode("phone edit"));
+    await desktopVault.move("notes/old.md", "notes/desktop-name.md");
+    const cachedFile = desktopCache.state?.files["notes/old.md"];
+    if (!desktopCache.state || !cachedFile) {
+      throw new Error("Expected desktop cache");
+    }
+    delete desktopCache.state.files["notes/old.md"];
+    desktopCache.state.files["notes/desktop-name.md"] = {
+      ...cachedFile,
+      path: "notes/desktop-name.md",
+    };
+    await desktop.synchronize();
+
+    const result = await phone.synchronize();
+
+    expect(result.status).toBe("complete");
+    expect(phoneVault.readText("notes/old.md")).toBeUndefined();
+    expect(phoneVault.readText("notes/desktop-name.md")).toBe("phone edit");
+    const head = await phoneRemote.readHead();
+    if (!head) {
+      throw new Error("Expected merged edit Head");
+    }
+    const snapshot = await phoneRemote.readSnapshot(head.value);
+    expect(Object.values(snapshot.entries)[0]).toMatchObject({
+      kind: "live",
+      path: "notes/desktop-name.md",
+      revision: { size: 10 },
+    });
+  });
+
+  it("blocks a remote rename when its target is already a different local file", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const desktopVault = new MemoryVault();
+    const phoneVault = new MemoryVault();
+    await desktopVault.write("notes/a.md", new TextEncoder().encode("remote"));
+    const desktop = new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: desktopRemote,
+      replicaId: "desktop",
+    });
+    const phone = new SyncService({
+      cache: new MemorySyncCache(),
+      local: phoneVault,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+    await desktop.initializeNew("vault-1");
+    await phone.synchronize();
+    await phoneVault.write("notes/b.md", new TextEncoder().encode("local draft"));
+    await desktopVault.move("notes/a.md", "notes/b.md");
+    await desktop.synchronize();
+
+    const result = await phone.synchronize();
+
+    expect(result.status).toBe("action-required");
+    expect(result.localIssues).toEqual([
+      { kind: "path-collision", paths: ["notes/b.md"] },
+    ]);
+    expect(phoneVault.readText("notes/a.md")).toBe("remote");
+    expect(phoneVault.readText("notes/b.md")).toBe("local draft");
+  });
+
+  it("preserves a target created after a remote move was planned", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const desktopVault = new MemoryVault();
+    const phoneVault = new MemoryVault();
+    await desktopVault.write("notes/a.md", new TextEncoder().encode("remote"));
+    const desktop = new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: desktopRemote,
+      replicaId: "desktop",
+    });
+    const phone = new SyncService({
+      cache: new MemorySyncCache(),
+      local: phoneVault,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+    await desktop.initializeNew("vault-1");
+    await phone.synchronize();
+    await desktopVault.move("notes/a.md", "notes/b.md");
+    await desktop.synchronize();
+    phoneVault.beforeMove = async (_fromPath, toPath) => {
+      phoneVault.beforeMove = undefined;
+      await phoneVault.write(toPath, new TextEncoder().encode("last-moment draft"));
+    };
+
+    await expect(phone.synchronize()).rejects.toThrow(
+      "Local file changed during synchronization: notes/b.md",
+    );
+
+    expect(phoneVault.readText("notes/a.md")).toBe("remote");
+    expect(phoneVault.readText("notes/b.md")).toBe("last-moment draft");
+  });
+
+  it("blocks an offline rename when a new file reuses the old path", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write("notes/b.md", new TextEncoder().encode("tracked"));
+    const cache = new MemorySyncCache();
+    const service = new SyncService({
+      cache,
+      local,
+      remote,
+      replicaId: "desktop",
+    });
+    await service.initializeNew("vault-1");
+    const initialHead = await remote.readHead();
+    if (!initialHead || !cache.state) {
+      throw new Error("Expected initialized state");
+    }
+    await local.move("notes/b.md", "notes/c.md");
+    const cachedFile = cache.state.files["notes/b.md"];
+    if (!cachedFile) {
+      throw new Error("Expected cached Entry");
+    }
+    delete cache.state.files["notes/b.md"];
+    cache.state.files["notes/c.md"] = {
+      ...cachedFile,
+      path: "notes/c.md",
+    };
+    await local.write("notes/b.md", new TextEncoder().encode("new local file"));
+
+    const result = await service.synchronize();
+
+    expect(result.status).toBe("action-required");
+    expect(result.localIssues).toEqual([
+      { kind: "path-collision", paths: ["notes/b.md"] },
+    ]);
+    expect(local.readText("notes/b.md")).toBe("new local file");
+    expect(local.readText("notes/c.md")).toBe("tracked");
+    await expect(remote.readHead()).resolves.toMatchObject({
+      value: { commitId: initialHead.value.commitId },
+    });
+  });
+
+  it("does not assign one missing Entry identity to two identical new files", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write("notes/old.md", new TextEncoder().encode("same"));
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      remote,
+      replicaId: "desktop",
+    });
+    await service.initializeNew("vault-1");
+    const initialGeneration = (await remote.readHead())?.value.generation;
+    await local.delete("notes/old.md");
+    await local.write("notes/new-1.md", new TextEncoder().encode("same"));
+    await local.write("notes/new-2.md", new TextEncoder().encode("same"));
+
+    const result = await service.synchronize();
+
+    expect(result.status).toBe("action-required");
+    expect(result.localIssues).toEqual([
+      {
+        kind: "possible-rename",
+        newPaths: ["notes/new-1.md", "notes/new-2.md"],
+        oldPaths: ["notes/old.md"],
+      },
+    ]);
+    expect((await remote.readHead())?.value.generation).toBe(initialGeneration);
   });
 
   it("publishes a rename and edit as one updated live Entry", async () => {
