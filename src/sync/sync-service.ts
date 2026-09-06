@@ -234,6 +234,14 @@ export class SyncService {
         throw new Error(`Local file changed while reading ${file.path}`);
       }
       await this.options.remote.writeBlob(blobId, plaintext);
+      const revision: RevisionRef = {
+        blobId,
+        contentHash: file.contentHash,
+        createdAt,
+        revisionId,
+        size: file.size,
+      };
+      await this.assertRemoteRevision(revision);
       completed += 1;
       transferredBytes += file.size;
       this.reportProgress({
@@ -248,13 +256,7 @@ export class SyncService {
         entryId,
         kind: "live",
         path: file.path,
-        revision: {
-          blobId,
-          contentHash: file.contentHash,
-          createdAt,
-          revisionId,
-          size: file.size,
-        },
+        revision,
       };
       cacheFiles[file.path] = { ...file, entryId };
     }
@@ -386,17 +388,19 @@ export class SyncService {
     const entryId = crypto.randomUUID();
     const blobId = crypto.randomUUID();
     await this.options.remote.writeBlob(blobId, plaintext);
+    const revision: RevisionRef = {
+      blobId,
+      contentHash: await sha256(plaintext),
+      createdAt,
+      revisionId: crypto.randomUUID(),
+      size: plaintext.byteLength,
+    };
+    await this.assertRemoteRevision(revision);
     const entry: VaultEntry = {
       entryId,
       kind: "live",
       path,
-      revision: {
-        blobId,
-        contentHash: await sha256(plaintext),
-        createdAt,
-        revisionId: crypto.randomUUID(),
-        size: plaintext.byteLength,
-      },
+      revision,
     };
     const commitId = crypto.randomUUID();
     await this.options.remote.advance({
@@ -1200,18 +1204,20 @@ export class SyncService {
                   ...(current.history ?? []),
                 ]
               : [];
+          const revision: RevisionRef = {
+            blobId,
+            contentHash: change.file.contentHash,
+            createdAt,
+            revisionId: crypto.randomUUID(),
+            size: change.file.size,
+          };
+          await this.assertRemoteRevision(revision);
           changedEntry = {
             entryId: change.entryId,
             history: previousRevisions,
             kind: "live",
             path: change.path,
-            revision: {
-              blobId,
-              contentHash: change.file.contentHash,
-              createdAt,
-              revisionId: crypto.randomUUID(),
-              size: change.file.size,
-            },
+            revision,
           };
         }
         nextEntries[change.entryId] = changedEntry;
@@ -1258,6 +1264,7 @@ export class SyncService {
           revisionId: crypto.randomUUID(),
           size: conflict.localFile.size,
         };
+        await this.assertRemoteRevision(localRevision);
         if (conflict.kind === "edit-delete") {
           if (remoteEntry?.kind !== "deleted") {
             throw new Error(`Expected deleted Entry ${conflict.entryId}`);
@@ -1324,6 +1331,14 @@ export class SyncService {
           if (merged) {
             const mergedBlobId = crypto.randomUUID();
             await this.options.remote.writeBlob(mergedBlobId, merged);
+            const mergedRevision: RevisionRef = {
+              blobId: mergedBlobId,
+              contentHash: await sha256(merged),
+              createdAt,
+              revisionId: crypto.randomUUID(),
+              size: merged.byteLength,
+            };
+            await this.assertRemoteRevision(mergedRevision);
             changedEntry = {
               entryId: conflict.entryId,
               history: [
@@ -1333,13 +1348,7 @@ export class SyncService {
               ],
               kind: "live",
               path: conflict.path,
-              revision: {
-                blobId: mergedBlobId,
-                contentHash: await sha256(merged),
-                createdAt,
-                revisionId: crypto.randomUUID(),
-                size: merged.byteLength,
-              },
+              revision: mergedRevision,
             };
             writeAfterCommit.push({
               body: merged,

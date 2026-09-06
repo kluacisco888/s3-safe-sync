@@ -50,7 +50,7 @@ Sync Commits form an immutable parent-linked history. The accepted Head identifi
 4. Ambiguous rename, bootstrap, or path collision requires explicit resolution.
 5. A local cache loss triggers remote bootstrap, never loss of deletion history.
 6. Live files are replaced only after staged content authenticates and its plaintext hash matches.
-7. Head never references a blob or commit that was not uploaded successfully first.
+7. Head never references a blob or commit that was not uploaded successfully first. Every newly uploaded Blob is read back, authenticated, and checked against its plaintext size and hash before publication.
 8. Every Head read checks that all referenced blob keys still exist. Before publishing a change to an existing Entry, its current decision-bearing Revision is downloaded, authenticated, and matched to its encrypted plaintext size and hash.
 9. A local draft created from a deleted base conflicts with a concurrent remote Restore; neither version is overwritten. Before replacing any materialized local version, the plugin verifies that an authenticated remote recovery copy of that exact plaintext still exists.
 

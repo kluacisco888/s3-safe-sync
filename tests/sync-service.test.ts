@@ -20,6 +20,7 @@ import { SyncRequestQueue } from "../src/sync/sync-request-queue";
 class MemoryObjectStore implements ObjectStore {
   private sequence = 0;
   private readonly objects = new Map<string, StoredObject>();
+  corruptNextBlobPut = false;
   onGet: ((key: string) => Promise<void> | void) | undefined;
 
   async delete(key: string): Promise<void> {
@@ -47,8 +48,14 @@ class MemoryObjectStore implements ObjectStore {
     if (options.ifMatch !== undefined && current?.etag !== options.ifMatch) {
       throw new ObjectPreconditionError();
     }
+    const shouldCorrupt = this.corruptNextBlobPut && key.includes("/blobs/");
+    if (shouldCorrupt) {
+      this.corruptNextBlobPut = false;
+    }
     const value = {
-      body: body.slice(),
+      body: shouldCorrupt
+        ? new TextEncoder().encode("corrupted ciphertext")
+        : body.slice(),
       etag: `etag-${++this.sequence}`,
       lastModified: "2026-09-05T00:00:00.000Z",
     };
@@ -1929,6 +1936,61 @@ describe("SyncService", () => {
         reason: "edit-edit",
       }),
     ]);
+  });
+
+  it("does not publish or replace a local Conflict candidate until its upload authenticates", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const desktopVault = new MemoryVault();
+    const phoneVault = new MemoryVault();
+    await desktopVault.write("notes/example.md", new TextEncoder().encode("base"));
+    const desktop = new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: desktopRemote,
+      replicaId: "desktop",
+    });
+    const phone = new SyncService({
+      cache: new MemorySyncCache(),
+      local: phoneVault,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+    await desktop.initializeNew("vault-1");
+    await phone.synchronize();
+    await desktopVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("desktop edit"),
+    );
+    await phoneVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("phone edit"),
+    );
+    await desktop.synchronize();
+    const before = await phoneRemote.readHead();
+    if (!before) {
+      throw new Error("Expected desktop edit Head");
+    }
+    objects.corruptNextBlobPut = true;
+
+    await expect(phone.synchronize()).rejects.toThrow(
+      "cannot be authenticated",
+    );
+
+    expect(phoneVault.readText("notes/example.md")).toBe("phone edit");
+    await expect(phoneRemote.readHead()).resolves.toMatchObject({
+      value: { commitId: before.value.commitId },
+    });
   });
 
   it("imports an unknown local file only after explicit confirmation", async () => {
