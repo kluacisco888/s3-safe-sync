@@ -1,4 +1,4 @@
-import { App, Modal } from "obsidian";
+import { App, Modal, Notice } from "obsidian";
 
 import type {
   ConflictedEntry,
@@ -9,6 +9,11 @@ import type {
   DeferredDownloadEntry,
   LocalSyncIssue,
 } from "../sync/sync-service";
+import {
+  decodeDeletedPreview,
+  MAX_DELETED_PREVIEW_BYTES,
+} from "./deleted-preview";
+import { copyText } from "./clipboard";
 
 export interface StatusModalController {
   confirmBulkDeletion(): Promise<void>;
@@ -25,6 +30,7 @@ export interface StatusModalController {
   isPaused(): boolean;
   keepConflictDeleted(entryId: string): Promise<void>;
   resolveConflict(entryId: string, revisionId: string): Promise<void>;
+  readDeletedRecovery(entryId: string): Promise<Uint8Array>;
   restoreDeleted(entryId: string): Promise<void>;
   syncNow(): Promise<void>;
   togglePause(): Promise<void>;
@@ -63,6 +69,63 @@ class RiskConfirmationModal extends Modal {
   }
 }
 
+class DeletedFilePreviewModal extends Modal {
+  constructor(
+    app: App,
+    private readonly entry: DeletedEntry,
+    private readonly loadContent: () => Promise<Uint8Array>,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.contentEl.empty();
+    this.contentEl.createEl("h2", { text: "Deleted file preview" });
+    this.contentEl.createDiv({
+      cls: "s3-vault-sync-selectable-path",
+      text: this.entry.path,
+    });
+    const recovery = this.entry.recovery;
+    if (!recovery) {
+      this.contentEl.createEl("p", { text: "No recovery content is available." });
+      return;
+    }
+    this.contentEl.createEl("p", {
+      cls: "s3-vault-sync-muted",
+      text: `${recovery.size} bytes · recoverable until ${recovery.expiresAt}`,
+    });
+    const preview = this.contentEl.createDiv({
+      cls: "s3-vault-sync-preview-content",
+    });
+    if (recovery.size > MAX_DELETED_PREVIEW_BYTES) {
+      preview.setText("This file is too large to preview. You can still restore it.");
+      return;
+    }
+    preview.setText("Loading encrypted recovery content…");
+    void this.loadContent()
+      .then((body) => {
+        preview.empty();
+        const text = decodeDeletedPreview(body);
+        if (text === undefined) {
+          preview.setText("This binary file cannot be shown as text.");
+          return;
+        }
+        preview.createEl("pre", { text });
+      })
+      .catch((error: unknown) => {
+        preview.empty();
+        preview.createDiv({
+          cls: "s3-vault-sync-error",
+          text: error instanceof Error ? error.message : "Preview failed.",
+        });
+      });
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
 export class StatusModal extends Modal {
   constructor(
     app: App,
@@ -75,12 +138,12 @@ export class StatusModal extends Modal {
     this.contentEl.empty();
     this.contentEl.createEl("h2", { text: "S3 Vault Sync" });
     this.contentEl.createEl("p", { text: this.controller.getStatusText() });
+    this.renderActions();
     this.renderBulkDeletion();
     this.renderConflicts();
     this.renderLocalIssues();
     this.renderDeferredDownloads();
     this.renderDeletedRecoveries();
-    this.renderActions();
   }
 
   onClose(): void {
@@ -89,6 +152,7 @@ export class StatusModal extends Modal {
 
   private renderActions(): void {
     const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+    actions.addClass("s3-vault-sync-toolbar");
     actions.createEl("button", { text: "Sync now" }).addEventListener("click", () => {
       void this.controller.syncNow().then(() => this.onOpen());
     });
@@ -198,11 +262,60 @@ export class StatusModal extends Modal {
     }
     this.contentEl.createEl("h3", { text: "Deleted files (30-day recovery)" });
     for (const entry of deleted) {
-      const item = this.contentEl.createDiv({ cls: "s3-vault-sync-history" });
-      item.createSpan({ text: entry.path });
-      item.createEl("button", { text: "Restore" }).addEventListener("click", () => {
-        void this.controller.restoreDeleted(entry.entryId).then(() => this.onOpen());
+      const item = this.contentEl.createDiv({ cls: "s3-vault-sync-deleted-row" });
+      const previewTarget = item.createDiv({
+        cls: "s3-vault-sync-deleted-preview",
       });
+      previewTarget.setAttr("role", "button");
+      previewTarget.setAttr("tabindex", "0");
+      previewTarget.setAttr("aria-label", `Preview deleted file ${entry.path}`);
+      previewTarget.createDiv({
+        cls: "s3-vault-sync-selectable-path",
+        text: entry.path,
+      });
+      previewTarget.createDiv({
+        cls: "s3-vault-sync-muted",
+        text: "Click to preview",
+      });
+      const openPreview = (): void => {
+        new DeletedFilePreviewModal(
+          this.app,
+          entry,
+          () => this.controller.readDeletedRecovery(entry.entryId),
+        ).open();
+      };
+      previewTarget.addEventListener("click", () => {
+        if (!previewTarget.ownerDocument.getSelection()?.toString()) {
+          openPreview();
+        }
+      });
+      previewTarget.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          openPreview();
+        }
+      });
+      const actions = item.createDiv({ cls: "s3-vault-sync-deleted-actions" });
+      actions.createEl("button", { text: "Copy path" }).addEventListener(
+        "click",
+        () => {
+          void copyText(entry.path).then((copied) => {
+            new Notice(
+              copied
+                ? "Deleted file path copied"
+                : "Clipboard unavailable; select the path to copy it",
+            );
+          });
+        },
+      );
+      actions.createEl("button", { text: "Restore" }).addEventListener(
+        "click",
+        () => {
+          void this.controller
+            .restoreDeleted(entry.entryId)
+            .then(() => this.onOpen());
+        },
+      );
     }
   }
 

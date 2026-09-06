@@ -312,6 +312,19 @@ export default class S3VaultSyncPlugin
     }
   }
 
+  async readDeletedRecovery(entryId: string): Promise<Uint8Array> {
+    const vaultKey = this.credentials.loadVaultKey();
+    if (!vaultKey) {
+      throw new Error("Unlock the encrypted Vault first");
+    }
+    const remote = await RemoteStore.open({
+      objects: this.createObjectStore(),
+      prefix: this.data.settings.prefix,
+      vaultKey,
+    });
+    return this.createSyncService(remote).readDeletedRecovery(entryId);
+  }
+
   async restoreDeleted(entryId: string): Promise<void> {
     try {
       const vaultKey = this.credentials.loadVaultKey();

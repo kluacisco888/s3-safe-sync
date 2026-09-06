@@ -15,6 +15,7 @@ The plugin does not run after Obsidian is closed, provide telemetry, synchronize
 - Mirror normal files to mobile up to 50 MB. Android transfers use bounded S3 ranges and multipart requests; larger remote files are listed as unavailable on that device, and larger local files are explicitly unsynchronized.
 - Delay mobile attachments above 10 MB until Wi-Fi by default.
 - Offer a 30-day per-file Version History and an encrypted shared Conflict Center.
+- Keep manual sync and pause controls at the top of the status view. Deleted-file paths are selectable and copyable, and UTF-8 recovery content up to 1 MiB can be previewed read-only before restoration.
 
 ## Sync Scope
 

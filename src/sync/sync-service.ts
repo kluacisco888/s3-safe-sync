@@ -2,6 +2,7 @@ import { diff3Merge } from "node-diff3";
 
 import {
   SyncEngine,
+  type DeletedEntry,
   type ReplicaObservation,
   type RevisionRef,
   type VaultEntry,
@@ -557,6 +558,19 @@ export class SyncService {
     );
   }
 
+  async readDeletedRecovery(entryId: string): Promise<Uint8Array> {
+    const versionedHead = await this.options.remote.readHead();
+    if (!versionedHead) {
+      throw new Error("Remote Store is not initialized");
+    }
+    const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
+    const deleted = snapshot.entries[entryId];
+    if (deleted?.kind !== "deleted" || !deleted.recovery) {
+      throw new Error(`Entry ${entryId} has no Recovery Copy`);
+    }
+    return this.readRecoveryCopy(deleted, versionedHead.serverDate);
+  }
+
   async restoreDeleted(entryId: string): Promise<void> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
@@ -567,16 +581,10 @@ export class SyncService {
     if (deleted?.kind !== "deleted" || !deleted.recovery) {
       throw new Error(`Entry ${entryId} has no Recovery Copy`);
     }
-    const plaintext = await this.options.remote.readBlob(deleted.recovery.blobId);
-    if (!plaintext || (await sha256(plaintext)) !== deleted.recovery.contentHash) {
-      throw new Error(`Recovery Copy for ${entryId} is damaged`);
-    }
-    if (
-      Date.parse(deleted.recovery.expiresAt) <=
-      Date.parse(versionedHead.serverDate)
-    ) {
-      throw new Error(`Recovery Copy for ${entryId} has expired`);
-    }
+    const plaintext = await this.readRecoveryCopy(
+      deleted,
+      versionedHead.serverDate,
+    );
     const createdAt = versionedHead.serverDate;
     const restoredEntry: VaultEntry = {
       entryId,
@@ -614,6 +622,24 @@ export class SyncService {
         vaultId: snapshot.vaultId,
       }),
     );
+  }
+
+  private async readRecoveryCopy(
+    deleted: DeletedEntry,
+    serverDate: string,
+  ): Promise<Uint8Array> {
+    const recovery = deleted.recovery;
+    if (!recovery) {
+      throw new Error(`Entry ${deleted.entryId} has no Recovery Copy`);
+    }
+    const plaintext = await this.options.remote.readBlob(recovery.blobId);
+    if (!plaintext || (await sha256(plaintext)) !== recovery.contentHash) {
+      throw new Error(`Recovery Copy for ${deleted.entryId} is damaged`);
+    }
+    if (Date.parse(recovery.expiresAt) <= Date.parse(serverDate)) {
+      throw new Error(`Recovery Copy for ${deleted.entryId} has expired`);
+    }
+    return plaintext;
   }
 
   async synchronize(): Promise<SyncResult> {

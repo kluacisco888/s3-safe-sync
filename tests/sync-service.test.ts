@@ -1313,6 +1313,11 @@ describe("SyncService", () => {
     await local.delete("notes/example.md");
     await service.synchronize();
 
+    expect(
+      new TextDecoder().decode(await service.readDeletedRecovery(entryId)),
+    ).toBe("recover me");
+    expect(local.readText("notes/example.md")).toBeUndefined();
+
     await service.restoreDeleted(entryId);
 
     expect(local.readText("notes/example.md")).toBe("recover me");
