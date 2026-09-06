@@ -5,6 +5,16 @@ import {
   type VaultDeletionPort,
 } from "../src/plugin/vault-delete";
 
+const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
+
+const hash = async (body: Uint8Array): Promise<string> => {
+  const digest = await crypto.subtle.digest("SHA-256", body.slice().buffer);
+  const hex = Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  return `sha256:${hex}`;
+};
+
 interface TestNode {
   kind: "file" | "folder";
 }
@@ -16,8 +26,10 @@ class MemoryDeletionVault implements VaultDeletionPort<TestNode> {
   statType: "file" | "folder" | null = "file";
   trashLocalSucceeds = false;
   trashSucceeds = false;
+  content = bytes("before");
   readonly adapter = {
     exists: vi.fn(async () => this.exists),
+    readBinary: vi.fn(async () => this.content.slice().buffer),
     remove: vi.fn(async () => {
       if (this.removeSucceeds) {
         this.exists = false;
@@ -142,5 +154,55 @@ describe("deleteVaultPath", () => {
     await expect(
       deleteVaultPath(vault, "notes/example.md", isFile),
     ).rejects.toThrow("still exists after deletion");
+  });
+
+  it("stops before deletion when the file no longer matches the plan", async () => {
+    const vault = new MemoryDeletionVault();
+    vault.content = bytes("new local edit");
+
+    await expect(
+      deleteVaultPath(
+        vault,
+        "notes/example.md",
+        isFile,
+        await hash(bytes("before")),
+      ),
+    ).rejects.toThrow("Local file changed during synchronization");
+
+    expect(vault.trash).not.toHaveBeenCalled();
+    expect(vault.adapter.trashLocal).not.toHaveBeenCalled();
+    expect(vault.adapter.remove).not.toHaveBeenCalled();
+  });
+
+  it("rechecks content before a permanent fallback", async () => {
+    const vault = new MemoryDeletionVault();
+    const expectedHash = await hash(vault.content);
+    vault.adapter.trashLocal.mockImplementationOnce(async () => {
+      vault.content = bytes("edit made while trash was attempted");
+    });
+
+    await expect(
+      deleteVaultPath(vault, "notes/example.md", isFile, expectedHash),
+    ).rejects.toThrow("Local file changed during synchronization");
+
+    expect(vault.adapter.remove).not.toHaveBeenCalled();
+    expect(vault.exists).toBe(true);
+  });
+
+  it("never uses permanent deletion for a synchronized file", async () => {
+    const vault = new MemoryDeletionVault();
+
+    await expect(
+      deleteVaultPath(
+        vault,
+        "notes/example.md",
+        isFile,
+        await hash(vault.content),
+      ),
+    ).rejects.toThrow("refusing permanent deletion");
+
+    expect(vault.delete).not.toHaveBeenCalled();
+    expect(vault.adapter.remove).not.toHaveBeenCalled();
+    expect(vault.exists).toBe(true);
   });
 });

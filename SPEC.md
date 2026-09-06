@@ -51,6 +51,7 @@ Sync Commits form an immutable parent-linked history. The accepted Head identifi
 5. A local cache loss triggers remote bootstrap, never loss of deletion history.
 6. Live files are replaced only after staged content authenticates and its plaintext hash matches.
 7. Head never references a blob or commit that was not uploaded successfully first.
+8. Every Head read checks that all referenced blob keys still exist. Before publishing a change to an existing Entry, its current decision-bearing Revision is downloaded, authenticated, and matched to its encrypted plaintext size and hash.
 
 ## Encryption
 
@@ -105,5 +106,5 @@ Enable S3 Versioning in the AWS console and scope each device's IAM policy to li
 - S3 integration supports global and `aws-cn` virtual-hosted endpoints. Live `cn-northwest-1` tests have passed signed List/Get/Put/Delete, stale ETag rejection, encrypted Blob/Commit round trips, ranged reads, multipart writes, concurrent Head CAS, and an Obsidian 1.13.7 macOS initialization plus no-op synchronization through `requestUrl`.
 - Desktop transfers currently have no configured size limit but use Obsidian's whole-file binary API; streaming multipart transfer remains required before claiming arbitrarily large-file support.
 - Android network responses are fetched in 4 MiB ranges and uploads use 8 MiB multipart parts, but encryption and decryption still operate on a complete file. Final local replacement uses a verified temporary file, backup, and recovery journal so an interrupted promotion restores the old file or keeps the verified new file on the next scan. Network transfer itself is not resumable across app restarts, so mobile transfer remains Beta below the configured 50 MB ceiling.
-- Restore operations enforce the 30-day deadline using AWS-observed time. Removing expired metadata, physical orphan-blob garbage collection, and shared audit browsing remain follow-up hardening work; S3 Versioning is the operational fallback during Beta.
+- Restore operations enforce the 30-day deadline using AWS-observed time. Deleted conflict candidates retained in Version History can be previewed and restored even when no primary deletion recovery remains. Removing expired metadata, physical orphan-blob garbage collection, and shared audit browsing remain follow-up hardening work; S3 Versioning is the operational fallback during Beta.
 - Repair Mode prevents further writes when Head is missing or invalid. During Beta, selecting a previous Head version is performed in the AWS console; an in-plugin S3 Versioning browser is not yet implemented.

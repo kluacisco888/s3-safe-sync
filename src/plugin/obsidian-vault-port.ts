@@ -5,6 +5,7 @@ import { deleteVaultPath } from "./vault-delete";
 import {
   recoverPendingVaultWrites,
   safeReplaceVaultFile,
+  withVaultMutationLock,
 } from "./safe-vault-write";
 
 const EXCLUDED_SEGMENTS = new Set([
@@ -38,12 +39,18 @@ export class ObsidianVaultPort implements LocalVaultPort {
 
   constructor(private readonly vault: Vault) {}
 
-  async delete(path: string): Promise<void> {
+  async delete(
+    path: string,
+    expectedContentHash?: string | null,
+  ): Promise<void> {
     await this.ensureRecovered();
-    await deleteVaultPath(
-      this.vault,
-      normalizePath(path),
-      (candidate) => candidate instanceof TFile,
+    await withVaultMutationLock(this.vault.adapter, () =>
+      deleteVaultPath(
+        this.vault,
+        normalizePath(path),
+        (candidate) => candidate instanceof TFile,
+        expectedContentHash,
+      ),
     );
   }
 
@@ -62,18 +69,20 @@ export class ObsidianVaultPort implements LocalVaultPort {
 
   async move(fromPath: string, toPath: string): Promise<void> {
     await this.ensureRecovered();
-    const file = this.vault.getAbstractFileByPath(normalizePath(fromPath));
-    if (!(file instanceof TFile)) {
-      throw new Error(`Local Vault path does not exist: ${fromPath}`);
-    }
-    const normalizedTarget = normalizePath(toPath);
-    const parent = normalizedTarget.includes("/")
-      ? normalizedTarget.slice(0, normalizedTarget.lastIndexOf("/"))
-      : "";
-    if (parent) {
-      await this.ensureFolder(parent);
-    }
-    await this.vault.rename(file, normalizedTarget);
+    await withVaultMutationLock(this.vault.adapter, async () => {
+      const file = this.vault.getAbstractFileByPath(normalizePath(fromPath));
+      if (!(file instanceof TFile)) {
+        throw new Error(`Local Vault path does not exist: ${fromPath}`);
+      }
+      const normalizedTarget = normalizePath(toPath);
+      const parent = normalizedTarget.includes("/")
+        ? normalizedTarget.slice(0, normalizedTarget.lastIndexOf("/"))
+        : "";
+      if (parent) {
+        await this.ensureFolder(parent);
+      }
+      await this.vault.rename(file, normalizedTarget);
+    });
   }
 
   async read(path: string): Promise<Uint8Array> {

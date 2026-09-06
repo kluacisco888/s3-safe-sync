@@ -5,6 +5,7 @@ import type {
   ConflictedEntry,
   DeletedEntry,
   LiveEntry,
+  RevisionRef,
 } from "../sync/sync-engine";
 import type {
   DeferredDownloadEntry,
@@ -31,8 +32,8 @@ export interface StatusModalController {
   isPaused(): boolean;
   keepConflictDeleted(entryId: string): Promise<void>;
   resolveConflict(entryId: string, revisionId: string): Promise<void>;
-  readDeletedRecovery(entryId: string): Promise<Uint8Array>;
-  restoreDeleted(entryId: string): Promise<void>;
+  readDeletedRecovery(entryId: string, revisionId?: string): Promise<Uint8Array>;
+  restoreDeleted(entryId: string, revisionId?: string): Promise<void>;
   syncNow(): Promise<void>;
   togglePause(): Promise<void>;
 }
@@ -74,6 +75,7 @@ class DeletedFilePreviewModal extends Modal {
   constructor(
     app: App,
     private readonly entry: DeletedEntry,
+    private readonly revision: RevisionRef,
     private readonly loadContent: () => Promise<Uint8Array>,
   ) {
     super(app);
@@ -86,19 +88,18 @@ class DeletedFilePreviewModal extends Modal {
       cls: "s3-vault-sync-selectable-path",
       text: this.entry.path,
     });
-    const recovery = this.entry.recovery;
-    if (!recovery) {
-      this.contentEl.createEl("p", { text: "No recovery content is available." });
-      return;
-    }
     this.contentEl.createEl("p", {
       cls: "s3-vault-sync-muted",
-      text: `${recovery.size} bytes · recoverable until ${recovery.expiresAt}`,
+      text: `${this.revision.size} bytes${
+        this.revision.expiresAt
+          ? ` · recoverable until ${this.revision.expiresAt}`
+          : ""
+      }`,
     });
     const preview = this.contentEl.createDiv({
       cls: "s3-vault-sync-preview-content",
     });
-    if (recovery.size > MAX_DELETED_PREVIEW_BYTES) {
+    if (this.revision.size > MAX_DELETED_PREVIEW_BYTES) {
       preview.setText("This file is too large to preview. You can still restore it.");
       return;
     }
@@ -263,39 +264,45 @@ export class StatusModal extends Modal {
     }
     this.contentEl.createEl("h3", { text: "Deleted files (30-day recovery)" });
     for (const entry of deleted) {
+      const recovery = entry.recovery;
       const item = this.contentEl.createDiv({ cls: "s3-vault-sync-deleted-row" });
       const previewTarget = item.createDiv({
         cls: "s3-vault-sync-deleted-preview",
       });
-      previewTarget.setAttr("role", "button");
-      previewTarget.setAttr("tabindex", "0");
-      previewTarget.setAttr("aria-label", `Preview deleted file ${entry.path}`);
       previewTarget.createDiv({
         cls: "s3-vault-sync-selectable-path",
         text: entry.path,
       });
       previewTarget.createDiv({
         cls: "s3-vault-sync-muted",
-        text: "Click to preview",
+        text: recovery
+          ? "Click to preview"
+          : "Primary recovery unavailable; open version history",
       });
-      const openPreview = (): void => {
-        new DeletedFilePreviewModal(
-          this.app,
-          entry,
-          () => this.controller.readDeletedRecovery(entry.entryId),
-        ).open();
-      };
-      previewTarget.addEventListener("click", () => {
-        if (!previewTarget.ownerDocument.getSelection()?.toString()) {
-          openPreview();
-        }
-      });
-      previewTarget.addEventListener("keydown", (event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          openPreview();
-        }
-      });
+      if (recovery) {
+        previewTarget.setAttr("role", "button");
+        previewTarget.setAttr("tabindex", "0");
+        previewTarget.setAttr("aria-label", `Preview deleted file ${entry.path}`);
+        const openPreview = (): void => {
+          new DeletedFilePreviewModal(
+            this.app,
+            entry,
+            recovery,
+            () => this.controller.readDeletedRecovery(entry.entryId),
+          ).open();
+        };
+        previewTarget.addEventListener("click", () => {
+          if (!previewTarget.ownerDocument.getSelection()?.toString()) {
+            openPreview();
+          }
+        });
+        previewTarget.addEventListener("keydown", (event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            openPreview();
+          }
+        });
+      }
       const actions = item.createDiv({ cls: "s3-vault-sync-deleted-actions" });
       actions.createEl("button", { text: "Copy path" }).addEventListener(
         "click",
@@ -309,14 +316,27 @@ export class StatusModal extends Modal {
           });
         },
       );
-      actions.createEl("button", { text: "Restore" }).addEventListener(
-        "click",
-        () => {
-          void this.controller
-            .restoreDeleted(entry.entryId)
-            .then(() => this.onOpen());
-        },
-      );
+      if (recovery) {
+        actions.createEl("button", { text: "Restore" }).addEventListener(
+          "click",
+          () => {
+            void this.controller
+              .restoreDeleted(entry.entryId)
+              .then(() => this.onOpen());
+          },
+        );
+      }
+      if ((entry.history?.length ?? 0) > 0) {
+        actions
+          .createEl("button", { text: "Version history" })
+          .addEventListener("click", () => {
+            new DeletedVersionHistoryModal(
+              this.app,
+              this.controller,
+              entry,
+            ).open();
+          });
+      }
     }
   }
 
@@ -359,6 +379,48 @@ export class StatusModal extends Modal {
         });
       }
     }
+  }
+}
+
+class DeletedVersionHistoryModal extends Modal {
+  constructor(
+    app: App,
+    private readonly controller: StatusModalController,
+    private readonly entry: DeletedEntry,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.contentEl.empty();
+    this.contentEl.createEl("h2", {
+      text: `Deleted version history: ${this.entry.path}`,
+    });
+    for (const revision of this.entry.history ?? []) {
+      const row = this.contentEl.createDiv({ cls: "s3-vault-sync-history" });
+      row.createSpan({ text: `${revision.createdAt} · ${revision.size} bytes` });
+      row.createEl("button", { text: "Preview" }).addEventListener("click", () => {
+        new DeletedFilePreviewModal(
+          this.app,
+          this.entry,
+          revision,
+          () =>
+            this.controller.readDeletedRecovery(
+              this.entry.entryId,
+              revision.revisionId,
+            ),
+        ).open();
+      });
+      row.createEl("button", { text: "Restore" }).addEventListener("click", () => {
+        void this.controller
+          .restoreDeleted(this.entry.entryId, revision.revisionId)
+          .then(() => this.close());
+      });
+    }
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
   }
 }
 

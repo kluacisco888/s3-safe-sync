@@ -166,6 +166,7 @@ describe("RemoteStore", () => {
       commit: commit("commit-1", undefined, [liveEntry]),
       head: head("commit-1", 1),
     });
+    await remote.writeBlob("blob-1", new TextEncoder().encode("old"));
     const currentHead = await remote.readHead();
     if (!currentHead) {
       throw new Error("Expected initialized Head");
@@ -204,6 +205,7 @@ describe("RemoteStore", () => {
       commit: initialCommit,
       head: head("commit-1", 1),
     });
+    await remote.writeBlob("blob-1", new TextEncoder().encode("old"));
     const initialHead = await remote.readHead();
     if (!initialHead) {
       throw new Error("Expected initialized Head");
@@ -227,5 +229,41 @@ describe("RemoteStore", () => {
     }
 
     await expect(remote.readSnapshot(currentHead.value)).resolves.toEqual(snapshot);
+  });
+
+  it("rejects a Snapshot whose referenced blob is missing", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const liveEntry: VaultEntry = {
+      entryId: "entry-1",
+      kind: "live",
+      path: "notes/example.md",
+      revision: {
+        blobId: "blob-1",
+        contentHash: "sha256:old",
+        createdAt: "2026-09-05T00:00:00.000Z",
+        revisionId: "revision-1",
+        size: 3,
+      },
+    };
+    await remote.writeBlob("blob-1", new TextEncoder().encode("old"));
+    await remote.initialize({
+      commit: commit("commit-1", undefined, [liveEntry]),
+      head: head("commit-1", 1),
+    });
+    const currentHead = await remote.readHead();
+    if (!currentHead) {
+      throw new Error("Expected initialized Head");
+    }
+    await objects.delete("chosen-prefix/v1/blobs/blob-1");
+
+    await expect(remote.readSnapshot(currentHead.value)).rejects.toThrow(
+      "Vault Snapshot references missing blobs: blob-1",
+    );
   });
 });

@@ -25,8 +25,8 @@ import {
   type LocalSyncIssue,
   type SyncCachePort,
   type SyncProgress,
-  LocalStateChangedError,
 } from "./sync/sync-service";
+import { LocalStateChangedError } from "./sync/errors";
 import type {
   BulkDeletionPlan,
   ConflictedEntry,
@@ -173,13 +173,17 @@ export default class S3VaultSyncPlugin
       }
     });
     this.registerDomEvent(window, "pagehide", () => {
-      if (!this.data.settings.paused) {
-        void this.syncNow();
-      }
+      this.requestFinalSync();
+    });
+    this.registerDomEvent(window, "beforeunload", () => {
+      this.requestFinalSync();
     });
   }
 
   onunload(): void {
+    if (document.visibilityState === "hidden") {
+      this.requestFinalSync();
+    }
     if (this.changeTimer !== undefined) {
       window.clearTimeout(this.changeTimer);
     }
@@ -239,7 +243,8 @@ export default class S3VaultSyncPlugin
   getDeletedRecoveries(): DeletedEntry[] {
     return Object.values(this.data.cache?.snapshot.entries ?? {}).filter(
       (entry): entry is DeletedEntry =>
-        entry.kind === "deleted" && entry.recovery !== undefined,
+        entry.kind === "deleted" &&
+        (entry.recovery !== undefined || (entry.history?.length ?? 0) > 0),
     );
   }
 
@@ -328,7 +333,10 @@ export default class S3VaultSyncPlugin
     }
   }
 
-  async readDeletedRecovery(entryId: string): Promise<Uint8Array> {
+  async readDeletedRecovery(
+    entryId: string,
+    revisionId?: string,
+  ): Promise<Uint8Array> {
     const vaultKey = this.credentials.loadVaultKey();
     if (!vaultKey) {
       throw new Error("Unlock the encrypted Vault first");
@@ -338,10 +346,13 @@ export default class S3VaultSyncPlugin
       prefix: this.data.settings.prefix,
       vaultKey,
     });
-    return this.createSyncService(remote).readDeletedRecovery(entryId);
+    return this.createSyncService(remote).readDeletedRecovery(
+      entryId,
+      revisionId,
+    );
   }
 
-  async restoreDeleted(entryId: string): Promise<void> {
+  async restoreDeleted(entryId: string, revisionId?: string): Promise<void> {
     try {
       const vaultKey = this.credentials.loadVaultKey();
       if (!vaultKey) {
@@ -352,7 +363,7 @@ export default class S3VaultSyncPlugin
         prefix: this.data.settings.prefix,
         vaultKey,
       });
-      await this.createSyncService(remote).restoreDeleted(entryId);
+      await this.createSyncService(remote).restoreDeleted(entryId, revisionId);
       this.setStatus("Idle", "Deleted file restored as a new Revision.");
     } catch (error) {
       this.showError(error);
@@ -731,6 +742,12 @@ export default class S3VaultSyncPlugin
       this.changeTimer = undefined;
       void this.syncNow();
     }, 5_000);
+  }
+
+  private requestFinalSync(): void {
+    if (this.data && !this.data.settings.paused) {
+      void this.syncNow();
+    }
   }
 
   private setStatus(

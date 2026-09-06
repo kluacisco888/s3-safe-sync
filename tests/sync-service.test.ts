@@ -915,11 +915,56 @@ describe("SyncService", () => {
     );
 
     await expect(phone.synchronize()).rejects.toThrow(
-      "Recovery Copy for",
+      "Vault Snapshot references missing blobs",
     );
 
     expect(phoneVault.readText("notes/example.md")).toBe(
       "only recoverable copy",
+    );
+  });
+
+  it("does not publish when the remote live Revision is corrupted", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write("notes/example.md", new TextEncoder().encode("before"));
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      remote,
+      replicaId: "desktop",
+    });
+    await service.initializeNew("vault-1");
+    const initialHead = await remote.readHead();
+    if (!initialHead) {
+      throw new Error("Expected initialized Head");
+    }
+    const initial = await remote.readSnapshot(initialHead.value);
+    const entry = Object.values(initial.entries)[0];
+    if (entry?.kind !== "live") {
+      throw new Error("Expected live Entry");
+    }
+    const keysBefore = await objects.list("chosen-prefix/v1/");
+    await objects.put(
+      `chosen-prefix/v1/blobs/${entry.revision.blobId}`,
+      new TextEncoder().encode("corrupted ciphertext"),
+    );
+    await local.write("notes/example.md", new TextEncoder().encode("after"));
+
+    await expect(service.synchronize()).rejects.toThrow(
+      "cannot be authenticated",
+    );
+
+    await expect(remote.readHead()).resolves.toMatchObject({
+      value: { commitId: initialHead.value.commitId },
+    });
+    expect(await objects.list("chosen-prefix/v1/")).toHaveLength(
+      keysBefore.length,
     );
   });
 
@@ -1553,7 +1598,7 @@ describe("SyncService", () => {
     const candidate = {
       blobId: "blob-candidate",
       contentHash:
-        "sha256:a70c756cd47ddf26be4ea49c0f09a0122f8e648e172f0d46aa60af8c9430f8",
+        "sha256:a70c756cd47ddf26be4ea49c0f09a0122f8e648e172efb0d46aa60af8c9430f8",
       createdAt: "2026-09-05T00:00:00.000Z",
       revisionId: "revision-candidate",
       size: 16,
@@ -1589,12 +1634,17 @@ describe("SyncService", () => {
         vaultId: "vault-1",
       },
     });
+    const local = new MemoryVault();
     const service = new SyncService({
       cache: new MemorySyncCache(),
-      local: new MemoryVault(),
+      local,
       remote,
       replicaId: "phone",
     });
+    await remote.writeBlob(
+      candidate.blobId,
+      new TextEncoder().encode("restored content"),
+    );
 
     await service.resolveConflict("entry-1", { kind: "keep-deleted" });
 
@@ -1612,6 +1662,10 @@ describe("SyncService", () => {
       ],
       kind: "deleted",
     });
+
+    await service.restoreDeleted("entry-1", candidate.revisionId);
+
+    expect(local.readText("notes/example.md")).toBe("restored content");
   });
 
   it("restores Version History without erasing the newer Revision", async () => {
@@ -1863,6 +1917,35 @@ describe("SyncService", () => {
       new TextDecoder().decode(await service.readDeletedRecovery(entryId)),
     ).toBe("recover me");
     expect(local.readText("notes/example.md")).toBeUndefined();
+
+    const deletedHead = await remote.readHead();
+    if (!deletedHead) {
+      throw new Error("Expected deleted Head");
+    }
+    const deletedSnapshot = await remote.readSnapshot(deletedHead.value);
+    const deletedEntry = deletedSnapshot.entries[entryId];
+    if (deletedEntry?.kind !== "deleted" || !deletedEntry.recovery) {
+      throw new Error("Expected deleted Entry with recovery");
+    }
+    objects.onGet = async (key) => {
+      if (key.endsWith(`/blobs/${deletedEntry.recovery?.blobId}`)) {
+        objects.onGet = undefined;
+        await local.write(
+          "notes/example.md",
+          new TextEncoder().encode("new local draft"),
+        );
+      }
+    };
+
+    await expect(service.restoreDeleted(entryId)).rejects.toThrow(
+      "Local file changed during synchronization",
+    );
+
+    expect(local.readText("notes/example.md")).toBe("new local draft");
+    await expect(remote.readHead()).resolves.toMatchObject({
+      value: { commitId: deletedHead.value.commitId },
+    });
+    await local.delete("notes/example.md");
 
     await service.restoreDeleted(entryId);
 

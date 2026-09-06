@@ -14,6 +14,7 @@ import {
   type HeadRecord,
   RemoteStore,
 } from "../storage/remote-store";
+import { LocalStateChangedError } from "./errors";
 
 export interface LocalFileInfo {
   modifiedAt: number;
@@ -22,7 +23,10 @@ export interface LocalFileInfo {
 }
 
 export interface LocalVaultPort {
-  delete(path: string): Promise<void>;
+  delete(
+    path: string,
+    expectedContentHash?: string | null,
+  ): Promise<void>;
   list(): Promise<LocalFileInfo[]>;
   move(fromPath: string, toPath: string): Promise<void>;
   read(path: string): Promise<Uint8Array>;
@@ -79,13 +83,6 @@ export interface SyncResult {
   status: "action-required" | "complete";
   unsyncedLocalEntries: number;
   uploaded: number;
-}
-
-export class LocalStateChangedError extends Error {
-  constructor(path: string) {
-    super(`Local file changed during synchronization: ${path}`);
-    this.name = "LocalStateChangedError";
-  }
 }
 
 export interface DeferredDownloadEntry {
@@ -536,7 +533,10 @@ export class SyncService {
         expectedMaterializedContentHash,
       );
     } else {
-      await this.options.local.delete(conflicted.path);
+      await this.options.local.delete(
+        conflicted.path,
+        expectedMaterializedContentHash,
+      );
     }
     await this.options.cache.save(
       await this.buildCache({
@@ -628,41 +628,79 @@ export class SyncService {
     );
   }
 
-  async readDeletedRecovery(entryId: string): Promise<Uint8Array> {
+  async readDeletedRecovery(
+    entryId: string,
+    revisionId?: string,
+  ): Promise<Uint8Array> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
       throw new Error("Remote Store is not initialized");
     }
     const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
     const deleted = snapshot.entries[entryId];
-    if (deleted?.kind !== "deleted" || !deleted.recovery) {
-      throw new Error(`Entry ${entryId} has no Recovery Copy`);
+    if (deleted?.kind !== "deleted") {
+      throw new Error(`Entry ${entryId} is not deleted`);
+    }
+    const revision = revisionId
+      ? [deleted.recovery, ...(deleted.history ?? [])].find(
+          (candidate) => candidate?.revisionId === revisionId,
+        )
+      : deleted.recovery;
+    if (!revision) {
+      throw new Error(`Deleted Revision ${revisionId ?? entryId} does not exist`);
     }
     await this.assertLocalContent(deleted.path, null);
-    return this.readRecoveryCopy(deleted, versionedHead.serverDate);
+    return this.readDeletedRevisionCopy(
+      deleted.entryId,
+      revision,
+      versionedHead.serverDate,
+    );
   }
 
-  async restoreDeleted(entryId: string): Promise<void> {
+  async restoreDeleted(entryId: string, revisionId?: string): Promise<void> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
       throw new Error("Remote Store is not initialized");
     }
     const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
     const deleted = snapshot.entries[entryId];
-    if (deleted?.kind !== "deleted" || !deleted.recovery) {
-      throw new Error(`Entry ${entryId} has no Recovery Copy`);
+    if (deleted?.kind !== "deleted") {
+      throw new Error(`Entry ${entryId} is not deleted`);
     }
-    const plaintext = await this.readRecoveryCopy(
-      deleted,
+    const selected = revisionId
+      ? [deleted.recovery, ...(deleted.history ?? [])].find(
+          (candidate) => candidate?.revisionId === revisionId,
+        )
+      : deleted.recovery;
+    if (!selected) {
+      throw new Error(`Deleted Revision ${revisionId ?? entryId} does not exist`);
+    }
+    const plaintext = await this.readDeletedRevisionCopy(
+      deleted.entryId,
+      selected,
       versionedHead.serverDate,
     );
+    await this.assertLocalContent(deleted.path, null);
+    await this.options.local.write(deleted.path, plaintext, null);
+    await this.assertLocalContent(deleted.path, selected.contentHash);
     const createdAt = versionedHead.serverDate;
     const restoredEntry: VaultEntry = {
       entryId,
-      history: deleted.history,
+      history: retainConflictHistory(
+        [
+          ...(deleted.recovery?.revisionId !== selected.revisionId &&
+          deleted.recovery
+            ? [deleted.recovery]
+            : []),
+          ...(deleted.history ?? []).filter(
+            (revision) => revision.revisionId !== selected.revisionId,
+          ),
+        ],
+        createdAt,
+      ),
       kind: "live",
       path: deleted.path,
-      revision: restoreAsCurrent(deleted.recovery, createdAt),
+      revision: restoreAsCurrent(selected, createdAt),
     };
     const commitId = crypto.randomUUID();
     await this.options.remote.advance({
@@ -684,8 +722,6 @@ export class SyncService {
         vaultId: snapshot.vaultId,
       },
     });
-    await this.assertLocalContent(deleted.path, null);
-    await this.options.local.write(deleted.path, plaintext, null);
     await this.options.cache.save(
       await this.buildCache({
         commitId,
@@ -704,16 +740,31 @@ export class SyncService {
     if (!recovery) {
       throw new Error(`Entry ${deleted.entryId} has no Recovery Copy`);
     }
-    const plaintext = await this.options.remote.readBlob(recovery.blobId);
+    return this.readDeletedRevisionCopy(
+      deleted.entryId,
+      recovery,
+      serverDate,
+    );
+  }
+
+  private async readDeletedRevisionCopy(
+    entryId: string,
+    revision: RevisionRef,
+    serverDate: string,
+  ): Promise<Uint8Array> {
+    const plaintext = await this.options.remote.readBlob(revision.blobId);
     if (
       !plaintext ||
-      plaintext.byteLength !== recovery.size ||
-      (await sha256(plaintext)) !== recovery.contentHash
+      plaintext.byteLength !== revision.size ||
+      (await sha256(plaintext)) !== revision.contentHash
     ) {
-      throw new Error(`Recovery Copy for ${deleted.entryId} is damaged`);
+      throw new Error(`Recovery Copy for ${entryId} is damaged`);
     }
-    if (Date.parse(recovery.expiresAt) <= Date.parse(serverDate)) {
-      throw new Error(`Recovery Copy for ${deleted.entryId} has expired`);
+    if (
+      revision.expiresAt !== undefined &&
+      Date.parse(revision.expiresAt) <= Date.parse(serverDate)
+    ) {
+      throw new Error(`Recovery Copy for ${entryId} has expired`);
     }
     return plaintext;
   }
@@ -931,6 +982,28 @@ export class SyncService {
       };
     }
 
+    const sharedConflicts = plan.conflicts.filter(
+      (conflict) =>
+        conflict.kind === "delete-edit" ||
+        conflict.kind === "edit-delete" ||
+        conflict.kind === "edit-edit",
+    );
+    await this.assertRemoteEntriesBeforePublication(
+      remote,
+      new Set([
+        ...plan.remoteChanges.map((change) => change.entryId),
+        ...sharedConflicts.map((conflict) => conflict.entryId),
+      ]),
+      [
+        ...plan.remoteChanges.flatMap((change) =>
+          change.kind === "delete-remote" ? [change.recoveryRevision] : [],
+        ),
+        ...sharedConflicts.flatMap((conflict) =>
+          conflict.kind === "delete-edit" ? [conflict.baseRevision] : [],
+        ),
+      ],
+    );
+
     const downloadingActions = plan.localActions.filter(
       (action) => action.kind === "download-remote",
     );
@@ -954,7 +1027,9 @@ export class SyncService {
           action.path,
           expectedLocalContentByPath.get(action.path) ?? null,
         );
-        await this.options.local.delete(action.path);
+        const expectedContentHash =
+          expectedLocalContentByPath.get(action.path) ?? null;
+        await this.options.local.delete(action.path, expectedContentHash);
         expectedLocalContentByPath.delete(action.path);
         deleted += 1;
       } else if (action.kind === "move-local") {
@@ -1012,12 +1087,6 @@ export class SyncService {
       }
     }
 
-    const sharedConflicts = plan.conflicts.filter(
-      (conflict) =>
-        conflict.kind === "delete-edit" ||
-        conflict.kind === "edit-delete" ||
-        conflict.kind === "edit-edit",
-    );
     const uploadingChanges = plan.remoteChanges.filter(
       (change) => change.kind === "upload-local" || change.kind === "upload-new",
     );
@@ -1320,7 +1389,10 @@ export class SyncService {
           pendingDelete.path,
           pendingDelete.expectedContentHash,
         );
-        await this.options.local.delete(pendingDelete.path);
+        await this.options.local.delete(
+          pendingDelete.path,
+          pendingDelete.expectedContentHash,
+        );
       }
       for (const pendingWrite of writeAfterCommit) {
         await this.assertLocalContent(
@@ -1425,6 +1497,53 @@ export class SyncService {
       (await sha256(content)) !== expectedContentHash
     ) {
       throw new LocalStateChangedError(path);
+    }
+  }
+
+  private async assertRemoteEntriesBeforePublication(
+    snapshot: VaultSnapshot,
+    entryIds: ReadonlySet<string>,
+    additionalRevisions: readonly RevisionRef[],
+  ): Promise<void> {
+    const revisions = new Map<string, RevisionRef>();
+    for (const revision of additionalRevisions) {
+      revisions.set(revision.blobId, revision);
+    }
+    for (const entryId of entryIds) {
+      const entry = snapshot.entries[entryId];
+      if (entry?.kind === "live") {
+        revisions.set(entry.revision.blobId, entry.revision);
+      } else if (entry?.kind === "deleted") {
+        if (entry.recovery) {
+          revisions.set(entry.recovery.blobId, entry.recovery);
+        }
+      } else if (entry?.kind === "conflicted") {
+        for (const candidate of entry.candidates) {
+          revisions.set(candidate.blobId, candidate);
+        }
+        if (entry.recovery) {
+          revisions.set(entry.recovery.blobId, entry.recovery);
+        }
+      }
+    }
+    for (const revision of revisions.values()) {
+      let plaintext: Uint8Array | undefined;
+      try {
+        plaintext = await this.options.remote.readBlob(revision.blobId);
+      } catch {
+        throw new Error(
+          `Remote Revision ${revision.revisionId} cannot be authenticated`,
+        );
+      }
+      if (
+        !plaintext ||
+        plaintext.byteLength !== revision.size ||
+        (await sha256(plaintext)) !== revision.contentHash
+      ) {
+        throw new Error(
+          `Remote Revision ${revision.revisionId} failed content verification`,
+        );
+      }
     }
   }
 

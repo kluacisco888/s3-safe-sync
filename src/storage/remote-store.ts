@@ -254,12 +254,14 @@ export class RemoteStore {
         }
       }
     }
-    return {
+    const snapshot = {
       commitId: head.commitId,
       entries,
       protocolVersion: 1,
       vaultId: head.vaultId,
-    };
+    } satisfies VaultSnapshot;
+    await this.assertSnapshotBlobReferences(snapshot);
+    return snapshot;
   }
 
   async readBlob(blobId: string): Promise<Uint8Array | undefined> {
@@ -300,6 +302,39 @@ export class RemoteStore {
       input.commit.vaultId !== input.head.vaultId
     ) {
       throw new Error("Sync Commit and Head do not describe the same state");
+    }
+  }
+
+  private async assertSnapshotBlobReferences(
+    snapshot: VaultSnapshot,
+  ): Promise<void> {
+    const blobPrefix = this.key("blobs/");
+    const available = new Set(await this.objects.list(blobPrefix));
+    const referencedBlobIds = new Set<string>();
+    for (const entry of Object.values(snapshot.entries)) {
+      if (entry.kind === "live") {
+        referencedBlobIds.add(entry.revision.blobId);
+      } else if (entry.kind === "conflicted") {
+        for (const candidate of entry.candidates) {
+          referencedBlobIds.add(candidate.blobId);
+        }
+        if (entry.recovery) {
+          referencedBlobIds.add(entry.recovery.blobId);
+        }
+      } else if (entry.recovery) {
+        referencedBlobIds.add(entry.recovery.blobId);
+      }
+      for (const revision of entry.history ?? []) {
+        referencedBlobIds.add(revision.blobId);
+      }
+    }
+    const missing = [...referencedBlobIds].filter(
+      (blobId) => !available.has(`${blobPrefix}${blobId}`),
+    );
+    if (missing.length > 0) {
+      throw new RemoteStateError(
+        `Vault Snapshot references missing blobs: ${missing.sort().join(", ")}`,
+      );
     }
   }
 

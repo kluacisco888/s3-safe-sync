@@ -1,3 +1,5 @@
+import { LocalStateChangedError } from "../sync/errors";
+
 const STAGING_DIRECTORY = ".obsidian/plugins/s3-vault-sync/staging";
 
 export interface SafeWriteAdapter {
@@ -18,9 +20,34 @@ interface WriteJournal {
   expectedHash: string;
   hadOriginal: boolean;
   journalPath: string;
+  originalHash?: string | null;
   targetPath: string;
   temporaryPath: string;
 }
+
+const mutationTails = new WeakMap<object, Promise<void>>();
+
+export const withVaultMutationLock = async <T>(
+  adapter: object,
+  action: () => Promise<T>,
+): Promise<T> => {
+  const previous = mutationTails.get(adapter) ?? Promise.resolve();
+  let release = (): void => undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.catch(() => undefined).then(() => gate);
+  mutationTails.set(adapter, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await action();
+  } finally {
+    release();
+    if (mutationTails.get(adapter) === tail) {
+      mutationTails.delete(adapter);
+    }
+  }
+};
 
 const isSafeStagingPath = (path: string): boolean => {
   if (!path.startsWith(`${STAGING_DIRECTORY}/`)) {
@@ -81,23 +108,49 @@ const removeFileIfPresent = async (
 const recoverJournal = async (
   adapter: SafeWriteAdapter,
   journal: WriteJournal,
+  allowUnknownTarget = false,
 ): Promise<void> => {
   const backupExists = await adapter.exists(journal.backupPath);
   const targetHash = await readHash(adapter, journal.targetPath);
   if (backupExists) {
     if (targetHash === journal.expectedHash) {
       await removeFileIfPresent(adapter, journal.backupPath);
-    } else {
-      await removeFileIfPresent(adapter, journal.targetPath);
+    } else if (targetHash === undefined) {
       await adapter.rename(journal.backupPath, journal.targetPath);
+    } else {
+      throw new Error(
+        `Staged write needs review for ${journal.targetPath}; preserving ${journal.journalPath} and ${journal.backupPath}`,
+      );
     }
-  } else if (!journal.hadOriginal && targetHash !== undefined) {
-    if (targetHash !== journal.expectedHash) {
-      await removeFileIfPresent(adapter, journal.targetPath);
-    }
+  } else if (
+    targetHash !== undefined &&
+    targetHash !== journal.expectedHash &&
+    targetHash !== journal.originalHash &&
+    !allowUnknownTarget
+  ) {
+    throw new Error(
+      `Staged write needs review for ${journal.targetPath}; preserving ${journal.journalPath}`,
+    );
   }
   await removeFileIfPresent(adapter, journal.temporaryPath);
   await removeFileIfPresent(adapter, journal.journalPath);
+};
+
+const recoverPendingVaultWritesUnlocked = async (
+  adapter: SafeWriteAdapter,
+): Promise<void> => {
+  if (!(await adapter.exists(STAGING_DIRECTORY))) {
+    return;
+  }
+  const staged = await adapter.list(STAGING_DIRECTORY);
+  for (const journalPath of staged.files.filter((path) =>
+    path.endsWith(".json"),
+  )) {
+    await recoverJournal(
+      adapter,
+      parseJournal(await adapter.read(journalPath), journalPath),
+    );
+  }
 };
 
 const parseJournal = (body: string, journalPath: string): WriteJournal => {
@@ -119,20 +172,10 @@ const parseJournal = (body: string, journalPath: string): WriteJournal => {
 
 export const recoverPendingVaultWrites = async (
   adapter: SafeWriteAdapter,
-): Promise<void> => {
-  if (!(await adapter.exists(STAGING_DIRECTORY))) {
-    return;
-  }
-  const staged = await adapter.list(STAGING_DIRECTORY);
-  for (const journalPath of staged.files.filter((path) =>
-    path.endsWith(".json"),
-  )) {
-    await recoverJournal(
-      adapter,
-      parseJournal(await adapter.read(journalPath), journalPath),
-    );
-  }
-};
+): Promise<void> =>
+  withVaultMutationLock(adapter, () =>
+    recoverPendingVaultWritesUnlocked(adapter),
+  );
 
 export const safeReplaceVaultFile = async (
   adapter: SafeWriteAdapter,
@@ -140,48 +183,62 @@ export const safeReplaceVaultFile = async (
   body: Uint8Array,
   expectedCurrentHash: string | null | undefined,
   createId: () => string = () => crypto.randomUUID(),
-): Promise<void> => {
-  await recoverPendingVaultWrites(adapter);
-  if (!(await adapter.exists(STAGING_DIRECTORY))) {
-    await adapter.mkdir(STAGING_DIRECTORY);
-  }
-  const currentHash = await readHash(adapter, targetPath);
-  if (
-    expectedCurrentHash !== undefined &&
-    ((expectedCurrentHash === null && currentHash !== undefined) ||
-      (expectedCurrentHash !== null && currentHash !== expectedCurrentHash))
-  ) {
-    throw new Error(`Local file changed before safe replacement: ${targetPath}`);
-  }
-  const id = createId();
-  const journal: WriteJournal = {
-    backupPath: `${STAGING_DIRECTORY}/${id}.backup`,
-    expectedHash: await sha256(body),
-    hadOriginal: currentHash !== undefined,
-    journalPath: `${STAGING_DIRECTORY}/${id}.json`,
-    targetPath,
-    temporaryPath: `${STAGING_DIRECTORY}/${id}.new`,
-  };
-  await adapter.write(journal.journalPath, JSON.stringify(journal));
-  try {
-    await adapter.writeBinary(journal.temporaryPath, toArrayBuffer(body));
-    if ((await readHash(adapter, journal.temporaryPath)) !== journal.expectedHash) {
-      throw new Error(`Staged file failed verification: ${targetPath}`);
+): Promise<void> =>
+  withVaultMutationLock(adapter, async () => {
+    await recoverPendingVaultWritesUnlocked(adapter);
+    if (!(await adapter.exists(STAGING_DIRECTORY))) {
+      await adapter.mkdir(STAGING_DIRECTORY);
     }
-    if ((await readHash(adapter, targetPath)) !== currentHash) {
-      throw new Error(`Local file changed while staging replacement: ${targetPath}`);
+    const currentHash = await readHash(adapter, targetPath);
+    if (
+      expectedCurrentHash !== undefined &&
+      ((expectedCurrentHash === null && currentHash !== undefined) ||
+        (expectedCurrentHash !== null && currentHash !== expectedCurrentHash))
+    ) {
+      throw new LocalStateChangedError(targetPath);
     }
-    if (journal.hadOriginal) {
-      await adapter.rename(targetPath, journal.backupPath);
+    const id = createId();
+    const journal: WriteJournal = {
+      backupPath: `${STAGING_DIRECTORY}/${id}.backup`,
+      expectedHash: await sha256(body),
+      hadOriginal: currentHash !== undefined,
+      journalPath: `${STAGING_DIRECTORY}/${id}.json`,
+      originalHash: currentHash ?? null,
+      targetPath,
+      temporaryPath: `${STAGING_DIRECTORY}/${id}.new`,
+    };
+    await adapter.write(journal.journalPath, JSON.stringify(journal));
+    try {
+      await adapter.writeBinary(journal.temporaryPath, toArrayBuffer(body));
+      if (
+        (await readHash(adapter, journal.temporaryPath)) !== journal.expectedHash
+      ) {
+        throw new Error(`Staged file failed verification: ${targetPath}`);
+      }
+      if ((await readHash(adapter, targetPath)) !== currentHash) {
+        throw new LocalStateChangedError(targetPath);
+      }
+      if (journal.hadOriginal) {
+        await adapter.rename(targetPath, journal.backupPath);
+        if ((await readHash(adapter, journal.backupPath)) !== currentHash) {
+          throw new LocalStateChangedError(targetPath);
+        }
+      }
+      if ((await readHash(adapter, targetPath)) !== undefined) {
+        throw new LocalStateChangedError(targetPath);
+      }
+      await adapter.rename(journal.temporaryPath, targetPath);
+      if ((await readHash(adapter, targetPath)) !== journal.expectedHash) {
+        throw new Error(`Promoted file failed verification: ${targetPath}`);
+      }
+      await removeFileIfPresent(adapter, journal.backupPath);
+      await removeFileIfPresent(adapter, journal.journalPath);
+    } catch (error) {
+      await recoverJournal(
+        adapter,
+        journal,
+        error instanceof LocalStateChangedError,
+      );
+      throw error;
     }
-    await adapter.rename(journal.temporaryPath, targetPath);
-    if ((await readHash(adapter, targetPath)) !== journal.expectedHash) {
-      throw new Error(`Promoted file failed verification: ${targetPath}`);
-    }
-    await removeFileIfPresent(adapter, journal.backupPath);
-    await removeFileIfPresent(adapter, journal.journalPath);
-  } catch (error) {
-    await recoverJournal(adapter, journal);
-    throw error;
-  }
-};
+  });
