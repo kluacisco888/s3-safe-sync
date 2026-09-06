@@ -1,3 +1,5 @@
+import { canonicalVaultPath } from "./canonical-path";
+
 export interface RevisionRef {
   blobId: string;
   contentHash: string;
@@ -222,7 +224,7 @@ export class SyncEngine {
   reconcile({ base, local, remote }: ReconcileInput): SyncPlan {
     const pathsByCanonicalForm = new Map<string, string[]>();
     for (const file of local.files) {
-      const canonical = file.path.normalize("NFC").toLocaleLowerCase("en-US");
+      const canonical = canonicalVaultPath(file.path);
       const paths = pathsByCanonicalForm.get(canonical) ?? [];
       paths.push(file.path);
       pathsByCanonicalForm.set(canonical, paths);
@@ -231,7 +233,7 @@ export class SyncEngine {
       if (entry.kind !== "live") {
         continue;
       }
-      const canonical = entry.path.normalize("NFC").toLocaleLowerCase("en-US");
+      const canonical = canonicalVaultPath(entry.path);
       const paths = pathsByCanonicalForm.get(canonical) ?? [];
       paths.push(entry.path);
       pathsByCanonicalForm.set(canonical, paths);
@@ -247,7 +249,7 @@ export class SyncEngine {
     );
     const remoteEntriesByCanonicalPath = new Map<string, LiveEntry[]>();
     for (const entry of liveRemoteEntries) {
-      const canonical = entry.path.normalize("NFC").toLocaleLowerCase("en-US");
+      const canonical = canonicalVaultPath(entry.path);
       const owners = remoteEntriesByCanonicalPath.get(canonical) ?? [];
       owners.push(entry);
       remoteEntriesByCanonicalPath.set(canonical, owners);
@@ -270,16 +272,14 @@ export class SyncEngine {
       );
       for (const file of local.files.filter(
         (candidate) =>
-          candidate.path.normalize("NFC").toLocaleLowerCase("en-US") ===
-          canonical,
+          canonicalVaultPath(candidate.path) === canonical,
       )) {
         const belongsToRemoteEntry = file.entryId === remoteEntry.entryId;
         const occupiesItsPreviousPath =
           file.entryId === undefined &&
           !hasBoundLocalClaimant &&
           baseEntry !== undefined &&
-          baseEntry.path.normalize("NFC").toLocaleLowerCase("en-US") ===
-            canonical;
+          canonicalVaultPath(baseEntry.path) === canonical;
         const cachelessSamePath = file.entryId === undefined && !baseEntry;
         if (
           !belongsToRemoteEntry &&

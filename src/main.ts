@@ -10,6 +10,7 @@ import { RemotelySaveMigration } from "./migration/remotely-save-migration";
 import { CredentialStore, type AwsCredentials } from "./plugin/credential-store";
 import { StatusModal, VersionHistoryModal } from "./plugin/modals";
 import { ObsidianVaultPort, isInSyncScope } from "./plugin/obsidian-vault-port";
+import { automaticMobileFileLimit } from "./plugin/mobile-file-limit";
 import { formatSyncProgress } from "./plugin/sync-progress";
 import {
   DEFAULT_SETTINGS,
@@ -72,14 +73,14 @@ const normalizePrefix = (prefix: string): string =>
 const ANDROID_DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const ANDROID_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 
-const mobileAutomaticFileLimit = (): number | undefined => {
+const mobileAutomaticFileLimit = (path: string): number | undefined => {
   if (!Platform.isMobile) {
     return undefined;
   }
   const network = (
     navigator as Navigator & { connection?: { type?: string } }
   ).connection;
-  return network?.type === "wifi" ? 50 * 1024 * 1024 : 10 * 1024 * 1024;
+  return automaticMobileFileLimit(path, true, network?.type);
 };
 
 export default class S3VaultSyncPlugin
@@ -502,7 +503,7 @@ export default class S3VaultSyncPlugin
     return new SyncService({
       cache,
       local: new ObsidianVaultPort(this.app.vault),
-      maxAutomaticFileBytes: mobileAutomaticFileLimit(),
+      maxAutomaticFileBytes: mobileAutomaticFileLimit,
       remote,
       onProgress: (progress) => this.updateSyncProgress(progress),
       replicaId: this.data.settings.replicaId,

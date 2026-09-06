@@ -13,13 +13,13 @@ The plugin does not run after Obsidian is closed, provide telemetry, synchronize
 - Show the current phase, file count, byte count, and current path during scanning, uploading, and downloading in plugin settings and the desktop status bar without routine success popups.
 - Persist an action-required state for conflicts, corruption, unsafe bulk deletion, repair, or a local edit waiting behind a deferred remote Revision.
 - Mirror normal files to mobile up to 50 MB. Android transfers use bounded S3 ranges and multipart requests; larger remote files are listed as unavailable on that device, and larger local files are explicitly unsynchronized.
-- Delay mobile attachments above 10 MB until Wi-Fi by default.
+- Delay mobile attachments above 10 MB until Wi-Fi by default. For this limit, `.md`, `.canvas`, and `.base` are note files; other paths are attachments.
 - Offer a 30-day per-file Version History and an encrypted shared Conflict Center.
 - Keep manual sync and pause controls at the top of the status view. Deleted-file paths are selectable and copyable, and UTF-8 recovery content up to 1 MiB can be previewed read-only before restoration.
 
 ## Sync Scope
 
-Include ordinary files of every extension. Exclude `.obsidian`, dot-prefixed path segments, underscore-prefixed path segments, version-control directories, `node_modules`, temporary office files, and configured glob patterns. Remote paths that the current device cannot create are deferred without becoming deletions and require a rename on another device. A previously deferred Entry remains known as unmaterialized and is downloaded when its path later becomes supported instead of treating its absence as a local deletion. Bookmarks and configuration synchronization are outside the first release.
+Include ordinary files of every extension. Exclude `.obsidian`, dot-prefixed path segments, underscore-prefixed path segments, version-control directories, `node_modules`, and temporary office files. Configurable exclusion globs, bookmarks, and configuration synchronization are outside the first release. Remote paths that the current device cannot create are deferred without becoming deletions and require a rename on another device. A previously deferred Entry remains known as unmaterialized and is downloaded when its path later becomes supported instead of treating its absence as a local deletion.
 
 ## Remote layout
 
@@ -70,7 +70,7 @@ Paths, hashes, entry metadata, deletion records, conflicts, commits, snapshots, 
 - A missing, unauthenticated, or dangling Head enters read-only Repair Mode.
 - S3 capability probes verify conditional create/update, read, list, and delete before initialization.
 - S3 Versioning and a 30-day noncurrent-version lifecycle are an independent safety layer.
-- Expiration creates an accepted cleanup decision before physical deletion after an additional 24-hour grace period.
+- Physical expiry cleanup is disabled during Beta. Before it is enabled, expiration must create an accepted cleanup decision followed by at least 24 hours of grace before physical deletion.
 - The plugin never deletes a legacy Remotely Save prefix or offers one-click remote destruction.
 
 ## Migration
@@ -82,7 +82,7 @@ The user completes one final Remotely Save sync, reviews the desktop Vault, disa
 - Desktop delete followed by a long-offline mobile sync does not resurrect the file, including after mobile cache loss.
 - Edit/delete and edit/edit preserve every user-authored version and surface the correct resolution action.
 - Concurrent CAS writers converge after one receives `412 Precondition Failed`.
-- Crash or cancellation before Head advancement leaves live state unchanged and later cleans Orphan Blobs.
+- Crash or cancellation before Head advancement leaves live state unchanged, and an uploaded Orphan Blob never becomes current.
 - Wrong password, corrupted ciphertext, mixed legacy data, Vault ID mismatch, and unsupported protocol version perform no writes.
 - Android and iOS pass encrypted 50 MB upload, download, interruption, and resume tests before leaving Beta.
 

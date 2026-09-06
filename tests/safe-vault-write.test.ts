@@ -19,6 +19,7 @@ const hash = async (body: Uint8Array): Promise<string> => {
 };
 
 class MemorySafeWriteAdapter implements SafeWriteAdapter {
+  readonly calls: string[] = [];
   readonly directories = new Set<string>([STAGING]);
   readonly files = new Map<string, Uint8Array>();
   readonly trashed: Uint8Array[] = [];
@@ -29,10 +30,12 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
   onWriteBinary: ((path: string) => Promise<void> | void) | undefined;
 
   exists(path: string): Promise<boolean> {
+    this.calls.push(`exists:${path}`);
     return Promise.resolve(this.files.has(path) || this.directories.has(path));
   }
 
   copy(fromPath: string, toPath: string): Promise<void> {
+    this.calls.push(`copy:${fromPath}:${toPath}`);
     this.beforeCopy?.(fromPath, toPath);
     if (this.failPromotion && fromPath.endsWith(".new")) {
       this.failPromotion = false;
@@ -50,6 +53,7 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
   }
 
   list(path: string): Promise<{ files: string[]; folders: string[] }> {
+    this.calls.push(`list:${path}`);
     return Promise.resolve({
       files: [...this.files.keys()].filter((candidate) =>
         candidate.startsWith(`${path}/`),
@@ -59,11 +63,13 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
   }
 
   mkdir(path: string): Promise<void> {
+    this.calls.push(`mkdir:${path}`);
     this.directories.add(path);
     return Promise.resolve();
   }
 
   read(path: string): Promise<string> {
+    this.calls.push(`read:${path}`);
     const body = this.files.get(path);
     if (!body) {
       throw new Error(`Missing ${path}`);
@@ -72,6 +78,7 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
   }
 
   readBinary(path: string): Promise<ArrayBuffer> {
+    this.calls.push(`readBinary:${path}`);
     const body = this.files.get(path);
     if (!body) {
       throw new Error(`Missing ${path}`);
@@ -82,11 +89,13 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
   }
 
   remove(path: string): Promise<void> {
+    this.calls.push(`remove:${path}`);
     this.files.delete(path);
     return Promise.resolve();
   }
 
   rename(fromPath: string, toPath: string): Promise<void> {
+    this.calls.push(`rename:${fromPath}:${toPath}`);
     this.beforeRename?.(fromPath, toPath);
     const body = this.files.get(fromPath);
     if (!body) {
@@ -98,6 +107,7 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
   }
 
   stat(path: string): Promise<{ type: string } | null> {
+    this.calls.push(`stat:${path}`);
     if (this.files.has(path)) {
       return Promise.resolve({ type: "file" });
     }
@@ -108,6 +118,7 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
   }
 
   trashLocal(path: string): Promise<void> {
+    this.calls.push(`trashLocal:${path}`);
     const body = this.files.get(path);
     if (body) {
       this.trashed.push(body.slice());
@@ -117,17 +128,43 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
   }
 
   write(path: string, body: string): Promise<void> {
+    this.calls.push(`write:${path}`);
     this.files.set(path, bytes(body));
     return Promise.resolve();
   }
 
   async writeBinary(path: string, body: ArrayBuffer): Promise<void> {
+    this.calls.push(`writeBinary:${path}`);
     this.files.set(path, new Uint8Array(body.slice(0)));
     await this.onWriteBinary?.(path);
   }
 }
 
 describe("safeReplaceVaultFile", () => {
+  it.each([
+    ["Obsidian configuration", ".obsidian/plugins/example.md"],
+    ["an absolute path", "/notes/example.md"],
+    ["a traversal segment", "notes/../example.md"],
+  ])(
+    "rejects %s before interacting with the Vault adapter",
+    async (_description, targetPath) => {
+      const adapter = new MemorySafeWriteAdapter();
+
+      await expect(
+        safeReplaceVaultFile(
+          adapter,
+          targetPath,
+          bytes("remote"),
+          undefined,
+          () => "write-1",
+        ),
+      ).rejects.toThrow("unsafe Vault path");
+
+      expect(adapter.calls).toEqual([]);
+      expect(adapter.files.size).toBe(0);
+    },
+  );
+
   it("promotes verified content and removes its journal and backup", async () => {
     const adapter = new MemorySafeWriteAdapter();
     adapter.files.set("notes/example.md", bytes("before"));

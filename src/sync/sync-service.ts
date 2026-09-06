@@ -16,6 +16,8 @@ import {
   RemoteStore,
 } from "../storage/remote-store";
 import { LocalStateChangedError } from "./errors";
+import { sha256Content as sha256 } from "./content-hash";
+import { canonicalVaultPath } from "./canonical-path";
 
 export interface LocalFileInfo {
   modifiedAt: number;
@@ -64,7 +66,7 @@ export interface SyncCachePort {
 export interface SyncServiceOptions {
   cache: SyncCachePort;
   local: LocalVaultPort;
-  maxAutomaticFileBytes?: number;
+  maxAutomaticFileBytes?: number | ((path: string) => number | undefined);
   onProgress?: (progress: SyncProgress) => void;
   remote: RemoteStore;
   replicaId: string;
@@ -120,23 +122,6 @@ export interface KeepDeletedResolution {
 export type ConflictResolution =
   | KeepDeletedResolution
   | RestoreCandidateResolution;
-
-const sha256 = async (input: Uint8Array): Promise<string> => {
-  const buffer =
-    input.byteOffset === 0 &&
-    input.buffer instanceof ArrayBuffer &&
-    input.byteLength === input.buffer.byteLength
-      ? input.buffer
-      : input.slice().buffer;
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    buffer,
-  );
-  const hex = Array.from(new Uint8Array(digest), (byte) =>
-    byte.toString(16).padStart(2, "0"),
-  ).join("");
-  return `sha256:${hex}`;
-};
 
 const mergeMarkdown = (
   local: Uint8Array,
@@ -207,7 +192,7 @@ export class SyncService {
     const files = scan.files;
     const pathsByCanonicalForm = new Map<string, string[]>();
     for (const file of files) {
-      const canonical = file.path.normalize("NFC").toLocaleLowerCase("en-US");
+      const canonical = canonicalVaultPath(file.path);
       const paths = pathsByCanonicalForm.get(canonical) ?? [];
       paths.push(file.path);
       pathsByCanonicalForm.set(canonical, paths);
@@ -382,10 +367,10 @@ export class SyncService {
       throw new Error("Remote Store is not initialized");
     }
     const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
-    const canonicalPath = path.normalize("NFC").toLocaleLowerCase("en-US");
+    const canonicalPath = canonicalVaultPath(path);
     const pathIsKnown = Object.values(snapshot.entries).some(
       (entry) =>
-        entry.path.normalize("NFC").toLocaleLowerCase("en-US") === canonicalPath,
+        canonicalVaultPath(entry.path) === canonicalPath,
     );
     if (pathIsKnown) {
       throw new Error(`Remote Store already knows path ${path}`);
@@ -397,8 +382,7 @@ export class SyncService {
       throw new Error(`Import Candidate no longer exists: ${path}`);
     }
     if (
-      this.options.maxAutomaticFileBytes !== undefined &&
-      file.size > this.options.maxAutomaticFileBytes
+      this.exceedsAutomaticFileLimit(file.path, file.size)
     ) {
       throw new Error(`Import Candidate exceeds the mobile limit: ${path}`);
     }
@@ -466,6 +450,9 @@ export class SyncService {
     const conflicted = snapshot.entries[entryId];
     if (conflicted?.kind !== "conflicted") {
       throw new Error(`Entry ${entryId} is not conflicted`);
+    }
+    if (this.options.local.supportsPath?.(conflicted.path) === false) {
+      throw new Error(`Path is not supported on this device: ${conflicted.path}`);
     }
     await this.assertRemoteEntriesBeforePublication(
       snapshot,
@@ -599,6 +586,9 @@ export class SyncService {
     if (entry?.kind !== "live") {
       throw new Error(`Entry ${entryId} is not live`);
     }
+    if (this.options.local.supportsPath?.(entry.path) === false) {
+      throw new Error(`Path is not supported on this device: ${entry.path}`);
+    }
     const historical = entry.history?.find(
       (revision) => revision.revisionId === revisionId,
     );
@@ -719,6 +709,9 @@ export class SyncService {
       : deleted.recovery;
     if (!selected) {
       throw new Error(`Deleted Revision ${revisionId ?? entryId} does not exist`);
+    }
+    if (this.options.local.supportsPath?.(deleted.path) === false) {
+      throw new Error(`Path is not supported on this device: ${deleted.path}`);
     }
     this.assertRemotePathAvailable(snapshot, deleted.entryId, deleted.path);
     await this.assertRemoteEntriesBeforePublication(
@@ -896,8 +889,7 @@ export class SyncService {
           ];
         }
         if (
-          this.options.maxAutomaticFileBytes !== undefined &&
-          entry.revision.size > this.options.maxAutomaticFileBytes
+          this.exceedsAutomaticFileLimit(entry.path, entry.revision.size)
         ) {
           return [
             {
@@ -1756,13 +1748,12 @@ export class SyncService {
     entryId: string,
     path: string,
   ): void {
-    const canonicalPath = path.normalize("NFC").toLocaleLowerCase("en-US");
+    const canonicalPath = canonicalVaultPath(path);
     const occupyingEntry = Object.values(snapshot.entries).find(
       (entry) =>
         entry.entryId !== entryId &&
         entry.kind !== "deleted" &&
-        entry.path.normalize("NFC").toLocaleLowerCase("en-US") ===
-          canonicalPath,
+        canonicalVaultPath(entry.path) === canonicalPath,
     );
     if (occupyingEntry) {
       throw new Error(
@@ -1883,8 +1874,7 @@ export class SyncService {
     for (const file of localFiles) {
       const cachedFile = cached?.files[file.path];
       if (
-        this.options.maxAutomaticFileBytes !== undefined &&
-        file.size > this.options.maxAutomaticFileBytes
+        this.exceedsAutomaticFileLimit(file.path, file.size)
       ) {
         unsyncedLocalEntries += 1;
         unsyncedLocalPaths.push(file.path);
@@ -1918,5 +1908,15 @@ export class SyncService {
       unsyncedLocalEntries,
       unsyncedLocalPaths,
     };
+  }
+
+  private maxAutomaticFileBytes(path: string): number | undefined {
+    const configured = this.options.maxAutomaticFileBytes;
+    return typeof configured === "function" ? configured(path) : configured;
+  }
+
+  private exceedsAutomaticFileLimit(path: string, size: number): boolean {
+    const limit = this.maxAutomaticFileBytes(path);
+    return limit !== undefined && size > limit;
   }
 }

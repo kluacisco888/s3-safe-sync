@@ -73,6 +73,71 @@ export class RemoteStateError extends Error {
 const normalizePrefix = (prefix: string): string =>
   prefix.replace(/^\/+|\/+$/gu, "");
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const isOptionalString = (
+  record: Record<string, unknown>,
+  key: string,
+): boolean => record[key] === undefined || typeof record[key] === "string";
+
+const isRevision = (value: unknown, requireExpiry = false): boolean => {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    typeof value.blobId === "string" &&
+    typeof value.contentHash === "string" &&
+    typeof value.createdAt === "string" &&
+    typeof value.revisionId === "string" &&
+    typeof value.size === "number" &&
+    Number.isFinite(value.size) &&
+    value.size >= 0 &&
+    (requireExpiry
+      ? typeof value.expiresAt === "string"
+      : isOptionalString(value, "expiresAt"))
+  );
+};
+
+const isVaultEntry = (value: unknown): value is VaultEntry => {
+  if (
+    !isRecord(value) ||
+    typeof value.entryId !== "string" ||
+    typeof value.path !== "string" ||
+    (value.history !== undefined &&
+      (!Array.isArray(value.history) ||
+        !value.history.every((revision) => isRevision(revision))))
+  ) {
+    return false;
+  }
+  if (value.kind === "live") {
+    return isRevision(value.revision);
+  }
+  if (value.kind === "deleted") {
+    return (
+      typeof value.deletedAt === "string" &&
+      typeof value.lastContentHash === "string" &&
+      typeof value.lastRevisionId === "string" &&
+      (value.recovery === undefined || isRevision(value.recovery, true))
+    );
+  }
+  if (value.kind === "conflicted") {
+    return (
+      Array.isArray(value.candidates) &&
+      value.candidates.every((revision) => isRevision(revision)) &&
+      (value.reason === "delete-edit" ||
+        value.reason === "edit-delete" ||
+        value.reason === "edit-edit") &&
+      isOptionalString(value, "deletedAt") &&
+      isOptionalString(value, "lastContentHash") &&
+      isOptionalString(value, "lastRevisionId") &&
+      isOptionalString(value, "materializedContentHash") &&
+      (value.recovery === undefined || isRevision(value.recovery, true))
+    );
+  }
+  return false;
+};
+
 const assertHeadRecord = (value: unknown): HeadRecord => {
   if (
     typeof value !== "object" ||
@@ -93,45 +158,44 @@ const assertHeadRecord = (value: unknown): HeadRecord => {
 };
 
 const assertVaultSnapshot = (value: unknown): VaultSnapshot => {
-  if (typeof value !== "object" || value === null) {
+  if (!isRecord(value)) {
     throw new Error("Snapshot payload is invalid");
   }
-  const record = value as Record<string, unknown>;
   if (
-    record.protocolVersion !== 1 ||
-    typeof record.vaultId !== "string" ||
-    typeof record.commitId !== "string" ||
-    typeof record.entries !== "object" ||
-    record.entries === null
+    value.protocolVersion !== 1 ||
+    typeof value.vaultId !== "string" ||
+    typeof value.commitId !== "string" ||
+    !isRecord(value.entries) ||
+    !Object.entries(value.entries).every(
+      ([entryId, entry]) => isVaultEntry(entry) && entry.entryId === entryId,
+    )
   ) {
     throw new Error("Snapshot payload is invalid");
   }
-  return value as VaultSnapshot;
+  return value as unknown as VaultSnapshot;
 };
 
 const assertCommitRecord = (value: unknown): CommitRecord => {
   if (
-    typeof value !== "object" ||
-    value === null ||
-    !("protocolVersion" in value) ||
+    !isRecord(value) ||
     value.protocolVersion !== 1 ||
-    !("vaultId" in value) ||
     typeof value.vaultId !== "string" ||
-    !("commitId" in value) ||
     typeof value.commitId !== "string" ||
-    !("createdAt" in value) ||
     typeof value.createdAt !== "string" ||
-    !("replicaId" in value) ||
     typeof value.replicaId !== "string" ||
-    !("parentIds" in value) ||
     !Array.isArray(value.parentIds) ||
     !value.parentIds.every((parentId) => typeof parentId === "string") ||
-    !("changes" in value) ||
-    !Array.isArray(value.changes)
+    !Array.isArray(value.changes) ||
+    !value.changes.every(
+      (change) =>
+        isRecord(change) &&
+        change.kind === "set-entry" &&
+        isVaultEntry(change.entry),
+    )
   ) {
     throw new Error("Sync Commit payload is invalid");
   }
-  return value as CommitRecord;
+  return value as unknown as CommitRecord;
 };
 
 export class RemoteStore {
@@ -217,7 +281,10 @@ export class RemoteStore {
           `Head references missing Snapshot ${head.snapshotId}`,
         );
       }
-      baseSnapshot = assertVaultSnapshot(await this.decryptJson(stored.body));
+      baseSnapshot = await this.decryptSnapshot(
+        head.snapshotId,
+        stored.body,
+      );
       if (baseSnapshot.vaultId !== head.vaultId) {
         throw new RemoteStateError("Snapshot belongs to a different Vault");
       }
@@ -277,7 +344,23 @@ export class RemoteStore {
     if (!stored) {
       return undefined;
     }
-    return assertCommitRecord(await this.decryptJson(stored.body));
+    let value: unknown;
+    try {
+      value = await this.decryptJson(stored.body);
+    } catch (error) {
+      throw new RemoteStateError(
+        `Sync Commit ${commitId} cannot be authenticated or decoded`,
+        error,
+      );
+    }
+    try {
+      return assertCommitRecord(value);
+    } catch (error) {
+      throw new RemoteStateError(
+        `Sync Commit ${commitId} payload is invalid`,
+        error,
+      );
+    }
   }
 
   async writeBlob(blobId: string, plaintext: Uint8Array): Promise<void> {
@@ -341,6 +424,29 @@ export class RemoteStore {
   private async decryptJson(ciphertext: Uint8Array): Promise<unknown> {
     const plaintext = await this.cipher.decryptData(ciphertext);
     return JSON.parse(new TextDecoder().decode(plaintext)) as unknown;
+  }
+
+  private async decryptSnapshot(
+    snapshotId: string,
+    ciphertext: Uint8Array,
+  ): Promise<VaultSnapshot> {
+    let value: unknown;
+    try {
+      value = await this.decryptJson(ciphertext);
+    } catch (error) {
+      throw new RemoteStateError(
+        `Snapshot ${snapshotId} cannot be authenticated or decoded`,
+        error,
+      );
+    }
+    try {
+      return assertVaultSnapshot(value);
+    } catch (error) {
+      throw new RemoteStateError(
+        `Snapshot ${snapshotId} payload is invalid`,
+        error,
+      );
+    }
   }
 
   private async encryptJson(value: unknown): Promise<Uint8Array> {

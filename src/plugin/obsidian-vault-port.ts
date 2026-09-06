@@ -1,10 +1,12 @@
 import { normalizePath, Platform, TFile, type Vault } from "obsidian";
 
 import type { LocalFileInfo, LocalVaultPort } from "../sync/sync-service";
+import { sha256Content as sha256 } from "../sync/content-hash";
 import { LocalStateChangedError } from "../sync/errors";
 import { deleteVaultPath } from "./vault-delete";
 import {
   recoverPendingVaultWrites,
+  isSafeTargetPath,
   safeReplaceVaultFile,
   withVaultMutationLock,
 } from "./safe-vault-write";
@@ -35,14 +37,6 @@ export const isInSyncScope = (path: string): boolean => {
 
 const ANDROID_UNSUPPORTED_PATH_CHARACTERS = /[*"<>:|?]/u;
 
-const sha256 = async (body: ArrayBuffer): Promise<string> => {
-  const digest = await crypto.subtle.digest("SHA-256", body);
-  const hex = Array.from(new Uint8Array(digest), (byte) =>
-    byte.toString(16).padStart(2, "0"),
-  ).join("");
-  return `sha256:${hex}`;
-};
-
 export class ObsidianVaultPort implements LocalVaultPort {
   private recovery: Promise<void> | undefined;
 
@@ -52,6 +46,9 @@ export class ObsidianVaultPort implements LocalVaultPort {
     path: string,
     expectedContentHash?: string | null,
   ): Promise<void> {
+    if (!isSafeTargetPath(path)) {
+      throw new Error(`Refusing to delete an unsafe Vault path: ${path}`);
+    }
     await this.ensureRecovered();
     await withVaultMutationLock(this.vault.adapter, () =>
       deleteVaultPath(
@@ -82,6 +79,9 @@ export class ObsidianVaultPort implements LocalVaultPort {
     expectedSourceHash?: string,
     expectedTargetHash?: string | null,
   ): Promise<void> {
+    if (!isSafeTargetPath(fromPath) || !isSafeTargetPath(toPath)) {
+      throw new Error(`Refusing to move an unsafe Vault path: ${toPath}`);
+    }
     await this.ensureRecovered();
     await withVaultMutationLock(this.vault.adapter, async () => {
       const normalizedSource = normalizePath(fromPath);
@@ -90,6 +90,12 @@ export class ObsidianVaultPort implements LocalVaultPort {
         throw new Error(`Local Vault path does not exist: ${fromPath}`);
       }
       const normalizedTarget = normalizePath(toPath);
+      if (
+        !isSafeTargetPath(normalizedSource) ||
+        !isSafeTargetPath(normalizedTarget)
+      ) {
+        throw new Error(`Refusing to move an unsafe Vault path: ${toPath}`);
+      }
       if (
         expectedSourceHash !== undefined &&
         (await this.readAdapterHash(normalizedSource)) !== expectedSourceHash
@@ -154,9 +160,13 @@ export class ObsidianVaultPort implements LocalVaultPort {
   }
 
   supportsPath(path: string): boolean {
-    return !(
-      Platform.isAndroidApp &&
-      ANDROID_UNSUPPORTED_PATH_CHARACTERS.test(normalizePath(path))
+    return (
+      isSafeTargetPath(path) &&
+      isInSyncScope(path) &&
+      !(
+        Platform.isAndroidApp &&
+        ANDROID_UNSUPPORTED_PATH_CHARACTERS.test(normalizePath(path))
+      )
     );
   }
 
@@ -165,8 +175,14 @@ export class ObsidianVaultPort implements LocalVaultPort {
     body: Uint8Array,
     expectedCurrentHash?: string | null,
   ): Promise<void> {
+    if (!isSafeTargetPath(path)) {
+      throw new Error(`Refusing to write an unsafe Vault path: ${path}`);
+    }
     await this.ensureRecovered();
     const normalized = normalizePath(path);
+    if (!isSafeTargetPath(normalized)) {
+      throw new Error(`Refusing to write an unsafe Vault path: ${path}`);
+    }
     const parent = normalized.includes("/")
       ? normalized.slice(0, normalized.lastIndexOf("/"))
       : "";

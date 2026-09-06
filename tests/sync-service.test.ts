@@ -1743,6 +1743,51 @@ describe("SyncService", () => {
     );
   });
 
+  it("applies a lower cellular limit only to attachments", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const desktopVault = new MemoryVault();
+    await desktopVault.write(
+      "notes/article.md",
+      new TextEncoder().encode("twenty-byte-note...."),
+    );
+    await desktopVault.write(
+      "attachments/photo.jpg",
+      new TextEncoder().encode("twenty-byte-photo..."),
+    );
+    await new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: desktopRemote,
+      replicaId: "desktop",
+    }).initializeNew("vault-1");
+    const phoneVault = new MemoryVault();
+    const phone = new SyncService({
+      cache: new MemorySyncCache(),
+      local: phoneVault,
+      maxAutomaticFileBytes: (path) =>
+        path.endsWith(".md") ? 50 : 10,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+
+    const result = await phone.synchronize();
+
+    expect(result).toMatchObject({ deferredDownloads: 1, downloaded: 1 });
+    expect(phoneVault.readText("notes/article.md")).toBe("twenty-byte-note....");
+    expect(phoneVault.readText("attachments/photo.jpg")).toBeUndefined();
+  });
+
   it("continues syncing when this device cannot create a remote path", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);

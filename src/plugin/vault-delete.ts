@@ -1,4 +1,5 @@
 import { LocalStateChangedError } from "../sync/errors";
+import { sha256Content as sha256 } from "../sync/content-hash";
 
 export interface VaultDeletionPort<File> {
   adapter: {
@@ -12,14 +13,6 @@ export interface VaultDeletionPort<File> {
   getAbstractFileByPath(path: string): File | null;
   trash(file: File, system: boolean): Promise<void>;
 }
-
-const sha256 = async (body: ArrayBuffer): Promise<string> => {
-  const digest = await crypto.subtle.digest("SHA-256", body);
-  const hex = Array.from(new Uint8Array(digest), (byte) =>
-    byte.toString(16).padStart(2, "0"),
-  ).join("");
-  return `sha256:${hex}`;
-};
 
 const assertExpectedContent = async <File>(
   vault: VaultDeletionPort<File>,

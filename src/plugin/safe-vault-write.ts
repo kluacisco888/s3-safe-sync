@@ -1,4 +1,8 @@
 import { LocalStateChangedError } from "../sync/errors";
+import {
+  sha256Content as sha256,
+  toArrayBuffer,
+} from "../sync/content-hash";
 
 const STAGING_DIRECTORY = ".obsidian/plugins/s3-vault-sync/staging";
 
@@ -59,26 +63,11 @@ const isSafeStagingPath = (path: string): boolean => {
   return basename.length > 0 && !basename.includes("/") && basename !== "..";
 };
 
-const isSafeTargetPath = (path: string): boolean =>
+export const isSafeTargetPath = (path: string): boolean =>
   path.length > 0 &&
   !path.startsWith("/") &&
   !path.startsWith(".obsidian/") &&
   !path.split("/").some((segment) => segment === "." || segment === "..");
-
-const toArrayBuffer = (body: Uint8Array): ArrayBuffer =>
-  body.byteOffset === 0 &&
-  body.buffer instanceof ArrayBuffer &&
-  body.byteLength === body.buffer.byteLength
-    ? body.buffer
-    : body.slice().buffer;
-
-const sha256 = async (body: Uint8Array): Promise<string> => {
-  const digest = await crypto.subtle.digest("SHA-256", toArrayBuffer(body));
-  const hex = Array.from(new Uint8Array(digest), (byte) =>
-    byte.toString(16).padStart(2, "0"),
-  ).join("");
-  return `sha256:${hex}`;
-};
 
 const readHash = async (
   adapter: SafeWriteAdapter,
@@ -225,8 +214,11 @@ export const safeReplaceVaultFile = async (
   body: Uint8Array,
   expectedCurrentHash: string | null | undefined,
   createId: () => string = () => crypto.randomUUID(),
-): Promise<void> =>
-  withVaultMutationLock(adapter, async () => {
+): Promise<void> => {
+  if (!isSafeTargetPath(targetPath)) {
+    throw new Error(`Refusing to write an unsafe Vault path: ${targetPath}`);
+  }
+  return withVaultMutationLock(adapter, async () => {
     await recoverPendingVaultWritesUnlocked(adapter);
     if (!(await adapter.exists(STAGING_DIRECTORY))) {
       await adapter.mkdir(STAGING_DIRECTORY);
@@ -283,3 +275,4 @@ export const safeReplaceVaultFile = async (
       throw error;
     }
   });
+};

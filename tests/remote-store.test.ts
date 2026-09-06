@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 
+import { RcloneCompat } from "../src/crypto/rclone-compat";
 import {
   HeadChangedError,
+  RemoteStateError,
   RemoteStore,
   type CommitRecord,
   type HeadRecord,
@@ -12,11 +14,12 @@ import {
   type ObjectStore,
   type StoredObject,
 } from "../src/storage/object-store";
-import type { VaultEntry } from "../src/sync/sync-engine";
+import type { VaultEntry, VaultSnapshot } from "../src/sync/sync-engine";
 
 class MemoryObjectStore implements ObjectStore {
   private etagSequence = 0;
   private readonly objects = new Map<string, StoredObject>();
+  putCount = 0;
 
   async delete(key: string): Promise<void> {
     this.objects.delete(key);
@@ -48,6 +51,7 @@ class MemoryObjectStore implements ObjectStore {
       lastModified: "2026-09-05T00:00:00.000Z",
     };
     this.objects.set(key, stored);
+    this.putCount += 1;
     return stored;
   }
 }
@@ -265,5 +269,175 @@ describe("RemoteStore", () => {
     await expect(remote.readSnapshot(currentHead.value)).rejects.toThrow(
       "Vault Snapshot references missing blobs: blob-1",
     );
+  });
+
+  it("enters Repair Mode when an encrypted Snapshot is corrupted", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    await remote.initialize({
+      commit: commit("commit-1"),
+      head: head("commit-1", 1),
+    });
+    await remote.writeSnapshot("snapshot-1", {
+      commitId: "commit-1",
+      entries: {},
+      protocolVersion: 1,
+      vaultId: "vault-1",
+    });
+    const snapshotKey = "chosen-prefix/v1/snapshots/snapshot-1";
+    const stored = await objects.get(snapshotKey);
+    if (!stored) {
+      throw new Error("Expected encrypted Snapshot");
+    }
+    const corrupted = stored.body.slice();
+    const lastByte = corrupted.length - 1;
+    corrupted[lastByte] = (corrupted[lastByte] ?? 0) ^ 1;
+    await objects.put(snapshotKey, corrupted);
+    const writesBeforeRead = objects.putCount;
+
+    const read = remote.readSnapshot({
+      ...head("commit-1", 1),
+      snapshotId: "snapshot-1",
+    });
+    await expect(read).rejects.toBeInstanceOf(RemoteStateError);
+    await expect(
+      remote.readSnapshot({
+        ...head("commit-1", 1),
+        snapshotId: "snapshot-1",
+      }),
+    ).rejects.toThrow("Snapshot snapshot-1 cannot be authenticated or decoded");
+    expect(objects.putCount).toBe(writesBeforeRead);
+  });
+
+  it("enters Repair Mode when an encrypted Sync Commit is corrupted", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    await remote.initialize({
+      commit: commit("commit-1"),
+      head: head("commit-1", 1),
+    });
+    const commitKey = "chosen-prefix/v1/commits/commit-1";
+    const stored = await objects.get(commitKey);
+    if (!stored) {
+      throw new Error("Expected encrypted Sync Commit");
+    }
+    const corrupted = stored.body.slice();
+    const lastByte = corrupted.length - 1;
+    corrupted[lastByte] = (corrupted[lastByte] ?? 0) ^ 1;
+    await objects.put(commitKey, corrupted);
+    const writesBeforeRead = objects.putCount;
+
+    await expect(remote.readCommit("commit-1")).rejects.toBeInstanceOf(
+      RemoteStateError,
+    );
+    await expect(remote.readSnapshot(head("commit-1", 1))).rejects.toThrow(
+      "Sync Commit commit-1 cannot be authenticated or decoded",
+    );
+    expect(objects.putCount).toBe(writesBeforeRead);
+  });
+
+  it("enters Repair Mode when an authenticated Snapshot has an invalid schema", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    await remote.initialize({
+      commit: commit("commit-1"),
+      head: head("commit-1", 1),
+    });
+    await remote.writeSnapshot(
+      "snapshot-1",
+      {
+        commitId: "commit-1",
+        entries: { "entry-1": null },
+        protocolVersion: 1,
+        vaultId: "vault-1",
+      } as unknown as VaultSnapshot,
+    );
+    const writesBeforeRead = objects.putCount;
+
+    await expect(
+      remote.readSnapshot({
+        ...head("commit-1", 1),
+        snapshotId: "snapshot-1",
+      }),
+    ).rejects.toMatchObject({
+      message: "Snapshot snapshot-1 payload is invalid",
+      name: "RemoteStateError",
+    });
+    expect(objects.putCount).toBe(writesBeforeRead);
+  });
+
+  it("enters Repair Mode when an authenticated Sync Commit has an invalid schema", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const invalidCommit = {
+      ...commit("commit-1"),
+      changes: [null],
+    } as unknown as CommitRecord;
+    await remote.initialize({
+      commit: invalidCommit,
+      head: head("commit-1", 1),
+    });
+    const writesBeforeRead = objects.putCount;
+
+    await expect(remote.readCommit("commit-1")).rejects.toMatchObject({
+      message: "Sync Commit commit-1 payload is invalid",
+      name: "RemoteStateError",
+    });
+    await expect(remote.readSnapshot(head("commit-1", 1))).rejects.toBeInstanceOf(
+      RemoteStateError,
+    );
+    expect(objects.putCount).toBe(writesBeforeRead);
+  });
+
+  it("enters Repair Mode when authenticated metadata is not valid JSON", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const cipher = await RcloneCompat.fromVaultKey(vaultKey);
+    const invalidJson = await cipher.encryptData(
+      new TextEncoder().encode("{not-json"),
+    );
+    await objects.put("chosen-prefix/v1/snapshots/snapshot-1", invalidJson);
+    await objects.put("chosen-prefix/v1/commits/commit-1", invalidJson);
+    const writesBeforeRead = objects.putCount;
+
+    await expect(
+      remote.readSnapshot({
+        ...head("commit-1", 1),
+        snapshotId: "snapshot-1",
+      }),
+    ).rejects.toMatchObject({
+      message: "Snapshot snapshot-1 cannot be authenticated or decoded",
+      name: "RemoteStateError",
+    });
+    await expect(remote.readCommit("commit-1")).rejects.toMatchObject({
+      message: "Sync Commit commit-1 cannot be authenticated or decoded",
+      name: "RemoteStateError",
+    });
+    expect(objects.putCount).toBe(writesBeforeRead);
   });
 });
