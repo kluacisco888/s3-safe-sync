@@ -8,7 +8,7 @@ The plugin does not run after Obsidian is closed, provide telemetry, synchronize
 
 ## User-visible behavior
 
-- Synchronize on startup, five seconds after local edits settle, every two foreground minutes for remote changes, and on explicit command. An ordinary sync request received during an active synchronization is coalesced into a guaranteed follow-up run instead of being dropped; destructive confirmations are revalidated against a fresh plan.
+- Synchronize on startup, five seconds after local edits settle, every two foreground minutes for remote changes, and on explicit command. When Obsidian becomes hidden or begins unloading, request one best-effort final sync; the host may still terminate before network work completes, so the next startup scan remains the guarantee. An ordinary sync request received during an active synchronization is coalesced into a guaranteed follow-up run instead of being dropped; destructive confirmations are revalidated against a fresh plan.
 - Permit per-device pause without losing local observations.
 - Show the current phase, file count, byte count, and current path during scanning, uploading, and downloading in plugin settings and the desktop status bar without routine success popups.
 - Persist an action-required state for conflicts, corruption, unsafe bulk deletion, or repair.
@@ -34,7 +34,7 @@ The user chooses an empty S3 prefix. All identifiers below are opaque or fixed p
 <prefix>/v1/audits/<random-id>
 ```
 
-Immutable objects use `If-None-Match: *`. Head uses `If-Match` with its previously read ETag, or `If-None-Match: *` during initialization. A rejected Head write reloads and reconciles instead of overwriting.
+Immutable objects use `If-None-Match: *`. Head uses `If-Match` with its previously read ETag, or `If-None-Match: *` during initialization. A rejected Head write reloads and reconciles instead of overwriting, using jittered exponential backoff and a bounded automatic retry schedule so concurrent Replicas do not remain in a sticky error state.
 
 ## State model
 

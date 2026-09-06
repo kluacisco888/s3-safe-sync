@@ -31,6 +31,7 @@ import type {
   DeletedEntry,
   LiveEntry,
 } from "./sync/sync-engine";
+import { retryHeadChanges } from "./sync/head-change-retry";
 import { SyncRequestQueue } from "./sync/sync-request-queue";
 import { AwsS3ObjectStore } from "./storage/aws-s3-object-store";
 import { BootstrapStore } from "./storage/bootstrap-store";
@@ -84,6 +85,8 @@ export default class S3VaultSyncPlugin
   implements SettingsController
 {
   private changeTimer: number | undefined;
+  private headRetryAttempt = 0;
+  private headRetryTimer: number | undefined;
   private credentials!: CredentialStore;
   private data!: PersistedPluginData;
   private pendingBulkDeletion:
@@ -162,10 +165,12 @@ export default class S3VaultSyncPlugin
       }, 120_000),
     );
     this.registerDomEvent(document, "visibilitychange", () => {
-      if (
-        document.visibilityState === "visible" &&
-        !this.data.settings.paused
-      ) {
+      if (!this.data.settings.paused) {
+        void this.syncNow();
+      }
+    });
+    this.registerDomEvent(window, "pagehide", () => {
+      if (!this.data.settings.paused) {
         void this.syncNow();
       }
     });
@@ -175,6 +180,7 @@ export default class S3VaultSyncPlugin
     if (this.changeTimer !== undefined) {
       window.clearTimeout(this.changeTimer);
     }
+    this.clearHeadRetryTimer();
   }
 
   getSettings(): S3VaultSyncSettings {
@@ -455,6 +461,7 @@ export default class S3VaultSyncPlugin
   }
 
   async syncNow(): Promise<void> {
+    this.clearHeadRetryTimer();
     return this.syncRequests.request();
   }
 
@@ -462,6 +469,7 @@ export default class S3VaultSyncPlugin
     this.data.settings.paused = !this.data.settings.paused;
     await this.savePluginData();
     if (this.data.settings.paused) {
+      this.clearHeadRetryTimer();
       this.setStatus("Paused", "Automatic sync is paused on this device.");
     } else {
       this.setStatus("Checking", "Automatic sync resumed.");
@@ -553,43 +561,71 @@ export default class S3VaultSyncPlugin
           "Remote Head is missing or belongs to a different Vault",
         );
       }
-      let attempt = 0;
-      while (attempt < 3) {
-        attempt += 1;
-        try {
-          this.setStatus("Syncing", `Synchronizing (attempt ${attempt}/3).`);
-          const result = await this.createSyncService(
+      const result = await retryHeadChanges(
+        async (attempt, totalAttempts) => {
+          this.setStatus(
+            "Syncing",
+            `Synchronizing (attempt ${attempt}/${totalAttempts}).`,
+          );
+          return this.createSyncService(
             remote,
             allowBulkDeletion,
           ).synchronize();
-          this.pendingBulkDeletion = result.bulkDeletion;
-          this.pendingLocalIssues = result.localIssues;
-          this.pendingDeferredDownloads = result.deferredDownloadEntries;
-          if (result.status === "action-required") {
-            this.setStatus(
-              "Action required",
-              result.bulkDeletion
-                ? "Review and confirm the Bulk Deletion."
-                : "Open sync status to review items that need attention.",
-            );
-          } else {
-            this.pendingBulkDeletion = undefined;
-            this.setStatus(
-              "Idle",
-              `Downloaded ${result.downloaded}, uploaded ${result.uploaded}, deleted ${result.deleted}, deferred ${result.deferredDownloads}, unsynced ${result.unsyncedLocalEntries}.`,
-            );
-          }
-          return;
-        } catch (error) {
-          if (error instanceof HeadChangedError && attempt < 3) {
-            continue;
-          }
-          throw error;
-        }
+        },
+        {
+          baseDelaysMs: allowBulkDeletion ? [] : undefined,
+        },
+      );
+      this.clearHeadRetryTimer();
+      this.headRetryAttempt = 0;
+      this.pendingBulkDeletion = result.bulkDeletion;
+      this.pendingLocalIssues = result.localIssues;
+      this.pendingDeferredDownloads = result.deferredDownloadEntries;
+      if (result.status === "action-required") {
+        this.setStatus(
+          "Action required",
+          result.bulkDeletion
+            ? "Review and confirm the Bulk Deletion."
+            : "Open sync status to review items that need attention.",
+        );
+      } else {
+        this.pendingBulkDeletion = undefined;
+        this.setStatus(
+          "Idle",
+          `Downloaded ${result.downloaded}, uploaded ${result.uploaded}, deleted ${result.deleted}, deferred ${result.deferredDownloads}, unsynced ${result.unsyncedLocalEntries}.`,
+        );
       }
     } catch (error) {
-      this.showError(error);
+      if (error instanceof HeadChangedError) {
+        this.scheduleHeadRetry();
+      } else {
+        this.showError(error);
+      }
     }
+  }
+
+  private clearHeadRetryTimer(): void {
+    if (this.headRetryTimer !== undefined) {
+      window.clearTimeout(this.headRetryTimer);
+      this.headRetryTimer = undefined;
+    }
+  }
+
+  private scheduleHeadRetry(): void {
+    if (this.data.settings.paused || this.headRetryTimer !== undefined) {
+      return;
+    }
+    const baseDelay = Math.min(30_000, 1_000 * 2 ** this.headRetryAttempt);
+    const delay = baseDelay + Math.floor(Math.random() * baseDelay);
+    this.headRetryAttempt += 1;
+    this.setStatus(
+      "Checking",
+      `Another device published first. Retrying automatically in ${Math.ceil(delay / 1_000)} seconds.`,
+    );
+    this.headRetryTimer = window.setTimeout(() => {
+      this.headRetryTimer = undefined;
+      void this.syncNow();
+    }, delay);
   }
 
   private async resolveConflictWith(
