@@ -9,7 +9,7 @@ The plugin does not run after Obsidian is closed, provide telemetry, synchronize
 ## User-visible behavior
 
 - Synchronize on startup, five seconds after local edits settle, every two foreground minutes for remote changes, and on explicit command. When Obsidian becomes hidden or begins unloading, request one best-effort final sync; the host may still terminate before network work completes, so the next startup scan remains the guarantee. An ordinary sync request received during an active synchronization is coalesced into a guaranteed follow-up run instead of being dropped; destructive confirmations are revalidated against a fresh plan.
-- Every automatic run lists the complete Sync Scope to discover creates, deletes, renames, sizes, and modification times, but reads and hashes content only for new files, changed metadata, and paths reported dirty by Obsidian. Manual **Sync now**, a missing cache, and the 24-hour integrity audit hash every eligible file. Remote overwrite and deletion preconditions always hash the affected local content regardless of this optimization.
+- Every automatic run lists the complete Sync Scope to discover creates, deletes, renames, sizes, and modification times, but reads and hashes content only for new files, changed metadata, and paths reported dirty by Obsidian. Manual **Sync now**, a missing cache, and the 24-hour full hash verification read every eligible file. Remote overwrite and deletion preconditions always hash the affected local content regardless of this optimization.
 - Permit per-device pause without losing local observations.
 - Show the current phase, file count, byte count, and current path during metadata checking, content hashing, uploading, and downloading in plugin settings and the desktop status bar without routine success popups.
 - Persist an action-required state for conflicts, corruption, unsafe bulk deletion, repair, or a local edit waiting behind a deferred remote Revision.
@@ -84,7 +84,7 @@ The user completes one final Remotely Save sync, reviews the desktop Vault, disa
 - Desktop delete followed by a long-offline mobile sync does not resurrect the file, including after mobile cache loss.
 - Edit/delete and edit/edit preserve every user-authored version and surface the correct resolution action.
 - Concurrent CAS writers converge after one receives `412 Precondition Failed`.
-- A one-file automatic edit reads and hashes only that file while still discovering deletions from a complete metadata listing; a manual or 24-hour audit hashes the full eligible Vault.
+- A one-file automatic edit reads and hashes only that file while still discovering deletions from a complete metadata listing; a manual or 24-hour verification hashes the full eligible Vault.
 - An unreported equal-size/equal-mtime edit blocks any remote overwrite through the final content-hash precondition and is retried as dirty.
 - Crash or cancellation before Head advancement leaves live state unchanged, and an uploaded Orphan Blob never becomes current.
 - Wrong password, corrupted ciphertext, mixed legacy data, Vault ID mismatch, and unsupported protocol version perform no writes.
@@ -110,7 +110,7 @@ Enable S3 Versioning in the AWS console and scope each device's IAM policy to li
 
 ## Beta boundary
 
-- Automated tests cover deletion resurrection after cache loss, concurrent restore/local-draft conflicts, rename/edit combinations, occupied rename targets, edit/delete, edit/edit, clean Markdown merge, conflicts, history restore, encrypted migration comparison, Head CAS, snapshots, mobile deferral and limit changes, exact-set bulk-delete confirmation, cache-loss mismatches, edits during download/delete, corrupted recovery copies, truncated reads, staged replacement recovery, incremental hash reuse, dirty-path races, and full-audit scheduling.
+- Automated tests cover deletion resurrection after cache loss, concurrent restore/local-draft conflicts, rename/edit combinations, occupied rename targets, edit/delete, edit/edit, clean Markdown merge, conflicts, history restore, encrypted migration comparison, Head CAS, snapshots, mobile deferral and limit changes, exact-set bulk-delete confirmation, cache-loss mismatches, edits during download/delete, corrupted recovery copies, truncated reads, staged replacement recovery, incremental hash reuse, dirty-path races, and full-verification scheduling.
 - The generated bundle contains no Node/Electron runtime import. A OnePlus Android 16 device has passed a 49.6 MB ranged download and a 12 MiB two-part upload without the previous `requestUrlAndroid` Base64 OOM; a full 50 MB upload, interruption/resume, and iOS still require real-device validation.
 - An opt-in desktop stress test round-trips an encrypted 50 MiB Revision under a 256 MiB Node heap. This validates local cryptographic framing and truncation checks, not Android or iOS lifecycle behavior.
 - S3 integration supports global and `aws-cn` virtual-hosted endpoints. Live `cn-northwest-1` tests have passed signed List/Get/Put/Delete, stale ETag rejection, encrypted Blob/Commit round trips, ranged reads, multipart writes, concurrent Head CAS, and an Obsidian 1.13.7 macOS initialization plus no-op synchronization through `requestUrl`.

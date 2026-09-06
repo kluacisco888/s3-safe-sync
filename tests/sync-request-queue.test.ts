@@ -1,12 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { SyncRequestQueue } from "../src/sync/sync-request-queue";
+import {
+  SyncRequestQueue,
+  type SyncRunOptions,
+} from "../src/sync/sync-request-queue";
 
 describe("SyncRequestQueue", () => {
   it("runs another sync when a request arrives during an active sync", async () => {
     let finishFirstSync: (() => void) | undefined;
     const run = vi
-      .fn<(allowBulkDeletion: boolean) => Promise<void>>()
+      .fn<(options: SyncRunOptions) => Promise<void>>()
       .mockImplementationOnce(
         () =>
           new Promise<void>((resolve) => {
@@ -25,12 +28,10 @@ describe("SyncRequestQueue", () => {
     expect(run).toHaveBeenCalledTimes(2);
   });
 
-  it("preserves a queued full hash audit request", async () => {
+  it("preserves a queued full hash verification request", async () => {
     let finishFirstSync: (() => void) | undefined;
     const run = vi
-      .fn<
-        (allowBulkDeletion: boolean, fullHashAudit: boolean) => Promise<void>
-      >()
+      .fn<(options: SyncRunOptions) => Promise<void>>()
       .mockImplementationOnce(
         () =>
           new Promise<void>((resolve) => {
@@ -42,12 +43,18 @@ describe("SyncRequestQueue", () => {
 
     const automaticRequest = queue.request();
     await Promise.resolve();
-    const manualRequest = queue.request({ fullHashAudit: true });
+    const manualRequest = queue.request({ fullHashVerification: true });
     finishFirstSync?.();
     await Promise.all([automaticRequest, manualRequest]);
 
-    expect(run).toHaveBeenNthCalledWith(1, false, false);
-    expect(run).toHaveBeenNthCalledWith(2, false, true);
+    expect(run).toHaveBeenNthCalledWith(1, {
+      allowBulkDeletion: false,
+      fullHashVerification: false,
+    });
+    expect(run).toHaveBeenNthCalledWith(2, {
+      allowBulkDeletion: false,
+      fullHashVerification: true,
+    });
   });
 
   it("serializes direct operations with queued synchronization", async () => {
@@ -98,7 +105,7 @@ describe("SyncRequestQueue", () => {
       finishFirstSync = resolve;
     });
     const run = vi
-      .fn<(allowBulkDeletion: boolean) => Promise<void>>()
+      .fn<(options: SyncRunOptions) => Promise<void>>()
       .mockImplementationOnce(() => firstSync)
       .mockResolvedValue(undefined);
     const queue = new SyncRequestQueue(run);

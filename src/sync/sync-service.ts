@@ -75,7 +75,7 @@ export interface SyncServiceOptions {
 export interface SyncProgress {
   completed: number;
   currentPath?: string;
-  phase: "downloading" | "publishing" | "scanning" | "uploading";
+  phase: "downloading" | "hashing" | "publishing" | "scanning" | "uploading";
   total: number;
   totalBytes: number;
   transferredBytes: number;
@@ -96,7 +96,7 @@ export interface SyncResult {
 
 export interface SyncScanOptions {
   forceHashPaths?: ReadonlySet<string>;
-  fullHashAudit?: boolean;
+  fullHashVerification?: boolean;
 }
 
 type HashedLocalFile = LocalFileInfo & { contentHash: string };
@@ -827,7 +827,7 @@ export class SyncService {
 
   async synchronize(
     approvedBulkDeletionEntryIds: readonly string[] = [],
-    scanOptions: SyncScanOptions = { fullHashAudit: true },
+    scanOptions: SyncScanOptions = { fullHashVerification: true },
   ): Promise<SyncResult> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
@@ -1575,7 +1575,7 @@ export class SyncService {
         deferredDownloadEntries.map((entry) => entry.entryId),
         {
           forceHashPaths: locallyMutatedPaths,
-          fullHashAudit: false,
+          fullHashVerification: false,
           hashHints: new Map(scan.files.map((file) => [file.path, file])),
         },
       ),
@@ -1605,7 +1605,7 @@ export class SyncService {
   private async buildCache(
     snapshot: VaultSnapshot,
     additionalUnmaterializedEntryIds: Iterable<string> = [],
-    scanOptions: FileScanOptions = { fullHashAudit: true },
+    scanOptions: FileScanOptions = { fullHashVerification: true },
   ): Promise<CachedSyncState> {
     const current = await this.options.cache.load();
     const scan = await this.scanFiles(current, false, scanOptions);
@@ -1868,7 +1868,7 @@ export class SyncService {
   private async scanFiles(
     cached?: CachedSyncState,
     reportProgress = false,
-    options: FileScanOptions = { fullHashAudit: true },
+    options: FileScanOptions = { fullHashVerification: true },
   ): Promise<{
     files: HashedLocalFile[];
     localPaths: string[];
@@ -1883,7 +1883,7 @@ export class SyncService {
     const localFiles = await this.options.local.list();
     const reusableHash = (file: LocalFileInfo): string | undefined => {
       if (
-        options.fullHashAudit !== false ||
+        options.fullHashVerification !== false ||
         options.forceHashPaths?.has(file.path)
       ) {
         return undefined;
@@ -1904,32 +1904,48 @@ export class SyncService {
     const hashesByPath = new Map(
       localFiles.map((file) => [file.path, reusableHash(file)] as const),
     );
-    const totalBytes = localFiles.reduce(
-      (sum, file) =>
-        this.exceedsAutomaticFileLimit(file.path, file.size) ||
-        hashesByPath.get(file.path) !== undefined
-          ? sum
-          : sum + file.size,
+    const filesToHash = localFiles.filter(
+      (file) =>
+        !this.exceedsAutomaticFileLimit(file.path, file.size) &&
+        hashesByPath.get(file.path) === undefined,
+    );
+    const totalBytes = filesToHash.reduce(
+      (sum, file) => sum + file.size,
       0,
     );
+    if (reportProgress) {
+      this.reportProgress({
+        completed: localFiles.length,
+        phase: "scanning",
+        total: localFiles.length,
+        totalBytes: 0,
+        transferredBytes: 0,
+      });
+    }
     let completed = 0;
     let transferredBytes = 0;
-    const reportScanned = (file?: LocalFileInfo): void => {
-      if (file) {
+    const reportHashed = (
+      file?: LocalFileInfo,
+      completedSize?: number,
+    ): void => {
+      if (completedSize !== undefined) {
         completed += 1;
+        transferredBytes += completedSize;
       }
       if (reportProgress) {
         this.reportProgress({
           completed,
           ...(file ? { currentPath: file.path } : {}),
-          phase: "scanning",
-          total: localFiles.length,
+          phase: "hashing",
+          total: filesToHash.length,
           totalBytes,
           transferredBytes,
         });
       }
     };
-    reportScanned();
+    if (filesToHash.length > 0) {
+      reportHashed();
+    }
     for (const file of localFiles) {
       const cachedFile = cached?.files[file.path];
       if (
@@ -1940,15 +1956,14 @@ export class SyncService {
         if (cachedFile) {
           skippedTrackedEntryIds.push(cachedFile.entryId);
         }
-        reportScanned(file);
         continue;
       }
       const cachedContentHash = hashesByPath.get(file.path);
       if (cachedContentHash !== undefined) {
         files.push({ ...file, contentHash: cachedContentHash });
-        reportScanned(file);
         continue;
       }
+      reportHashed(file);
       const content = await this.options.local.read(file.path);
       const current = await this.options.local.stat(file.path);
       if (
@@ -1960,12 +1975,11 @@ export class SyncService {
         throw new LocalStateChangedError(file.path);
       }
       const contentHash = await sha256(content);
-      transferredBytes += file.size;
       files.push({
         ...file,
         contentHash,
       });
-      reportScanned(file);
+      reportHashed(file, file.size);
     }
     return {
       files,

@@ -41,12 +41,26 @@ describe("formatSyncProgress", () => {
         completed: 1_517,
         phase: "scanning",
         total: 1_517,
-        totalBytes: 2_048,
-        transferredBytes: 2_048,
+        totalBytes: 0,
+        transferredBytes: 0,
       }),
     ).toEqual({
-      detail: "Checking metadata 1,517/1,517 (100%) · Hashed 2.00 KB / 2.00 KB",
+      detail: "Checking metadata 1,517/1,517 (100%)",
       label: "Checking metadata 1,517/1,517 (100%)",
+    });
+    expect(
+      formatSyncProgress({
+        completed: 0,
+        currentPath: "attachments/large.bin",
+        phase: "hashing",
+        total: 1,
+        totalBytes: 2_048,
+        transferredBytes: 0,
+      }),
+    ).toEqual({
+      detail:
+        "Hashing content 0/1 (0%) · 0 B / 2.00 KB · attachments/large.bin",
+      label: "Hashing content 0/1 (0%)",
     });
   });
 });

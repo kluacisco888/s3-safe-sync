@@ -2,6 +2,7 @@ import type { SyncProgress } from "../sync/sync-service";
 
 const phaseLabels: Record<SyncProgress["phase"], string> = {
   downloading: "Downloading",
+  hashing: "Hashing content",
   publishing: "Publishing encrypted snapshot",
   scanning: "Checking metadata",
   uploading: "Uploading",
@@ -33,7 +34,7 @@ export const formatSyncProgress = (
       : `${phase} ${progress.completed.toLocaleString("en-US")}/${progress.total.toLocaleString("en-US")} (${percentage}%)`;
   const bytes =
     progress.totalBytes > 0
-      ? ` · ${progress.phase === "scanning" ? "Hashed " : ""}${formatBytes(progress.transferredBytes)} / ${formatBytes(progress.totalBytes)}`
+      ? ` · ${formatBytes(progress.transferredBytes)} / ${formatBytes(progress.totalBytes)}`
       : "";
   const currentPath = progress.currentPath ? ` · ${progress.currentPath}` : "";
   return { detail: `${label}${bytes}${currentPath}`, label };

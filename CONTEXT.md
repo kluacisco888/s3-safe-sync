@@ -88,6 +88,10 @@ _Avoid_: Source of truth, deletion history
 A shared encrypted 30-day, content-free history of synchronization plans, outcomes, and failures that excludes secrets and note contents; detailed Debug Logs remain device-local for seven days.
 _Avoid_: Debug log, note history
 
+**Full Hash Verification**:
+A device-local integrity pass that reads and hashes every eligible Vault file after cache loss, on manual request, or at least once every 24 hours. It is not shared history and does not contact S3 for file contents.
+_Avoid_: Sync Audit, remote verification
+
 **Vault Key**:
 A randomly generated secret that encrypts one Vault's content and metadata independently from the user's password.
 _Avoid_: Password, S3 credential

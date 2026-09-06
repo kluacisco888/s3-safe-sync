@@ -27,9 +27,12 @@ import {
   type SyncCachePort,
   type SyncProgress,
 } from "./sync/sync-service";
-import { DirtyPathTracker } from "./sync/dirty-path-tracker";
+import {
+  DirtyPathTracker,
+  dirtyPathsForRename,
+} from "./sync/dirty-path-tracker";
 import { LocalStateChangedError } from "./sync/errors";
-import { isFullHashAuditDue } from "./sync/full-hash-audit-policy";
+import { isFullHashVerificationDue } from "./sync/full-hash-verification-policy";
 import type {
   BulkDeletionPlan,
   ConflictedEntry,
@@ -40,6 +43,7 @@ import { retryHeadChanges } from "./sync/head-change-retry";
 import {
   SyncRequestQueue,
   type SyncRequestOptions,
+  type SyncRunOptions,
 } from "./sync/sync-request-queue";
 import { AwsS3ObjectStore } from "./storage/aws-s3-object-store";
 import { BootstrapStore } from "./storage/bootstrap-store";
@@ -69,7 +73,7 @@ class RepairModeError extends Error {
 
 interface PersistedPluginData {
   cache?: CachedSyncState;
-  lastFullHashAuditAt?: number;
+  lastFullHashVerificationAt?: number;
   settings: S3VaultSyncSettings;
 }
 
@@ -96,7 +100,7 @@ export default class S3VaultSyncPlugin
   private changeTimer: number | undefined;
   private readonly dirtyPaths = new DirtyPathTracker();
   private headRetryAttempt = 0;
-  private headRetryFullHashAudit = false;
+  private fullHashVerificationRequired = false;
   private headRetryTimer: number | undefined;
   private credentials!: CredentialStore;
   private data!: PersistedPluginData;
@@ -106,9 +110,8 @@ export default class S3VaultSyncPlugin
   private approvedBulkDeletionEntryIds: string[] | undefined;
   private pendingLocalIssues: LocalSyncIssue[] = [];
   private pendingDeferredDownloads: DeferredDownloadEntry[] = [];
-  private readonly syncRequests = new SyncRequestQueue(
-    (allowBulkDeletion, fullHashAudit) =>
-      this.performSync(allowBulkDeletion, fullHashAudit),
+  private readonly syncRequests = new SyncRequestQueue((options) =>
+    this.performSync(options),
   );
   private status: PluginStatus = "Not configured";
   private statusDetail = "Enter AWS settings and a Vault password.";
@@ -268,7 +271,7 @@ export default class S3VaultSyncPlugin
     try {
       await this.requestSync({
         allowBulkDeletion: true,
-        fullHashAudit: true,
+        fullHashVerification: true,
       });
     } finally {
       this.approvedBulkDeletionEntryIds = undefined;
@@ -434,7 +437,7 @@ export default class S3VaultSyncPlugin
           );
         }
         await this.createSyncService(remote).initializeNew(vaultId);
-        this.data.lastFullHashAuditAt = Date.now();
+        this.data.lastFullHashVerificationAt = Date.now();
       }
       this.credentials.saveVaultKey(vaultKey);
       this.data.settings.vaultId = vaultId;
@@ -464,7 +467,7 @@ export default class S3VaultSyncPlugin
   }
 
   async syncNow(): Promise<void> {
-    return this.requestSync({ fullHashAudit: true });
+    return this.requestSync({ fullHashVerification: true });
   }
 
   async togglePause(): Promise<void> {
@@ -543,7 +546,7 @@ export default class S3VaultSyncPlugin
     const stored = (await this.loadData()) as Partial<PersistedPluginData> | null;
     this.data = {
       cache: stored?.cache,
-      lastFullHashAuditAt: stored?.lastFullHashAuditAt,
+      lastFullHashVerificationAt: stored?.lastFullHashVerificationAt,
       settings: { ...DEFAULT_SETTINGS, ...stored?.settings },
     };
     if (!this.data.settings.replicaId) {
@@ -552,10 +555,10 @@ export default class S3VaultSyncPlugin
     }
   }
 
-  private async performSync(
-    allowBulkDeletion = false,
-    requestedFullHashAudit = false,
-  ): Promise<void> {
+  private async performSync({
+    allowBulkDeletion,
+    fullHashVerification: requestedFullHashVerification,
+  }: SyncRunOptions): Promise<void> {
     if (this.data.settings.paused) {
       this.setStatus("Paused", "Automatic sync is paused on this device.");
       return;
@@ -565,14 +568,21 @@ export default class S3VaultSyncPlugin
       this.setStatus("Not configured", "Initialize or unlock the encrypted Vault.");
       return;
     }
+    if (this.headRetryTimer !== undefined) {
+      this.clearHeadRetryTimer();
+    }
     const dirtySnapshot = this.dirtyPaths.capture();
-    const fullHashAudit =
-      requestedFullHashAudit ||
-      isFullHashAuditDue(
-        this.data.lastFullHashAuditAt,
+    const fullHashVerification =
+      requestedFullHashVerification ||
+      this.fullHashVerificationRequired ||
+      isFullHashVerificationDue(
+        this.data.lastFullHashVerificationAt,
         this.data.cache !== undefined,
         Date.now(),
       );
+    if (fullHashVerification) {
+      this.fullHashVerificationRequired = true;
+    }
     try {
       this.setStatus("Checking", "Reading encrypted remote Head.");
       const objects = this.createObjectStore();
@@ -604,7 +614,7 @@ export default class S3VaultSyncPlugin
               : undefined,
             {
               forceHashPaths: new Set(dirtySnapshot.keys()),
-              fullHashAudit: fullHashAudit && attempt === 1,
+              fullHashVerification,
             },
           );
         },
@@ -618,17 +628,24 @@ export default class S3VaultSyncPlugin
       this.pendingLocalIssues = result.localIssues;
       this.pendingDeferredDownloads = result.deferredDownloadEntries;
       if (result.cacheUpdated) {
-        this.dirtyPaths.acknowledge(dirtySnapshot);
+        const unverifiedLocalPaths = new Set(
+          result.localIssues.flatMap((issue) =>
+            issue.kind === "unsynced-local" ? [issue.path] : [],
+          ),
+        );
+        this.dirtyPaths.acknowledge(dirtySnapshot, unverifiedLocalPaths);
       }
-      if (fullHashAudit) {
-        const previousAuditAt = this.data.lastFullHashAuditAt;
-        this.data.lastFullHashAuditAt = Date.now();
+      if (fullHashVerification && result.cacheUpdated) {
+        const previousVerificationAt =
+          this.data.lastFullHashVerificationAt;
+        this.data.lastFullHashVerificationAt = Date.now();
         try {
           await this.savePluginData();
         } catch (error) {
-          this.data.lastFullHashAuditAt = previousAuditAt;
+          this.data.lastFullHashVerificationAt = previousVerificationAt;
           throw error;
         }
+        this.fullHashVerificationRequired = false;
       }
       if (result.status === "action-required") {
         this.setStatus(
@@ -646,7 +663,7 @@ export default class S3VaultSyncPlugin
       }
     } catch (error) {
       if (error instanceof HeadChangedError) {
-        this.scheduleHeadRetry(fullHashAudit);
+        this.scheduleHeadRetry(fullHashVerification);
       } else if (error instanceof LocalStateChangedError) {
         this.dirtyPaths.mark(error.path);
         this.setStatus(
@@ -665,11 +682,10 @@ export default class S3VaultSyncPlugin
       window.clearTimeout(this.headRetryTimer);
       this.headRetryTimer = undefined;
     }
-    this.headRetryFullHashAudit = false;
   }
 
-  private scheduleHeadRetry(fullHashAudit = false): void {
-    this.headRetryFullHashAudit ||= fullHashAudit;
+  private scheduleHeadRetry(fullHashVerification = false): void {
+    this.fullHashVerificationRequired ||= fullHashVerification;
     if (this.data.settings.paused || this.headRetryTimer !== undefined) {
       return;
     }
@@ -682,9 +698,10 @@ export default class S3VaultSyncPlugin
     );
     this.headRetryTimer = window.setTimeout(() => {
       this.headRetryTimer = undefined;
-      const retryFullHashAudit = this.headRetryFullHashAudit;
-      this.headRetryFullHashAudit = false;
-      void this.requestSync({ fullHashAudit: retryFullHashAudit });
+      const retryFullHashVerification = this.fullHashVerificationRequired;
+      void this.requestSync({
+        fullHashVerification: retryFullHashVerification,
+      });
     }, delay);
   }
 
@@ -730,29 +747,11 @@ export default class S3VaultSyncPlugin
     this.registerEvent(this.app.vault.on("delete", schedule));
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
-        const dirtyRenamePaths = new Set<string>([oldPath, file.path]);
-        const cache = this.data.cache;
-        if (cache) {
-          const files = { ...cache.files };
-          const renamed: Array<[string, CachedSyncState["files"][string]]> = [];
-          for (const [path, cachedFile] of Object.entries(files)) {
-            if (path === oldPath || path.startsWith(`${oldPath}/`)) {
-              const suffix = path.slice(oldPath.length);
-              renamed.push([
-                `${file.path}${suffix}`,
-                { ...cachedFile, path: `${file.path}${suffix}` },
-              ]);
-              dirtyRenamePaths.add(path);
-              dirtyRenamePaths.add(`${file.path}${suffix}`);
-              delete files[path];
-            }
-          }
-          for (const [path, cachedFile] of renamed) {
-            files[path] = cachedFile;
-          }
-          this.data.cache = { ...cache, files };
-          void this.savePluginData();
-        }
+        const dirtyRenamePaths = dirtyPathsForRename(
+          Object.keys(this.data.cache?.files ?? {}),
+          oldPath,
+          file.path,
+        );
         for (const path of dirtyRenamePaths) {
           if (isInSyncScope(path)) {
             this.dirtyPaths.mark(path);
@@ -795,10 +794,11 @@ export default class S3VaultSyncPlugin
   private requestSync(
     options: SyncRequestOptions = {},
   ): Promise<void> {
-    const fullHashAudit =
-      options.fullHashAudit === true || this.headRetryFullHashAudit;
+    const fullHashVerification =
+      options.fullHashVerification === true ||
+      this.fullHashVerificationRequired;
     this.clearHeadRetryTimer();
-    return this.syncRequests.request({ ...options, fullHashAudit });
+    return this.syncRequests.request({ ...options, fullHashVerification });
   }
 
   private setStatus(

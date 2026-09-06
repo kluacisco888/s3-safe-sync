@@ -249,8 +249,25 @@ describe("SyncService", () => {
     expect(local.readCount).toBe(4);
     expect(progress.filter((update) => update.phase === "scanning")).toEqual([
       {
-        completed: 0,
+        completed: 2,
         phase: "scanning",
+        total: 2,
+        totalBytes: 0,
+        transferredBytes: 0,
+      },
+    ]);
+    expect(progress.filter((update) => update.phase === "hashing")).toEqual([
+      {
+        completed: 0,
+        phase: "hashing",
+        total: 2,
+        totalBytes: 8,
+        transferredBytes: 0,
+      },
+      {
+        completed: 0,
+        currentPath: "notes/one.md",
+        phase: "hashing",
         total: 2,
         totalBytes: 8,
         transferredBytes: 0,
@@ -258,7 +275,15 @@ describe("SyncService", () => {
       {
         completed: 1,
         currentPath: "notes/one.md",
-        phase: "scanning",
+        phase: "hashing",
+        total: 2,
+        totalBytes: 8,
+        transferredBytes: 3,
+      },
+      {
+        completed: 1,
+        currentPath: "notes/two.md",
+        phase: "hashing",
         total: 2,
         totalBytes: 8,
         transferredBytes: 3,
@@ -266,7 +291,7 @@ describe("SyncService", () => {
       {
         completed: 2,
         currentPath: "notes/two.md",
-        phase: "scanning",
+        phase: "hashing",
         total: 2,
         totalBytes: 8,
         transferredBytes: 8,
@@ -1551,14 +1576,16 @@ describe("SyncService", () => {
     progress.length = 0;
     await local.write("notes/changed.md", new TextEncoder().encode("second"));
 
-    const result = await service.synchronize([], { fullHashAudit: false });
+    const result = await service.synchronize([], {
+      fullHashVerification: false,
+    });
 
     expect(result).toMatchObject({ status: "complete", uploaded: 1 });
     expect(local.readPaths).toEqual([
       "notes/changed.md",
       "notes/changed.md",
     ]);
-    expect(progress.filter((update) => update.phase === "scanning").at(-1))
+    expect(progress.filter((update) => update.phase === "hashing").at(-1))
       .toMatchObject({ totalBytes: 6, transferredBytes: 6 });
   });
 
@@ -1583,7 +1610,9 @@ describe("SyncService", () => {
     local.readCount = 0;
     local.readPaths.length = 0;
 
-    const result = await service.synchronize([], { fullHashAudit: false });
+    const result = await service.synchronize([], {
+      fullHashVerification: false,
+    });
 
     expect(result).toMatchObject({
       cacheUpdated: true,
@@ -1620,7 +1649,7 @@ describe("SyncService", () => {
 
     const result = await service.synchronize([], {
       forceHashPaths: new Set(["notes/changed.md"]),
-      fullHashAudit: false,
+      fullHashVerification: false,
     });
 
     expect(result).toMatchObject({ status: "complete", uploaded: 1 });
@@ -1630,7 +1659,7 @@ describe("SyncService", () => {
     ]);
   });
 
-  it("reads every eligible file during an explicit full hash audit", async () => {
+  it("reads every eligible file during an explicit full hash verification", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
     const remote = await RemoteStore.open({
@@ -1651,7 +1680,7 @@ describe("SyncService", () => {
     local.readCount = 0;
     local.readPaths.length = 0;
 
-    await service.synchronize([], { fullHashAudit: true });
+    await service.synchronize([], { fullHashVerification: true });
 
     expect(local.readPaths).toEqual(["notes/one.md", "notes/two.md"]);
   });
@@ -1682,7 +1711,9 @@ describe("SyncService", () => {
     local.readPaths.length = 0;
     await local.delete("notes/1.md");
 
-    const result = await service.synchronize([], { fullHashAudit: false });
+    const result = await service.synchronize([], {
+      fullHashVerification: false,
+    });
 
     expect(result).toMatchObject({ cacheUpdated: true, status: "complete" });
     expect(local.readPaths).toEqual([]);
@@ -1733,10 +1764,69 @@ describe("SyncService", () => {
     );
 
     await expect(
-      phone.synchronize([], { fullHashAudit: false }),
+      phone.synchronize([], { fullHashVerification: false }),
     ).rejects.toMatchObject({ path: "notes/example.md" });
 
     expect(phoneVault.readText("notes/example.md")).toBe("draft");
+  });
+
+  it("hashes a dirty attachment after a temporary device limit is raised", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write(
+      "attachments/example.bin",
+      new TextEncoder().encode("aaaaaaaaaaaa"),
+    );
+    let limit = 20;
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      maxAutomaticFileBytes: () => limit,
+      remote,
+      replicaId: "phone",
+    });
+    await service.initializeNew("vault-1");
+    local.readCount = 0;
+    local.readPaths.length = 0;
+    local.writePreservingMetadata(
+      "attachments/example.bin",
+      new TextEncoder().encode("bbbbbbbbbbbb"),
+    );
+    const dirtyPath = new Set(["attachments/example.bin"]);
+    limit = 10;
+
+    const deferred = await service.synchronize([], {
+      forceHashPaths: dirtyPath,
+      fullHashVerification: false,
+    });
+
+    expect(deferred).toMatchObject({
+      cacheUpdated: true,
+      localIssues: [
+        { kind: "unsynced-local", path: "attachments/example.bin" },
+      ],
+      status: "action-required",
+      uploaded: 0,
+    });
+    expect(local.readPaths).toEqual([]);
+
+    limit = 20;
+    const resumed = await service.synchronize([], {
+      forceHashPaths: dirtyPath,
+      fullHashVerification: false,
+    });
+
+    expect(resumed).toMatchObject({ status: "complete", uploaded: 1 });
+    expect(local.readPaths).toEqual([
+      "attachments/example.bin",
+      "attachments/example.bin",
+    ]);
   });
 
   it("does not publish a file whose bytes are shorter than the scanned size", async () => {
