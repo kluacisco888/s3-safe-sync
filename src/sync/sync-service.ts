@@ -112,6 +112,7 @@ export interface VerifiedLocalFile extends LocalFileInfo {
 
 interface FileScanOptions extends SyncScanOptions {
   hashHints?: ReadonlyMap<string, VerifiedLocalFile>;
+  pathRenames?: ReadonlyMap<string, PersistedPathRename>;
 }
 
 export interface DeferredDownloadEntry {
@@ -1618,6 +1619,7 @@ export class SyncService {
           forceHashPaths: locallyMutatedPaths,
           fullHashVerification: false,
           hashHints: new Map(scan.files.map((file) => [file.path, file])),
+          pathRenames: syncOptions.pathRenames,
         },
       ),
     );
@@ -1922,6 +1924,15 @@ export class SyncService {
     const unsyncedLocalPaths: string[] = [];
     let unsyncedLocalEntries = 0;
     const localFiles = await this.options.local.list();
+    const renamedEntryIdsByTarget = new Map<string, string[]>();
+    for (const [fromPath, rename] of options.pathRenames ?? []) {
+      if (cached?.files[fromPath]?.entryId !== rename.entryId) {
+        continue;
+      }
+      const entryIds = renamedEntryIdsByTarget.get(rename.toPath) ?? [];
+      entryIds.push(rename.entryId);
+      renamedEntryIdsByTarget.set(rename.toPath, entryIds);
+    }
     const reusableHash = (file: LocalFileInfo): string | undefined => {
       if (options.fullHashVerification !== false) {
         return undefined;
@@ -2003,6 +2014,11 @@ export class SyncService {
         unsyncedLocalPaths.push(file.path);
         if (cachedFile) {
           skippedTrackedEntryIds.push(cachedFile.entryId);
+        } else {
+          const renamedEntryIds = renamedEntryIdsByTarget.get(file.path);
+          if (renamedEntryIds?.length === 1 && renamedEntryIds[0]) {
+            skippedTrackedEntryIds.push(renamedEntryIds[0]);
+          }
         }
         continue;
       }

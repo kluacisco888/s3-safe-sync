@@ -1946,6 +1946,75 @@ describe("SyncService", () => {
     ]);
   });
 
+  it("retains a tracked rename while its target exceeds the device limit", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write(
+      "attachments/a.bin",
+      new TextEncoder().encode("aaaaaaaaaaaa"),
+    );
+    const cache = new MemorySyncCache();
+    let limit = 20;
+    const service = new SyncService({
+      cache,
+      local,
+      maxAutomaticFileBytes: () => limit,
+      remote,
+      replicaId: "phone",
+    });
+    await service.initializeNew("vault-1");
+    const tracked = cache.state?.files["attachments/a.bin"];
+    if (!tracked) {
+      throw new Error("Expected cached Entry");
+    }
+    const pathRenames = new Map([
+      [
+        "attachments/a.bin",
+        { entryId: tracked.entryId, toPath: "attachments/b.bin" },
+      ],
+    ]);
+    await local.move("attachments/a.bin", "attachments/b.bin");
+    limit = 10;
+
+    const deferred = await service.synchronize([], {
+      fullHashVerification: false,
+      pathRenames,
+    });
+
+    expect(deferred).toMatchObject({
+      status: "action-required",
+      uploaded: 0,
+    });
+    expect(cache.state?.files["attachments/a.bin"]?.entryId).toBe(
+      tracked.entryId,
+    );
+    expect((await remote.readHead())?.value.generation).toBe(1);
+
+    limit = 20;
+    const resumed = await service.synchronize([], {
+      fullHashVerification: false,
+      pathRenames,
+    });
+
+    expect(resumed.status).toBe("complete");
+    const currentHead = await remote.readHead();
+    if (!currentHead) {
+      throw new Error("Expected current Head");
+    }
+    const current = await remote.readSnapshot(currentHead.value);
+    expect(current.entries[tracked.entryId]).toMatchObject({
+      entryId: tracked.entryId,
+      kind: "live",
+      path: "attachments/b.bin",
+    });
+  });
+
   it("does not publish a file whose bytes are shorter than the scanned size", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);

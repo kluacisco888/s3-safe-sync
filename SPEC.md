@@ -70,6 +70,7 @@ Paths, hashes, entry metadata, deletion records, conflicts, commits, snapshots, 
 - Bulk deletion over 100 entries or 20 percent of current entries requires confirmation bound to the exact Entry ID set; any changed deletion set requires a new confirmation.
 - Automatic sync, initialization, deferred downloads, imports, previews, and all restore or Conflict actions share one per-plugin serial operation queue so an older operation cannot overwrite a newer cache.
 - Dirty paths carry monotonic in-memory versions. A completed run acknowledges only the event versions it captured, so an edit that arrives during synchronization always remains queued for a follow-up run. Pending Path Renames and an incomplete Full Hash Verification are persisted across restart.
+- All writes to the device-local plugin data file are serialized. Each queued write snapshots the latest cache, verification, and rename state only when it starts, so an older slow write cannot finish last and replace newer evidence.
 - A missing, unauthenticated, or dangling Head enters read-only Repair Mode.
 - S3 capability probes verify conditional create/update, read, list, and delete before initialization.
 - S3 Versioning and a 30-day noncurrent-version lifecycle are an independent safety layer.

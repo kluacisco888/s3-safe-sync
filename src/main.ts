@@ -10,6 +10,7 @@ import { RemotelySaveMigration } from "./migration/remotely-save-migration";
 import { CredentialStore, type AwsCredentials } from "./plugin/credential-store";
 import { StatusModal, VersionHistoryModal } from "./plugin/modals";
 import { ObsidianVaultPort, isInSyncScope } from "./plugin/obsidian-vault-port";
+import { SerializedDataWriter } from "./plugin/serialized-data-writer";
 import { automaticMobileFileLimit } from "./plugin/mobile-file-limit";
 import { formatSyncProgress } from "./plugin/sync-progress";
 import {
@@ -114,6 +115,10 @@ export default class S3VaultSyncPlugin
   private approvedBulkDeletionEntryIds: string[] | undefined;
   private pendingLocalIssues: LocalSyncIssue[] = [];
   private pendingDeferredDownloads: DeferredDownloadEntry[] = [];
+  private readonly pluginDataWriter = new SerializedDataWriter(
+    () => this.data,
+    (snapshot) => this.saveData(snapshot),
+  );
   private readonly syncRequests = new SyncRequestQueue((options) =>
     this.performSync(options),
   );
@@ -660,7 +665,6 @@ export default class S3VaultSyncPlugin
             issue.kind === "unsynced-local" ? [issue.path] : [],
           ),
         );
-        const previousPendingPathRenames = this.pathRenames.serialize();
         const previousVerificationAt =
           this.data.lastFullHashVerificationAt;
         const previousVerificationRequired =
@@ -679,10 +683,7 @@ export default class S3VaultSyncPlugin
             await this.savePluginData();
           }
         } catch (error) {
-          this.pathRenames = new PathRenameTracker(
-            previousPendingPathRenames,
-          );
-          this.data.pendingPathRenames = previousPendingPathRenames;
+          this.data.pendingPathRenames = this.pathRenames.serialize();
           this.data.lastFullHashVerificationAt = previousVerificationAt;
           this.data.fullHashVerificationRequired =
             previousVerificationRequired;
@@ -797,7 +798,9 @@ export default class S3VaultSyncPlugin
           file.path,
         );
         this.data.pendingPathRenames = this.pathRenames.serialize();
-        void this.savePluginData();
+        void this.savePluginData().catch((error: unknown) => {
+          this.showError(error);
+        });
         for (const path of dirtyRenamePaths) {
           if (isInSyncScope(path)) {
             this.dirtyPaths.mark(path);
@@ -811,7 +814,7 @@ export default class S3VaultSyncPlugin
   }
 
   private async savePluginData(): Promise<void> {
-    await this.saveData(this.data);
+    await this.pluginDataWriter.save();
   }
 
   private scheduleAfterLocalChange(): void {
