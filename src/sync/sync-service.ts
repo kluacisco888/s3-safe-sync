@@ -82,6 +82,7 @@ export interface SyncProgress {
 }
 
 export interface SyncResult {
+  cacheUpdated: boolean;
   deferredDownloadEntries: DeferredDownloadEntry[];
   bulkDeletion?: BulkDeletionPlan;
   deferredDownloads: number;
@@ -91,6 +92,17 @@ export interface SyncResult {
   status: "action-required" | "complete";
   unsyncedLocalEntries: number;
   uploaded: number;
+}
+
+export interface SyncScanOptions {
+  forceHashPaths?: ReadonlySet<string>;
+  fullHashAudit?: boolean;
+}
+
+type HashedLocalFile = LocalFileInfo & { contentHash: string };
+
+interface FileScanOptions extends SyncScanOptions {
+  hashHints?: ReadonlyMap<string, HashedLocalFile>;
 }
 
 export interface DeferredDownloadEntry {
@@ -815,6 +827,7 @@ export class SyncService {
 
   async synchronize(
     approvedBulkDeletionEntryIds: readonly string[] = [],
+    scanOptions: SyncScanOptions = { fullHashAudit: true },
   ): Promise<SyncResult> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
@@ -822,7 +835,7 @@ export class SyncService {
     }
     let remote = await this.options.remote.readSnapshot(versionedHead.value);
     const cached = await this.options.cache.load();
-    const scan = await this.scanFiles(cached, true);
+    const scan = await this.scanFiles(cached, true, scanOptions);
     const scanned = scan.files;
     const localPaths = new Set(scan.localPaths);
     const scannedByPath = new Map(
@@ -972,6 +985,7 @@ export class SyncService {
     const expectedLocalContentByPath = new Map(
       observation.files.map((file) => [file.path, file.contentHash] as const),
     );
+    const locallyMutatedPaths = new Set<string>();
     const reconciliationBase = this.buildReconciliationBase(cached);
     const plan = this.engine.reconcile({
       base: reconciliationBase,
@@ -1027,6 +1041,7 @@ export class SyncService {
     if (hasBlockingConflict) {
       return {
         bulkDeletion: plan.bulkDeletion,
+        cacheUpdated: false,
         deferredDownloadEntries,
         deferredDownloads: deferredEntryIds.size,
         deleted: 0,
@@ -1050,6 +1065,7 @@ export class SyncService {
     if (plan.bulkDeletion && !bulkDeletionIsApproved) {
       return {
         bulkDeletion: plan.bulkDeletion,
+        cacheUpdated: false,
         deferredDownloadEntries,
         deferredDownloads: deferredEntryIds.size,
         deleted: 0,
@@ -1109,6 +1125,7 @@ export class SyncService {
         const expectedContentHash =
           expectedLocalContentByPath.get(action.path) ?? null;
         await this.options.local.delete(action.path, expectedContentHash);
+        locallyMutatedPaths.add(action.path);
         expectedLocalContentByPath.delete(action.path);
         deleted += 1;
       } else if (action.kind === "move-local") {
@@ -1121,6 +1138,8 @@ export class SyncService {
           expectedContentHash ?? undefined,
           null,
         );
+        locallyMutatedPaths.add(action.fromPath);
+        locallyMutatedPaths.add(action.toPath);
         expectedLocalContentByPath.delete(action.fromPath);
         if (expectedContentHash) {
           expectedLocalContentByPath.set(action.toPath, expectedContentHash);
@@ -1159,6 +1178,7 @@ export class SyncService {
           plaintext,
           expectedContentHash,
         );
+        locallyMutatedPaths.add(action.path);
         expectedLocalContentByPath.set(
           action.path,
           action.revision.contentHash,
@@ -1534,6 +1554,7 @@ export class SyncService {
           pendingDelete.path,
           pendingDelete.expectedContentHash,
         );
+        locallyMutatedPaths.add(pendingDelete.path);
       }
       for (const pendingWrite of writeAfterCommit) {
         await this.assertLocalContent(
@@ -1545,16 +1566,23 @@ export class SyncService {
           pendingWrite.body,
           pendingWrite.expectedContentHash,
         );
+        locallyMutatedPaths.add(pendingWrite.path);
       }
     }
     await this.options.cache.save(
       await this.buildCache(
         remote,
         deferredDownloadEntries.map((entry) => entry.entryId),
+        {
+          forceHashPaths: locallyMutatedPaths,
+          fullHashAudit: false,
+          hashHints: new Map(scan.files.map((file) => [file.path, file])),
+        },
       ),
     );
     return {
       bulkDeletion: plan.bulkDeletion,
+      cacheUpdated: true,
       deferredDownloadEntries,
       deferredDownloads: deferredEntryIds.size,
       deleted,
@@ -1577,9 +1605,10 @@ export class SyncService {
   private async buildCache(
     snapshot: VaultSnapshot,
     additionalUnmaterializedEntryIds: Iterable<string> = [],
+    scanOptions: FileScanOptions = { fullHashAudit: true },
   ): Promise<CachedSyncState> {
     const current = await this.options.cache.load();
-    const scan = await this.scanFiles(current);
+    const scan = await this.scanFiles(current, false, scanOptions);
     const files: Record<string, CachedFileState> = {};
     const pendingUnmaterializedEntryIds = new Set([
       ...(current?.unmaterializedEntryIds ?? []),
@@ -1839,25 +1868,55 @@ export class SyncService {
   private async scanFiles(
     cached?: CachedSyncState,
     reportProgress = false,
+    options: FileScanOptions = { fullHashAudit: true },
   ): Promise<{
-    files: Array<LocalFileInfo & { contentHash: string }>;
+    files: HashedLocalFile[];
     localPaths: string[];
     skippedTrackedEntryIds: string[];
     unsyncedLocalEntries: number;
     unsyncedLocalPaths: string[];
   }> {
-    const files: Array<LocalFileInfo & { contentHash: string }> = [];
+    const files: HashedLocalFile[] = [];
     const skippedTrackedEntryIds: string[] = [];
     const unsyncedLocalPaths: string[] = [];
     let unsyncedLocalEntries = 0;
     const localFiles = await this.options.local.list();
-    const totalBytes = localFiles.reduce((sum, file) => sum + file.size, 0);
+    const reusableHash = (file: LocalFileInfo): string | undefined => {
+      if (
+        options.fullHashAudit !== false ||
+        options.forceHashPaths?.has(file.path)
+      ) {
+        return undefined;
+      }
+      const hint = options.hashHints?.get(file.path);
+      if (
+        hint?.modifiedAt === file.modifiedAt &&
+        hint.size === file.size
+      ) {
+        return hint.contentHash;
+      }
+      const cachedFile = cached?.files[file.path];
+      return cachedFile?.modifiedAt === file.modifiedAt &&
+        cachedFile.size === file.size
+        ? cachedFile.contentHash
+        : undefined;
+    };
+    const hashesByPath = new Map(
+      localFiles.map((file) => [file.path, reusableHash(file)] as const),
+    );
+    const totalBytes = localFiles.reduce(
+      (sum, file) =>
+        this.exceedsAutomaticFileLimit(file.path, file.size) ||
+        hashesByPath.get(file.path) !== undefined
+          ? sum
+          : sum + file.size,
+      0,
+    );
     let completed = 0;
     let transferredBytes = 0;
     const reportScanned = (file?: LocalFileInfo): void => {
       if (file) {
         completed += 1;
-        transferredBytes += file.size;
       }
       if (reportProgress) {
         this.reportProgress({
@@ -1884,6 +1943,12 @@ export class SyncService {
         reportScanned(file);
         continue;
       }
+      const cachedContentHash = hashesByPath.get(file.path);
+      if (cachedContentHash !== undefined) {
+        files.push({ ...file, contentHash: cachedContentHash });
+        reportScanned(file);
+        continue;
+      }
       const content = await this.options.local.read(file.path);
       const current = await this.options.local.stat(file.path);
       if (
@@ -1895,6 +1960,7 @@ export class SyncService {
         throw new LocalStateChangedError(file.path);
       }
       const contentHash = await sha256(content);
+      transferredBytes += file.size;
       files.push({
         ...file,
         contentHash,

@@ -76,6 +76,7 @@ class MemoryVault implements LocalVaultPort {
   beforeMove: ((fromPath: string, toPath: string) => Promise<void> | void) | undefined;
   beforeStat: ((path: string) => Promise<void> | void) | undefined;
   readCount = 0;
+  readonly readPaths: string[] = [];
   readonly unsupportedPaths = new Set<string>();
 
   delete(path: string): Promise<void> {
@@ -127,6 +128,7 @@ class MemoryVault implements LocalVaultPort {
 
   read(path: string): Promise<Uint8Array> {
     this.readCount += 1;
+    this.readPaths.push(path);
     const file = this.files.get(path);
     if (!file) {
       throw new Error(`Missing local file ${path}`);
@@ -1524,6 +1526,219 @@ describe("SyncService", () => {
     expect((await remote.readHead())?.value.generation).toBe(2);
   });
 
+  it("reads only a changed file during an incremental synchronization", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write("notes/changed.md", new TextEncoder().encode("first"));
+    await local.write("notes/unchanged.md", new TextEncoder().encode("stable"));
+    const progress: SyncProgress[] = [];
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      onProgress: (update) => progress.push(update),
+      remote,
+      replicaId: "desktop",
+    });
+    await service.initializeNew("vault-1");
+    local.readCount = 0;
+    local.readPaths.length = 0;
+    progress.length = 0;
+    await local.write("notes/changed.md", new TextEncoder().encode("second"));
+
+    const result = await service.synchronize([], { fullHashAudit: false });
+
+    expect(result).toMatchObject({ status: "complete", uploaded: 1 });
+    expect(local.readPaths).toEqual([
+      "notes/changed.md",
+      "notes/changed.md",
+    ]);
+    expect(progress.filter((update) => update.phase === "scanning").at(-1))
+      .toMatchObject({ totalBytes: 6, transferredBytes: 6 });
+  });
+
+  it("reuses cached hashes when an incremental metadata scan is unchanged", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write("notes/one.md", new TextEncoder().encode("one"));
+    await local.write("notes/two.md", new TextEncoder().encode("two"));
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      remote,
+      replicaId: "desktop",
+    });
+    await service.initializeNew("vault-1");
+    local.readCount = 0;
+    local.readPaths.length = 0;
+
+    const result = await service.synchronize([], { fullHashAudit: false });
+
+    expect(result).toMatchObject({
+      cacheUpdated: true,
+      status: "complete",
+      uploaded: 0,
+    });
+    expect(local.readPaths).toEqual([]);
+  });
+
+  it("hashes a dirty path even when its size and modified time are unchanged", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write("notes/changed.md", new TextEncoder().encode("first"));
+    await local.write("notes/unchanged.md", new TextEncoder().encode("stable"));
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      remote,
+      replicaId: "desktop",
+    });
+    await service.initializeNew("vault-1");
+    local.readCount = 0;
+    local.readPaths.length = 0;
+    local.writePreservingMetadata(
+      "notes/changed.md",
+      new TextEncoder().encode("other"),
+    );
+
+    const result = await service.synchronize([], {
+      forceHashPaths: new Set(["notes/changed.md"]),
+      fullHashAudit: false,
+    });
+
+    expect(result).toMatchObject({ status: "complete", uploaded: 1 });
+    expect(local.readPaths).toEqual([
+      "notes/changed.md",
+      "notes/changed.md",
+    ]);
+  });
+
+  it("reads every eligible file during an explicit full hash audit", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write("notes/one.md", new TextEncoder().encode("one"));
+    await local.write("notes/two.md", new TextEncoder().encode("two"));
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      remote,
+      replicaId: "desktop",
+    });
+    await service.initializeNew("vault-1");
+    local.readCount = 0;
+    local.readPaths.length = 0;
+
+    await service.synchronize([], { fullHashAudit: true });
+
+    expect(local.readPaths).toEqual(["notes/one.md", "notes/two.md"]);
+  });
+
+  it("finds a deletion from metadata without rereading unchanged files", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    for (let index = 1; index <= 6; index += 1) {
+      await local.write(
+        `notes/${index}.md`,
+        new TextEncoder().encode(`note ${index}`),
+      );
+    }
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      remote,
+      replicaId: "desktop",
+    });
+    await service.initializeNew("vault-1");
+    local.readCount = 0;
+    local.readPaths.length = 0;
+    await local.delete("notes/1.md");
+
+    const result = await service.synchronize([], { fullHashAudit: false });
+
+    expect(result).toMatchObject({ cacheUpdated: true, status: "complete" });
+    expect(local.readPaths).toEqual([]);
+    expect((await remote.readHead())?.value.generation).toBe(2);
+  });
+
+  it("blocks a remote overwrite when an unreported edit kept identical metadata", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const desktopVault = new MemoryVault();
+    await desktopVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("first"),
+    );
+    const desktop = new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: desktopRemote,
+      replicaId: "desktop",
+    });
+    const phoneVault = new MemoryVault();
+    const phone = new SyncService({
+      cache: new MemorySyncCache(),
+      local: phoneVault,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+    await desktop.initializeNew("vault-1");
+    await phone.synchronize();
+    await desktopVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("newer"),
+    );
+    await desktop.synchronize();
+    phoneVault.writePreservingMetadata(
+      "notes/example.md",
+      new TextEncoder().encode("draft"),
+    );
+
+    await expect(
+      phone.synchronize([], { fullHashAudit: false }),
+    ).rejects.toMatchObject({ path: "notes/example.md" });
+
+    expect(phoneVault.readText("notes/example.md")).toBe("draft");
+  });
+
   it("does not publish a file whose bytes are shorter than the scanned size", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
@@ -1544,9 +1759,10 @@ describe("SyncService", () => {
     await local.write("notes/example.md", new TextEncoder().encode("short"));
     local.listedSizeOverrides.set("notes/example.md", 100);
 
-    await expect(service.synchronize()).rejects.toThrow(
-      "Local file changed during synchronization: notes/example.md",
-    );
+    await expect(service.synchronize()).rejects.toMatchObject({
+      message: "Local file changed during synchronization: notes/example.md",
+      path: "notes/example.md",
+    });
     expect((await remote.readHead())?.value.generation).toBe(1);
   });
 
@@ -2033,6 +2249,7 @@ describe("SyncService", () => {
 
     expect(result).toMatchObject({
       bulkDeletion: { count: 2, totalLiveEntries: 5 },
+      cacheUpdated: false,
       status: "action-required",
       uploaded: 0,
     });

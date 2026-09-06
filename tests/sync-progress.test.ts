@@ -34,4 +34,19 @@ describe("formatSyncProgress", () => {
       label: "Publishing encrypted snapshot",
     });
   });
+
+  it("distinguishes metadata checks from content hashing", () => {
+    expect(
+      formatSyncProgress({
+        completed: 1_517,
+        phase: "scanning",
+        total: 1_517,
+        totalBytes: 2_048,
+        transferredBytes: 2_048,
+      }),
+    ).toEqual({
+      detail: "Checking metadata 1,517/1,517 (100%) · Hashed 2.00 KB / 2.00 KB",
+      label: "Checking metadata 1,517/1,517 (100%)",
+    });
+  });
 });

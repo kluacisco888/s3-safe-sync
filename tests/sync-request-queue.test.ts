@@ -25,6 +25,31 @@ describe("SyncRequestQueue", () => {
     expect(run).toHaveBeenCalledTimes(2);
   });
 
+  it("preserves a queued full hash audit request", async () => {
+    let finishFirstSync: (() => void) | undefined;
+    const run = vi
+      .fn<
+        (allowBulkDeletion: boolean, fullHashAudit: boolean) => Promise<void>
+      >()
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finishFirstSync = resolve;
+          }),
+      )
+      .mockResolvedValue(undefined);
+    const queue = new SyncRequestQueue(run);
+
+    const automaticRequest = queue.request();
+    await Promise.resolve();
+    const manualRequest = queue.request({ fullHashAudit: true });
+    finishFirstSync?.();
+    await Promise.all([automaticRequest, manualRequest]);
+
+    expect(run).toHaveBeenNthCalledWith(1, false, false);
+    expect(run).toHaveBeenNthCalledWith(2, false, true);
+  });
+
   it("serializes direct operations with queued synchronization", async () => {
     const events: string[] = [];
     let releaseDirect = (): void => undefined;

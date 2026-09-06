@@ -1,15 +1,20 @@
 export interface SyncRequestOptions {
   allowBulkDeletion?: boolean;
+  fullHashAudit?: boolean;
 }
 
 export class SyncRequestQueue {
   private allowBulkDeletion = false;
   private exclusiveTail: Promise<void> = Promise.resolve();
+  private fullHashAudit = false;
   private pending = false;
   private running: Promise<void> | undefined;
 
   constructor(
-    private readonly run: (allowBulkDeletion: boolean) => Promise<void>,
+    private readonly run: (
+      allowBulkDeletion: boolean,
+      fullHashAudit: boolean,
+    ) => Promise<void>,
   ) {}
 
   get isRunning(): boolean {
@@ -19,6 +24,7 @@ export class SyncRequestQueue {
   request(options: SyncRequestOptions = {}): Promise<void> {
     this.pending = true;
     this.allowBulkDeletion ||= options.allowBulkDeletion === true;
+    this.fullHashAudit ||= options.fullHashAudit === true;
     if (this.running) {
       return this.running;
     }
@@ -40,8 +46,10 @@ export class SyncRequestQueue {
       while (this.pending) {
         this.pending = false;
         const allowBulkDeletion = this.allowBulkDeletion;
+        const fullHashAudit = this.fullHashAudit;
         this.allowBulkDeletion = false;
-        await this.run(allowBulkDeletion);
+        this.fullHashAudit = false;
+        await this.run(allowBulkDeletion, fullHashAudit);
       }
     } finally {
       this.running = undefined;
