@@ -109,7 +109,7 @@ A read-only synchronization state entered when Head or its referenced history ca
 _Avoid_: Automatic rollback, retry mode
 
 **Staged Revision**:
-A downloaded Revision held outside the live Vault until its encryption and content integrity are verified and it can replace the target atomically.
+A downloaded Revision written to a plugin-private temporary file after decryption and content verification, then promoted behind a recoverable backup only while the target still matches the Sync Plan.
 _Avoid_: Partial file, temporary note
 
 **Orphan Blob**:

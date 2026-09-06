@@ -2,6 +2,10 @@ import { normalizePath, Platform, TFile, type Vault } from "obsidian";
 
 import type { LocalFileInfo, LocalVaultPort } from "../sync/sync-service";
 import { deleteVaultPath } from "./vault-delete";
+import {
+  recoverPendingVaultWrites,
+  safeReplaceVaultFile,
+} from "./safe-vault-write";
 
 const EXCLUDED_SEGMENTS = new Set([
   ".git",
@@ -27,19 +31,15 @@ export const isInSyncScope = (path: string): boolean => {
   return !/^~\$.*\.(?:docx?|pptx?|xlsx?)$/iu.test(basename);
 };
 
-const asArrayBuffer = (body: Uint8Array): ArrayBuffer =>
-  body.byteOffset === 0 &&
-  body.buffer instanceof ArrayBuffer &&
-  body.byteLength === body.buffer.byteLength
-    ? body.buffer
-    : body.slice().buffer;
-
 const ANDROID_UNSUPPORTED_PATH_CHARACTERS = /[*"<>:|?]/u;
 
 export class ObsidianVaultPort implements LocalVaultPort {
+  private recovery: Promise<void> | undefined;
+
   constructor(private readonly vault: Vault) {}
 
   async delete(path: string): Promise<void> {
+    await this.ensureRecovered();
     await deleteVaultPath(
       this.vault,
       normalizePath(path),
@@ -47,23 +47,23 @@ export class ObsidianVaultPort implements LocalVaultPort {
     );
   }
 
-  list(): Promise<LocalFileInfo[]> {
-    return Promise.resolve(
-      this.vault
-        .getFiles()
-        .filter((file) => isInSyncScope(file.path))
-        .map((file) => ({
-          modifiedAt: file.stat.mtime,
-          path: file.path,
-          size: file.stat.size,
-        }))
-        .sort((left, right) => left.path.localeCompare(right.path)),
-    );
+  async list(): Promise<LocalFileInfo[]> {
+    await this.ensureRecovered();
+    return this.vault
+      .getFiles()
+      .filter((file) => isInSyncScope(file.path))
+      .map((file) => ({
+        modifiedAt: file.stat.mtime,
+        path: file.path,
+        size: file.stat.size,
+      }))
+      .sort((left, right) => left.path.localeCompare(right.path));
   }
 
   async move(fromPath: string, toPath: string): Promise<void> {
+    await this.ensureRecovered();
     const file = this.vault.getAbstractFileByPath(normalizePath(fromPath));
-    if (!file) {
+    if (!(file instanceof TFile)) {
       throw new Error(`Local Vault path does not exist: ${fromPath}`);
     }
     const normalizedTarget = normalizePath(toPath);
@@ -77,11 +77,24 @@ export class ObsidianVaultPort implements LocalVaultPort {
   }
 
   async read(path: string): Promise<Uint8Array> {
+    await this.ensureRecovered();
     const file = this.vault.getAbstractFileByPath(normalizePath(path));
     if (!(file instanceof TFile)) {
       throw new Error(`Local Vault file does not exist: ${path}`);
     }
     return new Uint8Array(await this.vault.readBinary(file));
+  }
+
+  async stat(path: string): Promise<LocalFileInfo | undefined> {
+    await this.ensureRecovered();
+    const file = this.vault.getAbstractFileByPath(normalizePath(path));
+    return file instanceof TFile
+      ? {
+          modifiedAt: file.stat.mtime,
+          path: file.path,
+          size: file.stat.size,
+        }
+      : undefined;
   }
 
   supportsPath(path: string): boolean {
@@ -91,20 +104,30 @@ export class ObsidianVaultPort implements LocalVaultPort {
     );
   }
 
-  async write(path: string, body: Uint8Array): Promise<void> {
+  async write(
+    path: string,
+    body: Uint8Array,
+    expectedCurrentHash?: string | null,
+  ): Promise<void> {
+    await this.ensureRecovered();
     const normalized = normalizePath(path);
-    const existing = this.vault.getAbstractFileByPath(normalized);
-    if (existing instanceof TFile) {
-      await this.vault.modifyBinary(existing, asArrayBuffer(body));
-      return;
-    }
     const parent = normalized.includes("/")
       ? normalized.slice(0, normalized.lastIndexOf("/"))
       : "";
     if (parent) {
       await this.ensureFolder(parent);
     }
-    await this.vault.createBinary(normalized, asArrayBuffer(body));
+    await safeReplaceVaultFile(
+      this.vault.adapter,
+      normalized,
+      body,
+      expectedCurrentHash,
+    );
+  }
+
+  private ensureRecovered(): Promise<void> {
+    this.recovery ??= recoverPendingVaultWrites(this.vault.adapter);
+    return this.recovery;
   }
 
   private async ensureFolder(path: string): Promise<void> {

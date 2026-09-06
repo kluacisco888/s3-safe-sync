@@ -60,7 +60,7 @@ Paths, hashes, entry metadata, deletion records, conflicts, commits, snapshots, 
 
 ## Safety and recovery
 
-- Bulk deletion over 100 entries or 20 percent of current entries requires confirmation.
+- Bulk deletion over 100 entries or 20 percent of current entries requires confirmation bound to the exact Entry ID set; any changed deletion set requires a new confirmation.
 - A missing, unauthenticated, or dangling Head enters read-only Repair Mode.
 - S3 capability probes verify conditional create/update, read, list, and delete before initialization.
 - S3 Versioning and a 30-day noncurrent-version lifecycle are an independent safety layer.
@@ -100,10 +100,10 @@ Enable S3 Versioning in the AWS console and scope each device's IAM policy to li
 
 ## Beta boundary
 
-- Automated tests cover deletion resurrection after cache loss, edit/delete, edit/edit, clean Markdown merge, conflicts, history restore, encrypted migration comparison, Head CAS, snapshots, mobile deferral, and bulk-delete blocking.
+- Automated tests cover deletion resurrection after cache loss, edit/delete, edit/edit, clean Markdown merge, conflicts, history restore, encrypted migration comparison, Head CAS, snapshots, mobile deferral, exact-set bulk-delete confirmation, cache-loss mismatches, edits during download/delete, truncated reads, and staged replacement recovery.
 - The generated bundle contains no Node/Electron runtime import. A OnePlus Android 16 device has passed a 49.6 MB ranged download and a 12 MiB two-part upload without the previous `requestUrlAndroid` Base64 OOM; a full 50 MB upload, interruption/resume, and iOS still require real-device validation.
 - S3 integration supports global and `aws-cn` virtual-hosted endpoints. Live `cn-northwest-1` tests have passed signed List/Get/Put/Delete, stale ETag rejection, encrypted Blob/Commit round trips, ranged reads, multipart writes, concurrent Head CAS, and an Obsidian 1.13.7 macOS initialization plus no-op synchronization through `requestUrl`.
 - Desktop transfers currently have no configured size limit but use Obsidian's whole-file binary API; streaming multipart transfer remains required before claiming arbitrarily large-file support.
-- Android network responses are fetched in 4 MiB ranges and uploads use 8 MiB multipart parts, but encryption, decryption, and final Obsidian file materialization still operate on a complete file. Resumable encrypted staging across app restarts is not yet available, so mobile transfer remains Beta below the configured 50 MB ceiling.
+- Android network responses are fetched in 4 MiB ranges and uploads use 8 MiB multipart parts, but encryption and decryption still operate on a complete file. Final local replacement uses a verified temporary file, backup, and recovery journal so an interrupted promotion restores the old file or keeps the verified new file on the next scan. Network transfer itself is not resumable across app restarts, so mobile transfer remains Beta below the configured 50 MB ceiling.
 - Restore operations enforce the 30-day deadline using AWS-observed time. Removing expired metadata, physical orphan-blob garbage collection, and shared audit browsing remain follow-up hardening work; S3 Versioning is the operational fallback during Beta.
 - Repair Mode prevents further writes when Head is missing or invalid. During Beta, selecting a previous Head version is performed in the AWS console; an in-plugin S3 Versioning browser is not yet implemented.

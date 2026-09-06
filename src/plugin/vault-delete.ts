@@ -3,6 +3,7 @@ export interface VaultDeletionPort<File> {
     exists(path: string): Promise<boolean>;
     remove(path: string): Promise<void>;
     stat(path: string): Promise<{ type: string } | null>;
+    trashLocal(path: string): Promise<void>;
   };
   delete(file: File, force?: boolean): Promise<void>;
   getAbstractFileByPath(path: string): File | null;
@@ -19,8 +20,12 @@ export const deleteVaultPath = async <File>(
     if (!isFile(indexed)) {
       throw new Error(`Refusing to delete a folder at file path: ${path}`);
     }
-    await vault.trash(indexed, true);
+    await vault.trash(indexed, false);
   }
+  if (!(await vault.adapter.exists(path))) {
+    return;
+  }
+  await vault.adapter.trashLocal(path);
   if (!(await vault.adapter.exists(path))) {
     return;
   }

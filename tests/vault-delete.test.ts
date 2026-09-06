@@ -14,6 +14,7 @@ class MemoryDeletionVault implements VaultDeletionPort<TestNode> {
   indexed: TestNode | null = null;
   removeSucceeds = true;
   statType: "file" | "folder" | null = "file";
+  trashLocalSucceeds = false;
   trashSucceeds = false;
   readonly adapter = {
     exists: vi.fn(async () => this.exists),
@@ -25,6 +26,12 @@ class MemoryDeletionVault implements VaultDeletionPort<TestNode> {
     stat: vi.fn(async () =>
       this.statType ? { type: this.statType } : null,
     ),
+    trashLocal: vi.fn(async () => {
+      if (this.trashLocalSucceeds) {
+        this.exists = false;
+        this.indexed = null;
+      }
+    }),
   };
   readonly delete = vi.fn(async () => {
     this.exists = false;
@@ -61,7 +68,7 @@ describe("deleteVaultPath", () => {
 
     await deleteVaultPath(vault, "notes/example.md", isFile);
 
-    expect(vault.trash).toHaveBeenCalledWith(file, true);
+    expect(vault.trash).toHaveBeenCalledWith(file, false);
     expect(vault.delete).toHaveBeenCalledWith(file);
     expect(vault.exists).toBe(false);
   });
@@ -73,6 +80,17 @@ describe("deleteVaultPath", () => {
 
     await deleteVaultPath(vault, "notes/example.md", isFile);
 
+    expect(vault.delete).not.toHaveBeenCalled();
+    expect(vault.adapter.remove).not.toHaveBeenCalled();
+  });
+
+  it("does not use a permanent fallback after local trash succeeds", async () => {
+    const vault = new MemoryDeletionVault();
+    vault.trashLocalSucceeds = true;
+
+    await deleteVaultPath(vault, "notes/example.md", isFile);
+
+    expect(vault.adapter.trashLocal).toHaveBeenCalledWith("notes/example.md");
     expect(vault.delete).not.toHaveBeenCalled();
     expect(vault.adapter.remove).not.toHaveBeenCalled();
   });
