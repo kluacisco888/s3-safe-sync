@@ -40,10 +40,21 @@ liveDescribe("AwsS3ObjectStore live integration", () => {
   const objects = new AwsS3ObjectStore({
     accessKeyId,
     bucket,
+    downloadChunkBytes: 8,
     execute: executeWithFetch,
     region,
     secretAccessKey,
     sessionToken,
+  });
+  const multipartObjects = new AwsS3ObjectStore({
+    accessKeyId,
+    bucket,
+    downloadChunkBytes: 1024 * 1024,
+    execute: executeWithFetch,
+    region,
+    secretAccessKey,
+    sessionToken,
+    uploadChunkBytes: 5 * 1024 * 1024,
   });
 
   afterAll(async () => {
@@ -114,5 +125,19 @@ liveDescribe("AwsS3ObjectStore live integration", () => {
     await expect(first.readHead()).resolves.toMatchObject({
       value: { commitId: "commit-a", generation: 2 },
     });
+  });
+
+  it("round-trips a multipart object through ranged downloads", async () => {
+    const body = new Uint8Array(5 * 1024 * 1024 + 17);
+    body[0] = 1;
+    body[body.byteLength - 1] = 255;
+    const key = `${testPrefix}/multipart.bin`;
+
+    await multipartObjects.put(key, body, { ifNoneMatch: true });
+    const downloaded = await multipartObjects.get(key);
+
+    expect(downloaded?.body.byteLength).toBe(body.byteLength);
+    expect(downloaded?.body[0]).toBe(1);
+    expect(downloaded?.body.at(-1)).toBe(255);
   });
 });

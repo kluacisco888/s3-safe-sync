@@ -15,6 +15,7 @@ import {
   type StoredObject,
 } from "../src/storage/object-store";
 import { RemoteStore } from "../src/storage/remote-store";
+import { SyncRequestQueue } from "../src/sync/sync-request-queue";
 
 class MemoryObjectStore implements ObjectStore {
   private sequence = 0;
@@ -61,6 +62,7 @@ class MemoryVault implements LocalVaultPort {
     { bytes: Uint8Array; modifiedAt: number }
   >();
   readCount = 0;
+  readonly unsupportedPaths = new Set<string>();
 
   delete(path: string): Promise<void> {
     this.files.delete(path);
@@ -99,6 +101,10 @@ class MemoryVault implements LocalVaultPort {
   readText(path: string): string | undefined {
     const file = this.files.get(path);
     return file ? new TextDecoder().decode(file.bytes) : undefined;
+  }
+
+  supportsPath(path: string): boolean {
+    return !this.unsupportedPaths.has(path);
   }
 
   write(path: string, body: Uint8Array): Promise<void> {
@@ -395,6 +401,122 @@ describe("SyncService", () => {
     expect(phoneVault.readText("notes/example.md")).toBe("hello from desktop");
   });
 
+  it("updates an already-synced Replica after another Replica edits a file", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopVault = new MemoryVault();
+    const desktop = new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: await RemoteStore.open({
+        objects,
+        prefix: "chosen-prefix",
+        vaultKey,
+      }),
+      replicaId: "desktop",
+    });
+    await desktopVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("first version"),
+    );
+    await desktop.initializeNew("vault-1");
+
+    const phoneVault = new MemoryVault();
+    const phone = new SyncService({
+      cache: new MemorySyncCache(),
+      local: phoneVault,
+      remote: await RemoteStore.open({
+        objects,
+        prefix: "chosen-prefix",
+        vaultKey,
+      }),
+      replicaId: "phone",
+    });
+    await phone.synchronize();
+    expect(phoneVault.readText("notes/example.md")).toBe("first version");
+
+    await desktopVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("second version"),
+    );
+    await desktop.synchronize();
+    const result = await phone.synchronize();
+
+    expect(result).toMatchObject({ downloaded: 1, status: "complete" });
+    expect(phoneVault.readText("notes/example.md")).toBe("second version");
+  });
+
+  it("publishes an edit requested while the previous sync is still completing", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopVault = new MemoryVault();
+    const desktop = new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: await RemoteStore.open({
+        objects,
+        prefix: "chosen-prefix",
+        vaultKey,
+      }),
+      replicaId: "desktop",
+    });
+    await desktopVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("first version"),
+    );
+    await desktop.initializeNew("vault-1");
+
+    const phoneVault = new MemoryVault();
+    const phone = new SyncService({
+      cache: new MemorySyncCache(),
+      local: phoneVault,
+      remote: await RemoteStore.open({
+        objects,
+        prefix: "chosen-prefix",
+        vaultKey,
+      }),
+      replicaId: "phone",
+    });
+    await phone.synchronize();
+
+    let markFirstRunComplete: (() => void) | undefined;
+    const firstRunComplete = new Promise<void>((resolve) => {
+      markFirstRunComplete = resolve;
+    });
+    let releaseFirstRun: (() => void) | undefined;
+    const firstRunGate = new Promise<void>((resolve) => {
+      releaseFirstRun = resolve;
+    });
+    let runCount = 0;
+    const queue = new SyncRequestQueue(async () => {
+      await desktop.synchronize();
+      runCount += 1;
+      if (runCount === 1) {
+        markFirstRunComplete?.();
+        await firstRunGate;
+      }
+    });
+
+    await desktopVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("second version"),
+    );
+    const firstRequest = queue.request();
+    await firstRunComplete;
+    await desktopVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("third version"),
+    );
+    const secondRequest = queue.request();
+    releaseFirstRun?.();
+    await Promise.all([firstRequest, secondRequest]);
+    const phoneResult = await phone.synchronize();
+
+    expect(runCount).toBe(2);
+    expect(phoneResult).toMatchObject({ downloaded: 1, status: "complete" });
+    expect(phoneVault.readText("notes/example.md")).toBe("third version");
+  });
+
   it("propagates a permanent deletion to a stale Replica without resurrection", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
@@ -618,6 +740,69 @@ describe("SyncService", () => {
 
     expect(phoneVault.readText("attachments/large.bin")).toBe(
       "larger than the test limit",
+    );
+  });
+
+  it("continues syncing when this device cannot create a remote path", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const desktopVault = new MemoryVault();
+    await desktopVault.write(
+      "notes/portable.md",
+      new TextEncoder().encode("portable"),
+    );
+    await desktopVault.write(
+      "notes/question?.md",
+      new TextEncoder().encode("unsupported"),
+    );
+    await new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: desktopRemote,
+      replicaId: "desktop",
+    }).initializeNew("vault-1");
+    const phoneVault = new MemoryVault();
+    phoneVault.unsupportedPaths.add("notes/question?.md");
+    const phone = new SyncService({
+      cache: new MemorySyncCache(),
+      local: phoneVault,
+      remote: await RemoteStore.open({
+        objects,
+        prefix: "chosen-prefix",
+        vaultKey,
+      }),
+      replicaId: "phone",
+    });
+
+    const result = await phone.synchronize();
+
+    expect(result).toMatchObject({
+      deferredDownloadEntries: [
+        {
+          path: "notes/question?.md",
+          reason: "unsupported-path",
+          size: 11,
+        },
+      ],
+      downloaded: 1,
+      localIssues: [
+        { kind: "unsupported-path", path: "notes/question?.md" },
+      ],
+      status: "action-required",
+    });
+    expect(phoneVault.readText("notes/portable.md")).toBe("portable");
+    expect(phoneVault.readText("notes/question?.md")).toBeUndefined();
+    const unsupported = result.deferredDownloadEntries[0];
+    if (!unsupported) {
+      throw new Error("Expected unsupported remote path");
+    }
+    await expect(phone.downloadDeferred(unsupported.entryId)).rejects.toThrow(
+      "not supported on this device",
     );
   });
 

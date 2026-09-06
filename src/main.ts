@@ -21,6 +21,7 @@ import {
 import {
   SyncService,
   type CachedSyncState,
+  type DeferredDownloadEntry,
   type LocalSyncIssue,
   type SyncCachePort,
   type SyncProgress,
@@ -30,6 +31,7 @@ import type {
   DeletedEntry,
   LiveEntry,
 } from "./sync/sync-engine";
+import { SyncRequestQueue } from "./sync/sync-request-queue";
 import { AwsS3ObjectStore } from "./storage/aws-s3-object-store";
 import { BootstrapStore } from "./storage/bootstrap-store";
 import { executeObsidianHttpRequest } from "./storage/obsidian-http";
@@ -64,6 +66,9 @@ interface PersistedPluginData {
 const normalizePrefix = (prefix: string): string =>
   prefix.replace(/^\/+|\/+$/gu, "");
 
+const ANDROID_DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
+const ANDROID_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
+
 const mobileAutomaticFileLimit = (): number | undefined => {
   if (!Platform.isMobile) {
     return undefined;
@@ -85,12 +90,10 @@ export default class S3VaultSyncPlugin
     | { count: number; totalLiveEntries: number }
     | undefined;
   private pendingLocalIssues: LocalSyncIssue[] = [];
-  private pendingDeferredDownloads: Array<{
-    entryId: string;
-    path: string;
-    size: number;
-  }> = [];
-  private runningSync: Promise<void> | undefined;
+  private pendingDeferredDownloads: DeferredDownloadEntry[] = [];
+  private readonly syncRequests = new SyncRequestQueue((allowBulkDeletion) =>
+    this.performSync(allowBulkDeletion),
+  );
   private status: PluginStatus = "Not configured";
   private statusDetail = "Enter AWS settings and a Vault password.";
   private statusElement: HTMLElement | undefined;
@@ -220,11 +223,7 @@ export default class S3VaultSyncPlugin
     return this.pendingLocalIssues;
   }
 
-  getDeferredDownloads(): Array<{
-    entryId: string;
-    path: string;
-    size: number;
-  }> {
+  getDeferredDownloads(): DeferredDownloadEntry[] {
     return this.pendingDeferredDownloads;
   }
 
@@ -236,13 +235,10 @@ export default class S3VaultSyncPlugin
   }
 
   async confirmBulkDeletion(): Promise<void> {
-    if (!this.pendingBulkDeletion || this.runningSync) {
+    if (!this.pendingBulkDeletion || this.syncRequests.isRunning) {
       return;
     }
-    this.runningSync = this.performSync(true).finally(() => {
-      this.runningSync = undefined;
-    });
-    await this.runningSync;
+    await this.syncRequests.request({ allowBulkDeletion: true });
   }
 
   async keepConflictDeleted(entryId: string): Promise<void> {
@@ -446,13 +442,7 @@ export default class S3VaultSyncPlugin
   }
 
   async syncNow(): Promise<void> {
-    if (this.runningSync) {
-      return this.runningSync;
-    }
-    this.runningSync = this.performSync().finally(() => {
-      this.runningSync = undefined;
-    });
-    return this.runningSync;
+    return this.syncRequests.request();
   }
 
   async togglePause(): Promise<void> {
@@ -478,8 +468,14 @@ export default class S3VaultSyncPlugin
     return new AwsS3ObjectStore({
       ...credentials,
       bucket,
+      downloadChunkBytes: Platform.isAndroidApp
+        ? ANDROID_DOWNLOAD_CHUNK_BYTES
+        : undefined,
       execute: executeObsidianHttpRequest,
       region,
+      uploadChunkBytes: Platform.isAndroidApp
+        ? ANDROID_UPLOAD_CHUNK_BYTES
+        : undefined,
     });
   }
 
@@ -561,7 +557,7 @@ export default class S3VaultSyncPlugin
               "Action required",
               result.bulkDeletion
                 ? "Review and confirm the Bulk Deletion."
-                : "Open the Conflict Center.",
+                : "Open sync status to review items that need attention.",
             );
           } else {
             this.pendingBulkDeletion = undefined;

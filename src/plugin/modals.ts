@@ -5,17 +5,16 @@ import type {
   DeletedEntry,
   LiveEntry,
 } from "../sync/sync-engine";
-import type { LocalSyncIssue } from "../sync/sync-service";
+import type {
+  DeferredDownloadEntry,
+  LocalSyncIssue,
+} from "../sync/sync-service";
 
 export interface StatusModalController {
   confirmBulkDeletion(): Promise<void>;
   downloadDeferred(entryId: string): Promise<void>;
   getConflicts(): ConflictedEntry[];
-  getDeferredDownloads(): Array<{
-    entryId: string;
-    path: string;
-    size: number;
-  }>;
+  getDeferredDownloads(): DeferredDownloadEntry[];
   getDeletedRecoveries(): DeletedEntry[];
   getLocalIssues(): LocalSyncIssue[];
   getPendingBulkDeletion():
@@ -166,13 +165,19 @@ export class StatusModal extends Modal {
       return;
     }
     this.contentEl.createEl("h3", {
-      text: `${deferred.length} large files unavailable on this device`,
+      text: `${deferred.length} files unavailable on this device`,
     });
     for (const entry of deferred) {
       const item = this.contentEl.createDiv({ cls: "s3-vault-sync-history" });
       item.createSpan({
-        text: `${entry.path} · ${Math.ceil(entry.size / 1024 / 1024)} MB`,
+        text:
+          entry.reason === "unsupported-path"
+            ? `${entry.path} · rename on another device`
+            : `${entry.path} · ${Math.ceil(entry.size / 1024 / 1024)} MB`,
       });
+      if (entry.reason === "unsupported-path") {
+        continue;
+      }
       item.createEl("button", { text: "Try anyway" }).addEventListener(
         "click",
         () => {
@@ -230,7 +235,9 @@ export class StatusModal extends Modal {
               ? "Local content differs from the encrypted remote Revision after cache loss."
               : issue.kind === "resolution-mismatch"
                 ? "This file changed while its Conflict was awaiting resolution."
-              : "Local file exceeds the automatic mobile limit.",
+                : issue.kind === "unsupported-path"
+                  ? "Rename this file on another device before it can sync here."
+                  : "Local file exceeds the automatic mobile limit.",
       });
       if (issue.kind === "import-candidate") {
         item.createEl("button", { text: "Import" }).addEventListener("click", () => {

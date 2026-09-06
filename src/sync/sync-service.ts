@@ -24,6 +24,7 @@ export interface LocalVaultPort {
   list(): Promise<LocalFileInfo[]>;
   move(fromPath: string, toPath: string): Promise<void>;
   read(path: string): Promise<Uint8Array>;
+  supportsPath?(path: string): boolean;
   write(path: string, body: Uint8Array): Promise<void>;
 }
 
@@ -62,11 +63,7 @@ export interface SyncProgress {
 }
 
 export interface SyncResult {
-  deferredDownloadEntries: Array<{
-    entryId: string;
-    path: string;
-    size: number;
-  }>;
+  deferredDownloadEntries: DeferredDownloadEntry[];
   bulkDeletion?: {
     count: number;
     totalLiveEntries: number;
@@ -80,12 +77,20 @@ export interface SyncResult {
   uploaded: number;
 }
 
+export interface DeferredDownloadEntry {
+  entryId: string;
+  path: string;
+  reason: "device-limit" | "unsupported-path";
+  size: number;
+}
+
 export type LocalSyncIssue =
   | { kind: "bootstrap-mismatch"; path: string }
   | { kind: "import-candidate"; path: string }
   | { kind: "path-collision"; paths: string[] }
   | { kind: "possible-rename"; newPaths: string[]; oldPaths: string[] }
   | { kind: "resolution-mismatch"; path: string }
+  | { kind: "unsupported-path"; path: string }
   | { kind: "unsynced-local"; path: string };
 
 export interface RestoreCandidateResolution {
@@ -292,6 +297,9 @@ export class SyncService {
     const entry = snapshot.entries[entryId];
     if (entry?.kind !== "live") {
       throw new Error(`Deferred Entry ${entryId} is not live`);
+    }
+    if (this.options.local.supportsPath?.(entry.path) === false) {
+      throw new Error(`Path is not supported on this device: ${entry.path}`);
     }
     const plaintext = await this.options.remote.readBlob(entry.revision.blobId);
     if (!plaintext || (await sha256(plaintext)) !== entry.revision.contentHash) {
@@ -638,13 +646,35 @@ export class SyncService {
       }
     }
     const deferredDownloadEntries = Object.values(remote.entries).flatMap(
-      (entry) =>
-      entry.kind === "live" &&
-      this.options.maxAutomaticFileBytes !== undefined &&
-      entry.revision.size > this.options.maxAutomaticFileBytes &&
-      !localPaths.has(entry.path)
-        ? [{ entryId: entry.entryId, path: entry.path, size: entry.revision.size }]
-        : [],
+      (entry): DeferredDownloadEntry[] => {
+        if (entry.kind !== "live" || localPaths.has(entry.path)) {
+          return [];
+        }
+        if (this.options.local.supportsPath?.(entry.path) === false) {
+          return [
+            {
+              entryId: entry.entryId,
+              path: entry.path,
+              reason: "unsupported-path",
+              size: entry.revision.size,
+            },
+          ];
+        }
+        if (
+          this.options.maxAutomaticFileBytes !== undefined &&
+          entry.revision.size > this.options.maxAutomaticFileBytes
+        ) {
+          return [
+            {
+              entryId: entry.entryId,
+              path: entry.path,
+              reason: "device-limit",
+              size: entry.revision.size,
+            },
+          ];
+        }
+        return [];
+      },
     );
     const deferredEntryIds = deferredDownloadEntries.map(
       (entry) => entry.entryId,
@@ -693,6 +723,11 @@ export class SyncService {
       }),
       ...scan.unsyncedLocalPaths.map(
         (path): LocalSyncIssue => ({ kind: "unsynced-local", path }),
+      ),
+      ...deferredDownloadEntries.flatMap((entry): LocalSyncIssue[] =>
+        entry.reason === "unsupported-path"
+          ? [{ kind: "unsupported-path", path: entry.path }]
+          : [],
       ),
     ];
 
@@ -1045,7 +1080,11 @@ export class SyncService {
       downloaded,
       localIssues,
       status:
-        unresolvedConflicts > 0 || scan.unsyncedLocalEntries > 0
+        unresolvedConflicts > 0 ||
+        scan.unsyncedLocalEntries > 0 ||
+        deferredDownloadEntries.some(
+          (entry) => entry.reason === "unsupported-path",
+        )
           ? "action-required"
           : "complete",
       unsyncedLocalEntries: scan.unsyncedLocalEntries,

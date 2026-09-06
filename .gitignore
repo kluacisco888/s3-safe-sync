@@ -3,4 +3,5 @@ main.js.map
 node_modules/
 .DS_Store
 coverage/
+dist/
 *.log

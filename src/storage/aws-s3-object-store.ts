@@ -30,10 +30,12 @@ export type HttpExecutor = (
 export interface AwsS3ObjectStoreOptions {
   accessKeyId: string;
   bucket: string;
+  downloadChunkBytes?: number;
   execute: HttpExecutor;
   region: string;
   secretAccessKey: string;
   sessionToken?: string;
+  uploadChunkBytes?: number;
 }
 
 export class S3RequestError extends Error {
@@ -74,12 +76,87 @@ const requiredHeader = (
   return value;
 };
 
+const parseContentRange = (
+  value: string,
+): { end: number; start: number; total: number } => {
+  const match = /^bytes (\d+)-(\d+)\/(\d+)$/u.exec(value);
+  if (!match?.[1] || !match[2] || !match[3]) {
+    throw new Error(`AWS S3 returned an invalid Content-Range: ${value}`);
+  }
+  return {
+    end: Number(match[2]),
+    start: Number(match[1]),
+    total: Number(match[3]),
+  };
+};
+
+const readXmlElement = (
+  body: Uint8Array,
+  rootName: string,
+  elementName: string,
+): string => {
+  const parsed = new XMLParser().parse(new TextDecoder().decode(body)) as unknown;
+  if (typeof parsed !== "object" || parsed === null || !(rootName in parsed)) {
+    throw new Error(`AWS S3 returned an invalid ${rootName} document`);
+  }
+  const root = (parsed as Record<string, unknown>)[rootName];
+  if (typeof root !== "object" || root === null) {
+    throw new Error(`AWS S3 returned an invalid ${rootName} result`);
+  }
+  const value = (root as Record<string, unknown>)[elementName];
+  if (typeof value !== "string") {
+    throw new Error(`AWS S3 omitted ${elementName} from ${rootName}`);
+  }
+  return value;
+};
+
+const escapeXml = (value: string): string =>
+  value
+    .replace(/&/gu, "&amp;")
+    .replace(/</gu, "&lt;")
+    .replace(/>/gu, "&gt;")
+    .replace(/"/gu, "&quot;")
+    .replace(/'/gu, "&apos;");
+
+const conditionalWriteHeaders = (
+  contentType: string,
+  options: ObjectPutOptions,
+): Record<string, string> => ({
+  "content-type": contentType,
+  ...(options.ifMatch !== undefined ? { "if-match": options.ifMatch } : {}),
+  ...(options.ifNoneMatch ? { "if-none-match": "*" } : {}),
+});
+
+const throwIfPreconditionFailed = (response: HttpResponseOutput): void => {
+  if (response.status === 409 || response.status === 412) {
+    throw new ObjectPreconditionError();
+  }
+};
+
 export class AwsS3ObjectStore implements ObjectStore {
+  private readonly downloadChunkBytes: number | undefined;
   private readonly execute: HttpExecutor;
   private readonly hostname: string;
   private readonly signer: SignatureV4;
+  private readonly uploadChunkBytes: number | undefined;
 
   constructor(options: AwsS3ObjectStoreOptions) {
+    if (
+      options.downloadChunkBytes !== undefined &&
+      (!Number.isInteger(options.downloadChunkBytes) ||
+        options.downloadChunkBytes < 1)
+    ) {
+      throw new Error("S3 download chunk size must be a positive integer");
+    }
+    this.downloadChunkBytes = options.downloadChunkBytes;
+    if (
+      options.uploadChunkBytes !== undefined &&
+      (!Number.isInteger(options.uploadChunkBytes) ||
+        options.uploadChunkBytes < 5 * 1024 * 1024)
+    ) {
+      throw new Error("S3 upload chunk size must be at least 5 MiB");
+    }
+    this.uploadChunkBytes = options.uploadChunkBytes;
     this.execute = options.execute;
     const dnsSuffix = options.region.startsWith("cn-")
       ? "amazonaws.com.cn"
@@ -106,18 +183,84 @@ export class AwsS3ObjectStore implements ObjectStore {
   }
 
   async get(key: string): Promise<StoredObject | undefined> {
-    const response = await this.request("GET", encodeKeyPath(key));
-    if (response.status === 404) {
+    const path = encodeKeyPath(key);
+    if (this.downloadChunkBytes === undefined) {
+      const response = await this.request("GET", path);
+      if (response.status === 404) {
+        return undefined;
+      }
+      if (response.status !== 200) {
+        this.throwResponseError(response, `read ${key}`);
+      }
+      return {
+        body: response.body,
+        etag: requiredHeader(response.headers, "etag"),
+        lastModified: requiredHeader(response.headers, "last-modified"),
+        serverDate: requiredHeader(response.headers, "date"),
+      };
+    }
+    const first = await this.request("GET", path, undefined, {
+      range: `bytes=0-${this.downloadChunkBytes - 1}`,
+    });
+    if (first.status === 404) {
       return undefined;
     }
-    if (response.status !== 200) {
-      this.throwResponseError(response, `read ${key}`);
+    if (first.status === 200) {
+      return {
+        body: first.body,
+        etag: requiredHeader(first.headers, "etag"),
+        lastModified: requiredHeader(first.headers, "last-modified"),
+        serverDate: requiredHeader(first.headers, "date"),
+      };
+    }
+    if (first.status !== 206) {
+      this.throwResponseError(first, `read ${key}`);
+    }
+    const firstRange = parseContentRange(
+      requiredHeader(first.headers, "content-range"),
+    );
+    if (
+      firstRange.start !== 0 ||
+      firstRange.end + 1 !== first.body.byteLength
+    ) {
+      throw new Error(`AWS S3 returned an unexpected first byte range for ${key}`);
+    }
+    const etag = requiredHeader(first.headers, "etag");
+    const body = new Uint8Array(firstRange.total);
+    body.set(first.body, 0);
+    let offset = firstRange.end + 1;
+    while (offset < firstRange.total) {
+      const end = Math.min(
+        offset + this.downloadChunkBytes - 1,
+        firstRange.total - 1,
+      );
+      const response = await this.request("GET", path, undefined, {
+        "if-match": etag,
+        range: `bytes=${offset}-${end}`,
+      });
+      if (response.status !== 206) {
+        this.throwResponseError(response, `read byte range ${offset}-${end} of ${key}`);
+      }
+      const received = parseContentRange(
+        requiredHeader(response.headers, "content-range"),
+      );
+      if (
+        received.start !== offset ||
+        received.end !== end ||
+        received.total !== firstRange.total ||
+        response.body.byteLength !== end - offset + 1 ||
+        requiredHeader(response.headers, "etag") !== etag
+      ) {
+        throw new Error(`AWS S3 returned an inconsistent byte range for ${key}`);
+      }
+      body.set(response.body, offset);
+      offset = end + 1;
     }
     return {
-      body: response.body,
-      etag: requiredHeader(response.headers, "etag"),
-      lastModified: requiredHeader(response.headers, "last-modified"),
-      serverDate: requiredHeader(response.headers, "date"),
+      body,
+      etag,
+      lastModified: requiredHeader(first.headers, "last-modified"),
+      serverDate: requiredHeader(first.headers, "date"),
     };
   }
 
@@ -151,24 +294,20 @@ export class AwsS3ObjectStore implements ObjectStore {
     body: Uint8Array,
     options: ObjectPutOptions = {},
   ): Promise<StoredObject> {
-    const headers: Record<string, string> = {
-      "content-type": "application/octet-stream",
-    };
-    if (options.ifMatch !== undefined) {
-      headers["if-match"] = options.ifMatch;
+    if (
+      this.uploadChunkBytes !== undefined &&
+      body.byteLength > this.uploadChunkBytes
+    ) {
+      return this.putMultipart(key, body, options);
     }
-    if (options.ifNoneMatch) {
-      headers["if-none-match"] = "*";
-    }
+    const headers = conditionalWriteHeaders("application/octet-stream", options);
     const response = await this.request(
       "PUT",
       encodeKeyPath(key),
       body,
       headers,
     );
-    if (response.status === 409 || response.status === 412) {
-      throw new ObjectPreconditionError();
-    }
+    throwIfPreconditionFailed(response);
     if (response.status !== 200) {
       this.throwResponseError(response, `write ${key}`);
     }
@@ -178,6 +317,91 @@ export class AwsS3ObjectStore implements ObjectStore {
       lastModified: requiredHeader(response.headers, "date"),
       serverDate: requiredHeader(response.headers, "date"),
     };
+  }
+
+  private async putMultipart(
+    key: string,
+    body: Uint8Array,
+    options: ObjectPutOptions,
+  ): Promise<StoredObject> {
+    if (this.uploadChunkBytes === undefined) {
+      throw new Error("Multipart upload requires a configured chunk size");
+    }
+    const path = encodeKeyPath(key);
+    const initiated = await this.request(
+      "POST",
+      path,
+      undefined,
+      { "content-type": "application/octet-stream" },
+      { uploads: "" },
+    );
+    if (initiated.status !== 200) {
+      this.throwResponseError(initiated, `start multipart upload for ${key}`);
+    }
+    const uploadId = readXmlElement(
+      initiated.body,
+      "InitiateMultipartUploadResult",
+      "UploadId",
+    );
+    try {
+      const parts: Array<{ etag: string; partNumber: number }> = [];
+      let partNumber = 1;
+      for (let offset = 0; offset < body.byteLength; offset += this.uploadChunkBytes) {
+        const end = Math.min(offset + this.uploadChunkBytes, body.byteLength);
+        const uploaded = await this.request(
+          "PUT",
+          path,
+          body.subarray(offset, end),
+          { "content-type": "application/octet-stream" },
+          { partNumber: String(partNumber), uploadId },
+        );
+        if (uploaded.status !== 200) {
+          this.throwResponseError(uploaded, `upload part ${partNumber} of ${key}`);
+        }
+        parts.push({
+          etag: requiredHeader(uploaded.headers, "etag"),
+          partNumber,
+        });
+        partNumber += 1;
+      }
+      const completionDocument = new TextEncoder().encode(
+        `<CompleteMultipartUpload>${parts
+          .map(
+            (part) =>
+              `<Part><PartNumber>${part.partNumber}</PartNumber><ETag>${escapeXml(part.etag)}</ETag></Part>`,
+          )
+          .join("")}</CompleteMultipartUpload>`,
+      );
+      const headers = conditionalWriteHeaders("application/xml", options);
+      const completed = await this.request(
+        "POST",
+        path,
+        completionDocument,
+        headers,
+        { uploadId },
+      );
+      throwIfPreconditionFailed(completed);
+      if (completed.status !== 200) {
+        this.throwResponseError(completed, `complete multipart upload for ${key}`);
+      }
+      return {
+        body: new Uint8Array(),
+        etag: readXmlElement(
+          completed.body,
+          "CompleteMultipartUploadResult",
+          "ETag",
+        ),
+        lastModified: requiredHeader(completed.headers, "date"),
+        serverDate: requiredHeader(completed.headers, "date"),
+      };
+    } catch (error) {
+      try {
+        await this.request("DELETE", path, undefined, {}, { uploadId });
+      } catch {
+        // The original upload failure is more useful than a cleanup failure.
+      }
+      throw error;
+    }
   }
 
   private buildUrl(request: {

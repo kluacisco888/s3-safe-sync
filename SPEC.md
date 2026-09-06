@@ -8,17 +8,17 @@ The plugin does not run after Obsidian is closed, provide telemetry, synchronize
 
 ## User-visible behavior
 
-- Synchronize on startup, five seconds after local edits settle, every two foreground minutes for remote changes, and on explicit command.
+- Synchronize on startup, five seconds after local edits settle, every two foreground minutes for remote changes, and on explicit command. An ordinary sync request received during an active synchronization is coalesced into a guaranteed follow-up run instead of being dropped; destructive confirmations are revalidated against a fresh plan.
 - Permit per-device pause without losing local observations.
 - Show the current phase, file count, byte count, and current path during scanning, uploading, and downloading in plugin settings and the desktop status bar without routine success popups.
 - Persist an action-required state for conflicts, corruption, unsafe bulk deletion, or repair.
-- Mirror normal files to mobile up to 50 MB. Larger remote files are listed as unavailable on that device; larger local files are explicitly unsynchronized.
+- Mirror normal files to mobile up to 50 MB. Android transfers use bounded S3 ranges and multipart requests; larger remote files are listed as unavailable on that device, and larger local files are explicitly unsynchronized.
 - Delay mobile attachments above 10 MB until Wi-Fi by default.
 - Offer a 30-day per-file Version History and an encrypted shared Conflict Center.
 
 ## Sync Scope
 
-Include ordinary files of every extension. Exclude `.obsidian`, dot-prefixed path segments, underscore-prefixed path segments, version-control directories, `node_modules`, temporary office files, and configured glob patterns. Bookmarks and configuration synchronization are outside the first release.
+Include ordinary files of every extension. Exclude `.obsidian`, dot-prefixed path segments, underscore-prefixed path segments, version-control directories, `node_modules`, temporary office files, and configured glob patterns. Remote paths that the current device cannot create are deferred without becoming deletions and require a rename on another device. Bookmarks and configuration synchronization are outside the first release.
 
 ## Remote layout
 
@@ -100,9 +100,9 @@ Enable S3 Versioning in the AWS console and scope each device's IAM policy to li
 ## Beta boundary
 
 - Automated tests cover deletion resurrection after cache loss, edit/delete, edit/edit, clean Markdown merge, conflicts, history restore, encrypted migration comparison, Head CAS, snapshots, mobile deferral, and bulk-delete blocking.
-- The generated bundle contains no Node/Electron runtime import, but Android and iOS 50 MB transfer behavior still requires real-device validation.
-- S3 integration supports global and `aws-cn` virtual-hosted endpoints. Live `cn-northwest-1` tests have passed signed List/Get/Put/Delete, stale ETag rejection, encrypted Blob/Commit round trips, concurrent Head CAS, and an Obsidian 1.13.7 macOS initialization plus no-op synchronization through `requestUrl`. Android and iOS still require real-device transport validation before trusted use with personal data.
+- The generated bundle contains no Node/Electron runtime import. A OnePlus Android 16 device has passed a 49.6 MB ranged download and a 12 MiB two-part upload without the previous `requestUrlAndroid` Base64 OOM; a full 50 MB upload, interruption/resume, and iOS still require real-device validation.
+- S3 integration supports global and `aws-cn` virtual-hosted endpoints. Live `cn-northwest-1` tests have passed signed List/Get/Put/Delete, stale ETag rejection, encrypted Blob/Commit round trips, ranged reads, multipart writes, concurrent Head CAS, and an Obsidian 1.13.7 macOS initialization plus no-op synchronization through `requestUrl`.
 - Desktop transfers currently have no configured size limit but use Obsidian's whole-file binary API; streaming multipart transfer remains required before claiming arbitrarily large-file support.
-- Downloads authenticate and hash the complete plaintext before calling Obsidian's binary write API, but resumable chunk staging is not yet available. Mobile upload and final materialization therefore still have whole-file memory exposure and remain Beta even below the configured 50 MB ceiling.
+- Android network responses are fetched in 4 MiB ranges and uploads use 8 MiB multipart parts, but encryption, decryption, and final Obsidian file materialization still operate on a complete file. Resumable encrypted staging across app restarts is not yet available, so mobile transfer remains Beta below the configured 50 MB ceiling.
 - Restore operations enforce the 30-day deadline using AWS-observed time. Removing expired metadata, physical orphan-blob garbage collection, and shared audit browsing remain follow-up hardening work; S3 Versioning is the operational fallback during Beta.
 - Repair Mode prevents further writes when Head is missing or invalid. During Beta, selecting a previous Head version is performed in the AWS console; an in-plugin S3 Versioning browser is not yet implemented.

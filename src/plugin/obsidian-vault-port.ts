@@ -1,4 +1,4 @@
-import { normalizePath, TFile, type Vault } from "obsidian";
+import { normalizePath, Platform, TFile, type Vault } from "obsidian";
 
 import type { LocalFileInfo, LocalVaultPort } from "../sync/sync-service";
 
@@ -32,6 +32,8 @@ const asArrayBuffer = (body: Uint8Array): ArrayBuffer =>
   body.byteLength === body.buffer.byteLength
     ? body.buffer
     : body.slice().buffer;
+
+const ANDROID_UNSUPPORTED_PATH_CHARACTERS = /[*"<>:|?]/u;
 
 export class ObsidianVaultPort implements LocalVaultPort {
   constructor(private readonly vault: Vault) {}
@@ -78,6 +80,13 @@ export class ObsidianVaultPort implements LocalVaultPort {
       throw new Error(`Local Vault file does not exist: ${path}`);
     }
     return new Uint8Array(await this.vault.readBinary(file));
+  }
+
+  supportsPath(path: string): boolean {
+    return !(
+      Platform.isAndroidApp &&
+      ANDROID_UNSUPPORTED_PATH_CHARACTERS.test(normalizePath(path))
+    );
   }
 
   async write(path: string, body: Uint8Array): Promise<void> {
