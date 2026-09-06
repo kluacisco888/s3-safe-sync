@@ -66,6 +66,14 @@ class OneFileVault implements LocalVaultPort {
     return Promise.resolve(this.body.slice());
   }
 
+  stat(path: string): Promise<LocalFileInfo | undefined> {
+    return Promise.resolve(
+      path === this.path
+        ? { modifiedAt: 1, path, size: this.body.byteLength }
+        : undefined,
+    );
+  }
+
   write(): Promise<void> {
     return Promise.resolve();
   }

@@ -512,7 +512,11 @@ describe("SyncEngine", () => {
       remote: snapshot,
     });
 
-    expect(plan.bulkDeletion).toEqual({ count: 2, totalLiveEntries: 5 });
+    expect(plan.bulkDeletion).toEqual({
+      count: 2,
+      entryIds: ["entry-1", "entry-2"],
+      totalLiveEntries: 5,
+    });
   });
 
   it("stops on a cross-platform Path Collision", () => {

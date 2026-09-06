@@ -198,13 +198,16 @@ export type RemoteChange =
   | UploadNewChange;
 
 export interface SyncPlan {
-  bulkDeletion?: {
-    count: number;
-    totalLiveEntries: number;
-  };
+  bulkDeletion?: BulkDeletionPlan;
   conflicts: SyncConflict[];
   localActions: LocalAction[];
   remoteChanges: RemoteChange[];
+}
+
+export interface BulkDeletionPlan {
+  count: number;
+  entryIds: string[];
+  totalLiveEntries: number;
 }
 
 export interface ReconcileInput {
@@ -270,6 +273,12 @@ export class SyncEngine {
       const remoteEntry = file.entryId
         ? remote.entries[file.entryId]
         : remoteByPath.get(file.path);
+      if (
+        remoteEntry?.kind === "live" &&
+        deferredEntryIds.has(remoteEntry.entryId)
+      ) {
+        continue;
+      }
       if (
         remoteEntry?.kind === "deleted" &&
         remoteEntry.lastContentHash === file.contentHash
@@ -347,7 +356,7 @@ export class SyncEngine {
             entryId: remoteEntry.entryId,
             file,
             kind: "upload-local",
-            path: remoteEntry.path,
+            path: file.path,
             replacesRevisionId: remoteEntry.revision.revisionId,
           });
         } else if (
@@ -427,7 +436,9 @@ export class SyncEngine {
       if (baseEntry.kind !== "live") {
         continue;
       }
-      const isPresent = localByEntryId.has(baseEntry.entryId);
+      const isPresent =
+        localByEntryId.has(baseEntry.entryId) ||
+        localByPath.has(baseEntry.path);
       const absenceIsNotDeletion =
         deferredEntryIds.has(baseEntry.entryId) ||
         unmaterializedEntryIds.has(baseEntry.entryId);
@@ -562,16 +573,21 @@ export class SyncEngine {
     const totalLiveEntries = Object.values(base?.entries ?? {}).filter(
       (entry) => entry.kind === "live",
     ).length;
-    const deletionCount = remoteChanges.filter(
-      (change) => change.kind === "delete-remote",
-    ).length;
+    const deletionEntryIds = remoteChanges.flatMap((change) =>
+      change.kind === "delete-remote" ? [change.entryId] : [],
+    );
+    const deletionCount = deletionEntryIds.length;
     const isBulkDeletion =
       deletionCount > 100 ||
       (totalLiveEntries > 0 && deletionCount / totalLiveEntries > 0.2);
 
     return {
       bulkDeletion: isBulkDeletion
-        ? { count: deletionCount, totalLiveEntries }
+        ? {
+            count: deletionCount,
+            entryIds: deletionEntryIds.sort(),
+            totalLiveEntries,
+          }
         : undefined,
       conflicts,
       localActions,

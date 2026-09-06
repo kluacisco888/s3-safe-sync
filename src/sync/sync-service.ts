@@ -2,6 +2,7 @@ import { diff3Merge } from "node-diff3";
 
 import {
   SyncEngine,
+  type BulkDeletionPlan,
   type DeletedEntry,
   type ReplicaObservation,
   type RevisionRef,
@@ -25,8 +26,13 @@ export interface LocalVaultPort {
   list(): Promise<LocalFileInfo[]>;
   move(fromPath: string, toPath: string): Promise<void>;
   read(path: string): Promise<Uint8Array>;
+  stat(path: string): Promise<LocalFileInfo | undefined>;
   supportsPath?(path: string): boolean;
-  write(path: string, body: Uint8Array): Promise<void>;
+  write(
+    path: string,
+    body: Uint8Array,
+    expectedCurrentHash?: string | null,
+  ): Promise<void>;
 }
 
 export interface CachedFileState extends LocalFileInfo {
@@ -46,7 +52,6 @@ export interface SyncCachePort {
 }
 
 export interface SyncServiceOptions {
-  allowBulkDeletion?: boolean;
   cache: SyncCachePort;
   local: LocalVaultPort;
   maxAutomaticFileBytes?: number;
@@ -66,10 +71,7 @@ export interface SyncProgress {
 
 export interface SyncResult {
   deferredDownloadEntries: DeferredDownloadEntry[];
-  bulkDeletion?: {
-    count: number;
-    totalLiveEntries: number;
-  };
+  bulkDeletion?: BulkDeletionPlan;
   deferredDownloads: number;
   deleted: number;
   downloaded: number;
@@ -77,6 +79,13 @@ export interface SyncResult {
   status: "action-required" | "complete";
   unsyncedLocalEntries: number;
   uploaded: number;
+}
+
+export class LocalStateChangedError extends Error {
+  constructor(path: string) {
+    super(`Local file changed during synchronization: ${path}`);
+    this.name = "LocalStateChangedError";
+  }
 }
 
 export interface DeferredDownloadEntry {
@@ -165,6 +174,20 @@ const restoreAsCurrent = (
 ): RevisionRef => {
   const { expiresAt: _expiredRecovery, ...current } = revision;
   return { ...current, createdAt, revisionId: crypto.randomUUID() };
+};
+
+const retainConflictHistory = (
+  revisions: RevisionRef[],
+  createdAt: string,
+): RevisionRef[] => {
+  const retained = new Map<string, RevisionRef>();
+  for (const revision of revisions) {
+    retained.set(
+      revision.revisionId,
+      revision.expiresAt ? revision : keepForRecovery(revision, createdAt),
+    );
+  }
+  return [...retained.values()];
 };
 
 export class SyncService {
@@ -307,11 +330,23 @@ export class SyncService {
     if (this.options.local.supportsPath?.(entry.path) === false) {
       throw new Error(`Path is not supported on this device: ${entry.path}`);
     }
+    const cached = await this.options.cache.load();
+    const expectedContentHash = cached?.files[entry.path]?.contentHash ?? null;
+    await this.assertLocalContent(entry.path, expectedContentHash);
     const plaintext = await this.options.remote.readBlob(entry.revision.blobId);
-    if (!plaintext || (await sha256(plaintext)) !== entry.revision.contentHash) {
+    if (
+      !plaintext ||
+      plaintext.byteLength !== entry.revision.size ||
+      (await sha256(plaintext)) !== entry.revision.contentHash
+    ) {
       throw new Error(`Deferred Revision ${entry.revision.revisionId} is damaged`);
     }
-    await this.options.local.write(entry.path, plaintext);
+    await this.assertLocalContent(entry.path, expectedContentHash);
+    await this.options.local.write(
+      entry.path,
+      plaintext,
+      expectedContentHash,
+    );
     await this.options.cache.save(await this.buildCache(snapshot));
   }
 
@@ -342,6 +377,9 @@ export class SyncService {
       throw new Error(`Import Candidate exceeds the mobile limit: ${path}`);
     }
     const plaintext = await this.options.local.read(path);
+    if (plaintext.byteLength !== file.size) {
+      throw new LocalStateChangedError(path);
+    }
     const createdAt = versionedHead.serverDate;
     const entryId = crypto.randomUUID();
     const blobId = crypto.randomUUID();
@@ -401,6 +439,13 @@ export class SyncService {
     if (conflicted?.kind !== "conflicted") {
       throw new Error(`Entry ${entryId} is not conflicted`);
     }
+    const expectedMaterializedContentHash =
+      conflicted.materializedContentHash ?? null;
+    await this.assertLocalContent(
+      conflicted.path,
+      expectedMaterializedContentHash,
+    );
+    const createdAt = versionedHead.serverDate;
     let materializedContent: Uint8Array | undefined;
     let resolvedEntry: VaultEntry;
     if (resolution.kind === "restore-candidate") {
@@ -415,21 +460,26 @@ export class SyncService {
       materializedContent = await this.options.remote.readBlob(candidate.blobId);
       if (
         !materializedContent ||
+        materializedContent.byteLength !== candidate.size ||
         (await sha256(materializedContent)) !== candidate.contentHash
       ) {
         throw new Error(`Conflict candidate ${resolution.revisionId} is damaged`);
       }
       resolvedEntry = {
         entryId,
-        history: [
-          ...conflicted.candidates.filter(
-            (revision) => revision.revisionId !== resolution.revisionId,
-          ),
-          ...(conflicted.history ?? []),
-        ],
+        history: retainConflictHistory(
+          [
+            ...conflicted.candidates.filter(
+              (revision) => revision.revisionId !== resolution.revisionId,
+            ),
+            ...(conflicted.recovery ? [conflicted.recovery] : []),
+            ...(conflicted.history ?? []),
+          ],
+          createdAt,
+        ),
         kind: "live",
         path: conflicted.path,
-        revision: candidate,
+        revision: restoreAsCurrent(candidate, createdAt),
       };
     } else {
       if (
@@ -442,7 +492,10 @@ export class SyncService {
       resolvedEntry = {
         deletedAt: conflicted.deletedAt,
         entryId,
-        history: conflicted.history,
+        history: retainConflictHistory(
+          [...conflicted.candidates, ...(conflicted.history ?? [])],
+          createdAt,
+        ),
         kind: "deleted",
         lastContentHash: conflicted.lastContentHash,
         lastRevisionId: conflicted.lastRevisionId,
@@ -450,7 +503,6 @@ export class SyncService {
         recovery: conflicted.recovery,
       };
     }
-    const createdAt = versionedHead.serverDate;
     const commitId = crypto.randomUUID();
     const commit: CommitRecord = {
       changes: [{ entry: resolvedEntry, kind: "set-entry" }],
@@ -473,8 +525,16 @@ export class SyncService {
       expectedHeadEtag: versionedHead.etag,
       head,
     });
+    await this.assertLocalContent(
+      conflicted.path,
+      expectedMaterializedContentHash,
+    );
     if (materializedContent) {
-      await this.options.local.write(conflicted.path, materializedContent);
+      await this.options.local.write(
+        conflicted.path,
+        materializedContent,
+        expectedMaterializedContentHash,
+      );
     } else {
       await this.options.local.delete(conflicted.path);
     }
@@ -504,8 +564,13 @@ export class SyncService {
     if (!historical) {
       throw new Error(`Historical Revision ${revisionId} does not exist`);
     }
+    await this.assertLocalContent(entry.path, entry.revision.contentHash);
     const plaintext = await this.options.remote.readBlob(historical.blobId);
-    if (!plaintext || (await sha256(plaintext)) !== historical.contentHash) {
+    if (
+      !plaintext ||
+      plaintext.byteLength !== historical.size ||
+      (await sha256(plaintext)) !== historical.contentHash
+    ) {
       throw new Error(`Historical Revision ${revisionId} is damaged`);
     }
     if (
@@ -547,7 +612,12 @@ export class SyncService {
         vaultId: snapshot.vaultId,
       },
     });
-    await this.options.local.write(entry.path, plaintext);
+    await this.assertLocalContent(entry.path, entry.revision.contentHash);
+    await this.options.local.write(
+      entry.path,
+      plaintext,
+      entry.revision.contentHash,
+    );
     await this.options.cache.save(
       await this.buildCache({
         commitId,
@@ -568,6 +638,7 @@ export class SyncService {
     if (deleted?.kind !== "deleted" || !deleted.recovery) {
       throw new Error(`Entry ${entryId} has no Recovery Copy`);
     }
+    await this.assertLocalContent(deleted.path, null);
     return this.readRecoveryCopy(deleted, versionedHead.serverDate);
   }
 
@@ -613,7 +684,8 @@ export class SyncService {
         vaultId: snapshot.vaultId,
       },
     });
-    await this.options.local.write(deleted.path, plaintext);
+    await this.assertLocalContent(deleted.path, null);
+    await this.options.local.write(deleted.path, plaintext, null);
     await this.options.cache.save(
       await this.buildCache({
         commitId,
@@ -633,7 +705,11 @@ export class SyncService {
       throw new Error(`Entry ${deleted.entryId} has no Recovery Copy`);
     }
     const plaintext = await this.options.remote.readBlob(recovery.blobId);
-    if (!plaintext || (await sha256(plaintext)) !== recovery.contentHash) {
+    if (
+      !plaintext ||
+      plaintext.byteLength !== recovery.size ||
+      (await sha256(plaintext)) !== recovery.contentHash
+    ) {
       throw new Error(`Recovery Copy for ${deleted.entryId} is damaged`);
     }
     if (Date.parse(recovery.expiresAt) <= Date.parse(serverDate)) {
@@ -642,7 +718,9 @@ export class SyncService {
     return plaintext;
   }
 
-  async synchronize(): Promise<SyncResult> {
+  async synchronize(
+    approvedBulkDeletionEntryIds: readonly string[] = [],
+  ): Promise<SyncResult> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
       throw new Error("Remote Store is not initialized");
@@ -651,7 +729,10 @@ export class SyncService {
     const cached = await this.options.cache.load();
     const scan = await this.scanFiles(cached, true);
     const scanned = scan.files;
-    const localPaths = new Set(scanned.map((file) => file.path));
+    const localPaths = new Set(scan.localPaths);
+    const scannedByPath = new Map(
+      scanned.map((file) => [file.path, file] as const),
+    );
     const missingCachedByFingerprint = new Map<string, CachedFileState[]>();
     for (const cachedFile of Object.values(cached?.files ?? {})) {
       if (localPaths.has(cachedFile.path)) {
@@ -678,7 +759,11 @@ export class SyncService {
     }
     const deferredDownloadEntries = Object.values(remote.entries).flatMap(
       (entry): DeferredDownloadEntry[] => {
-        if (entry.kind !== "live" || localPaths.has(entry.path)) {
+        if (entry.kind !== "live") {
+          return [];
+        }
+        const localFile = scannedByPath.get(entry.path);
+        if (localFile?.contentHash === entry.revision.contentHash) {
           return [];
         }
         if (this.options.local.supportsPath?.(entry.path) === false) {
@@ -718,10 +803,16 @@ export class SyncService {
         entry.kind === "live" ? ([[entry.path, entry]] as const) : [],
       ),
     );
+    const remoteLiveEntriesByPath = new Map(
+      Object.values(remote.entries).flatMap((entry) =>
+        entry.kind === "live" ? ([[entry.path, entry]] as const) : [],
+      ),
+    );
     for (const path of scan.unsyncedLocalPaths) {
-      const cachedEntry = cachedLiveEntriesByPath.get(path);
-      if (cachedEntry) {
-        deferredEntryIds.add(cachedEntry.entryId);
+      const knownEntry =
+        cachedLiveEntriesByPath.get(path) ?? remoteLiveEntriesByPath.get(path);
+      if (knownEntry) {
+        deferredEntryIds.add(knownEntry.entryId);
       }
     }
     const materializedEntryIds = new Set(
@@ -752,6 +843,9 @@ export class SyncService {
       replicaId: this.options.replicaId,
       unmaterializedEntryIds: [...unmaterializedEntryIds],
     };
+    const expectedLocalContentByPath = new Map(
+      observation.files.map((file) => [file.path, file.contentHash] as const),
+    );
     const plan = this.engine.reconcile({
       base: cached?.snapshot,
       local: observation,
@@ -792,7 +886,38 @@ export class SyncService {
       ),
     ];
 
-    if (plan.bulkDeletion && !this.options.allowBulkDeletion) {
+    const hasBlockingConflict = plan.conflicts.some(
+      (conflict) =>
+        conflict.kind === "bootstrap-mismatch" ||
+        conflict.kind === "import-candidate" ||
+        conflict.kind === "path-collision" ||
+        conflict.kind === "possible-rename" ||
+        conflict.kind === "resolution-mismatch",
+    );
+    if (hasBlockingConflict) {
+      return {
+        bulkDeletion: plan.bulkDeletion,
+        deferredDownloadEntries,
+        deferredDownloads: deferredEntryIds.size,
+        deleted: 0,
+        downloaded: 0,
+        localIssues,
+        status: "action-required",
+        unsyncedLocalEntries: scan.unsyncedLocalEntries,
+        uploaded: 0,
+      };
+    }
+
+    const approvedBulkDeletionEntryIdSet = new Set(
+      approvedBulkDeletionEntryIds,
+    );
+    const bulkDeletionIsApproved =
+      plan.bulkDeletion !== undefined &&
+      approvedBulkDeletionEntryIdSet.size === plan.bulkDeletion.entryIds.length &&
+      plan.bulkDeletion.entryIds.every((entryId) =>
+        approvedBulkDeletionEntryIdSet.has(entryId),
+      );
+    if (plan.bulkDeletion && !bulkDeletionIsApproved) {
       return {
         bulkDeletion: plan.bulkDeletion,
         deferredDownloadEntries,
@@ -818,10 +943,29 @@ export class SyncService {
     let downloadedBytes = 0;
     for (const action of plan.localActions) {
       if (action.kind === "delete-local") {
+        const remoteEntry = remote.entries[action.entryId];
+        if (remoteEntry?.kind === "deleted") {
+          await this.assertRecoveryBeforeDelete(
+            remoteEntry,
+            versionedHead.serverDate,
+          );
+        }
+        await this.assertLocalContent(
+          action.path,
+          expectedLocalContentByPath.get(action.path) ?? null,
+        );
         await this.options.local.delete(action.path);
+        expectedLocalContentByPath.delete(action.path);
         deleted += 1;
       } else if (action.kind === "move-local") {
+        const expectedContentHash =
+          expectedLocalContentByPath.get(action.fromPath) ?? null;
+        await this.assertLocalContent(action.fromPath, expectedContentHash);
         await this.options.local.move(action.fromPath, action.toPath);
+        expectedLocalContentByPath.delete(action.fromPath);
+        if (expectedContentHash) {
+          expectedLocalContentByPath.set(action.toPath, expectedContentHash);
+        }
       } else {
         this.reportProgress({
           completed: downloaded,
@@ -837,10 +981,24 @@ export class SyncService {
         if (!plaintext) {
           throw new Error(`Missing remote blob ${action.revision.blobId}`);
         }
-        if ((await sha256(plaintext)) !== action.revision.contentHash) {
+        if (
+          plaintext.byteLength !== action.revision.size ||
+          (await sha256(plaintext)) !== action.revision.contentHash
+        ) {
           throw new Error(`Remote blob ${action.revision.blobId} failed hash verification`);
         }
-        await this.options.local.write(action.path, plaintext);
+        const expectedContentHash =
+          expectedLocalContentByPath.get(action.path) ?? null;
+        await this.assertLocalContent(action.path, expectedContentHash);
+        await this.options.local.write(
+          action.path,
+          plaintext,
+          expectedContentHash,
+        );
+        expectedLocalContentByPath.set(
+          action.path,
+          action.revision.contentHash,
+        );
         downloaded += 1;
         downloadedBytes += action.revision.size;
         this.reportProgress({
@@ -897,8 +1055,15 @@ export class SyncService {
       const createdAt = versionedHead.serverDate;
       const changedEntries: VaultEntry[] = [];
       const nextEntries = { ...remote.entries };
-      const deleteAfterCommit: string[] = [];
-      const writeAfterCommit: Array<{ body: Uint8Array; path: string }> = [];
+      const deleteAfterCommit: Array<{
+        expectedContentHash: string;
+        path: string;
+      }> = [];
+      const writeAfterCommit: Array<{
+        body: Uint8Array;
+        expectedContentHash: string;
+        path: string;
+      }> = [];
       for (const change of plan.remoteChanges) {
         let changedEntry: VaultEntry;
         if (change.kind === "delete-remote") {
@@ -924,7 +1089,10 @@ export class SyncService {
         } else {
           reportUpload(change.path);
           const plaintext = await this.options.local.read(change.path);
-          if ((await sha256(plaintext)) !== change.file.contentHash) {
+          if (
+            plaintext.byteLength !== change.file.size ||
+            (await sha256(plaintext)) !== change.file.contentHash
+          ) {
             throw new Error(`Local file changed while reading ${change.path}`);
           }
           const blobId = crypto.randomUUID();
@@ -981,7 +1149,10 @@ export class SyncService {
         }
         reportUpload(conflict.path);
         const plaintext = await this.options.local.read(conflict.path);
-        if ((await sha256(plaintext)) !== conflict.localFile.contentHash) {
+        if (
+          plaintext.byteLength !== conflict.localFile.size ||
+          (await sha256(plaintext)) !== conflict.localFile.contentHash
+        ) {
           throw new Error(`Local file changed while reading ${conflict.path}`);
         }
         const blobId = crypto.randomUUID();
@@ -1009,7 +1180,10 @@ export class SyncService {
             reason: "edit-delete",
             recovery: remoteEntry.recovery,
           };
-          deleteAfterCommit.push(conflict.path);
+          deleteAfterCommit.push({
+            expectedContentHash: conflict.localFile.contentHash,
+            path: conflict.path,
+          });
           unresolvedConflicts += 1;
         } else {
           const baseEntry = cached?.snapshot.entries[conflict.entryId];
@@ -1024,6 +1198,14 @@ export class SyncService {
           );
           if (!baseContent || !remoteContent) {
             throw new Error(`Conflict history is incomplete for ${conflict.path}`);
+          }
+          if (
+            baseContent.byteLength !== baseEntry.revision.size ||
+            (await sha256(baseContent)) !== baseEntry.revision.contentHash ||
+            remoteContent.byteLength !== remoteEntry.revision.size ||
+            (await sha256(remoteContent)) !== remoteEntry.revision.contentHash
+          ) {
+            throw new Error(`Conflict history is damaged for ${conflict.path}`);
           }
           let merged: Uint8Array | undefined;
           if (
@@ -1057,7 +1239,11 @@ export class SyncService {
                 size: merged.byteLength,
               },
             };
-            writeAfterCommit.push({ body: merged, path: conflict.path });
+            writeAfterCommit.push({
+              body: merged,
+              expectedContentHash: conflict.localFile.contentHash,
+              path: conflict.path,
+            });
           } else {
             changedEntry = {
               candidates: [remoteEntry.revision, localRevision],
@@ -1068,7 +1254,11 @@ export class SyncService {
               path: conflict.path,
               reason: "edit-edit",
             };
-            writeAfterCommit.push({ body: remoteContent, path: conflict.path });
+            writeAfterCommit.push({
+              body: remoteContent,
+              expectedContentHash: conflict.localFile.contentHash,
+              path: conflict.path,
+            });
             unresolvedConflicts += 1;
           }
         }
@@ -1125,11 +1315,23 @@ export class SyncService {
         protocolVersion: 1,
         vaultId: head.vaultId,
       };
-      for (const path of deleteAfterCommit) {
-        await this.options.local.delete(path);
+      for (const pendingDelete of deleteAfterCommit) {
+        await this.assertLocalContent(
+          pendingDelete.path,
+          pendingDelete.expectedContentHash,
+        );
+        await this.options.local.delete(pendingDelete.path);
       }
       for (const pendingWrite of writeAfterCommit) {
-        await this.options.local.write(pendingWrite.path, pendingWrite.body);
+        await this.assertLocalContent(
+          pendingWrite.path,
+          pendingWrite.expectedContentHash,
+        );
+        await this.options.local.write(
+          pendingWrite.path,
+          pendingWrite.body,
+          pendingWrite.expectedContentHash,
+        );
       }
     }
     await this.options.cache.save(
@@ -1172,7 +1374,7 @@ export class SyncService {
     );
     for (const file of scan.files) {
       const entry = liveEntriesByPath.get(file.path);
-      if (entry && entry.revision.contentHash === file.contentHash) {
+      if (entry) {
         files[file.path] = { ...file, entryId: entry.entryId };
       }
     }
@@ -1203,11 +1405,58 @@ export class SyncService {
     };
   }
 
+  private async assertLocalContent(
+    path: string,
+    expectedContentHash: string | null,
+  ): Promise<void> {
+    const current = await this.options.local.stat(path);
+    if (expectedContentHash === null) {
+      if (current) {
+        throw new LocalStateChangedError(path);
+      }
+      return;
+    }
+    if (!current) {
+      throw new LocalStateChangedError(path);
+    }
+    const content = await this.options.local.read(path);
+    if (
+      content.byteLength !== current.size ||
+      (await sha256(content)) !== expectedContentHash
+    ) {
+      throw new LocalStateChangedError(path);
+    }
+  }
+
+  private async assertRecoveryBeforeDelete(
+    deleted: DeletedEntry,
+    serverDate: string,
+  ): Promise<void> {
+    const recoveryRequiredUntil = Date.parse(
+      expiresInDays(deleted.deletedAt, 30),
+    );
+    const serverTime = Date.parse(serverDate);
+    if (serverTime < recoveryRequiredUntil) {
+      if (!deleted.recovery) {
+        throw new Error(
+          `Deleted Entry ${deleted.entryId} is missing its Recovery Copy`,
+        );
+      }
+      await this.readRecoveryCopy(deleted, serverDate);
+    } else if (
+      deleted.recovery &&
+      Date.parse(deleted.recovery.expiresAt) > serverTime
+    ) {
+      await this.readRecoveryCopy(deleted, serverDate);
+    }
+  }
+
   private async scanFiles(
     cached?: CachedSyncState,
     reportProgress = false,
   ): Promise<{
     files: Array<LocalFileInfo & { contentHash: string }>;
+    localPaths: string[];
     skippedTrackedEntryIds: string[];
     unsyncedLocalEntries: number;
     unsyncedLocalPaths: string[];
@@ -1243,28 +1492,25 @@ export class SyncService {
         this.options.maxAutomaticFileBytes !== undefined &&
         file.size > this.options.maxAutomaticFileBytes
       ) {
-        if (
-          cachedFile &&
-          cachedFile.size === file.size &&
-          cachedFile.modifiedAt === file.modifiedAt
-        ) {
-          files.push({ ...file, contentHash: cachedFile.contentHash });
-        } else {
-          unsyncedLocalEntries += 1;
-          unsyncedLocalPaths.push(file.path);
-          if (cachedFile) {
-            skippedTrackedEntryIds.push(cachedFile.entryId);
-          }
+        unsyncedLocalEntries += 1;
+        unsyncedLocalPaths.push(file.path);
+        if (cachedFile) {
+          skippedTrackedEntryIds.push(cachedFile.entryId);
         }
         reportScanned(file);
         continue;
       }
-      const contentHash =
-        cachedFile &&
-        cachedFile.size === file.size &&
-        cachedFile.modifiedAt === file.modifiedAt
-          ? cachedFile.contentHash
-          : await sha256(await this.options.local.read(file.path));
+      const content = await this.options.local.read(file.path);
+      const current = await this.options.local.stat(file.path);
+      if (
+        !current ||
+        current.modifiedAt !== file.modifiedAt ||
+        current.size !== file.size ||
+        content.byteLength !== file.size
+      ) {
+        throw new LocalStateChangedError(file.path);
+      }
+      const contentHash = await sha256(content);
       files.push({
         ...file,
         contentHash,
@@ -1273,6 +1519,7 @@ export class SyncService {
     }
     return {
       files,
+      localPaths: localFiles.map((file) => file.path),
       skippedTrackedEntryIds,
       unsyncedLocalEntries,
       unsyncedLocalPaths,

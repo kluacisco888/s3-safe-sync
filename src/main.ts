@@ -25,8 +25,10 @@ import {
   type LocalSyncIssue,
   type SyncCachePort,
   type SyncProgress,
+  LocalStateChangedError,
 } from "./sync/sync-service";
 import type {
+  BulkDeletionPlan,
   ConflictedEntry,
   DeletedEntry,
   LiveEntry,
@@ -90,8 +92,9 @@ export default class S3VaultSyncPlugin
   private credentials!: CredentialStore;
   private data!: PersistedPluginData;
   private pendingBulkDeletion:
-    | { count: number; totalLiveEntries: number }
+    | BulkDeletionPlan
     | undefined;
+  private approvedBulkDeletionEntryIds: string[] | undefined;
   private pendingLocalIssues: LocalSyncIssue[] = [];
   private pendingDeferredDownloads: DeferredDownloadEntry[] = [];
   private readonly syncRequests = new SyncRequestQueue((allowBulkDeletion) =>
@@ -207,7 +210,7 @@ export default class S3VaultSyncPlugin
   }
 
   getPendingBulkDeletion():
-    | { count: number; totalLiveEntries: number }
+    | BulkDeletionPlan
     | undefined {
     return this.pendingBulkDeletion;
   }
@@ -244,7 +247,14 @@ export default class S3VaultSyncPlugin
     if (!this.pendingBulkDeletion || this.syncRequests.isRunning) {
       return;
     }
-    await this.syncRequests.request({ allowBulkDeletion: true });
+    this.approvedBulkDeletionEntryIds = [
+      ...this.pendingBulkDeletion.entryIds,
+    ];
+    try {
+      await this.syncRequests.request({ allowBulkDeletion: true });
+    } finally {
+      this.approvedBulkDeletionEntryIds = undefined;
+    }
   }
 
   async keepConflictDeleted(entryId: string): Promise<void> {
@@ -502,7 +512,6 @@ export default class S3VaultSyncPlugin
 
   private createSyncService(
     remote: RemoteStore,
-    allowBulkDeletion = false,
   ): SyncService {
     const cache: SyncCachePort = {
       load: () => Promise.resolve(this.data.cache),
@@ -512,7 +521,6 @@ export default class S3VaultSyncPlugin
       },
     };
     return new SyncService({
-      allowBulkDeletion,
       cache,
       local: new ObsidianVaultPort(this.app.vault),
       maxAutomaticFileBytes: mobileAutomaticFileLimit(),
@@ -569,8 +577,11 @@ export default class S3VaultSyncPlugin
           );
           return this.createSyncService(
             remote,
-            allowBulkDeletion,
-          ).synchronize();
+          ).synchronize(
+            allowBulkDeletion
+              ? this.approvedBulkDeletionEntryIds
+              : undefined,
+          );
         },
         {
           baseDelaysMs: allowBulkDeletion ? [] : undefined,
@@ -598,6 +609,12 @@ export default class S3VaultSyncPlugin
     } catch (error) {
       if (error instanceof HeadChangedError) {
         this.scheduleHeadRetry();
+      } else if (error instanceof LocalStateChangedError) {
+        this.setStatus(
+          "Checking",
+          "A local file changed during synchronization. Retrying after edits settle.",
+        );
+        this.scheduleAfterLocalChange();
       } else {
         this.showError(error);
       }
