@@ -768,14 +768,15 @@ describe("SyncService", () => {
     }).initializeNew("vault-1");
     const phoneVault = new MemoryVault();
     phoneVault.unsupportedPaths.add("notes/question?.md");
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
     const phone = new SyncService({
       cache: new MemorySyncCache(),
       local: phoneVault,
-      remote: await RemoteStore.open({
-        objects,
-        prefix: "chosen-prefix",
-        vaultKey,
-      }),
+      remote: phoneRemote,
       replicaId: "phone",
     });
 
@@ -803,6 +804,65 @@ describe("SyncService", () => {
     }
     await expect(phone.downloadDeferred(unsupported.entryId)).rejects.toThrow(
       "not supported on this device",
+    );
+  });
+
+  it("downloads a previously deferred file after its remote path becomes supported", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopVault = new MemoryVault();
+    await desktopVault.write(
+      "notes/question?.md",
+      new TextEncoder().encode("portable after rename"),
+    );
+    const desktop = new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: await RemoteStore.open({
+        objects,
+        prefix: "chosen-prefix",
+        vaultKey,
+      }),
+      replicaId: "desktop",
+    });
+    await desktop.initializeNew("vault-1");
+
+    const phoneVault = new MemoryVault();
+    phoneVault.unsupportedPaths.add("notes/question?.md");
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const phoneCache = new MemorySyncCache();
+    const phone = new SyncService({
+      cache: phoneCache,
+      local: phoneVault,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+    expect((await phone.synchronize()).deferredDownloads).toBe(1);
+    if (!phoneCache.state) {
+      throw new Error("Expected phone cache");
+    }
+    phoneCache.state.unmaterializedEntryIds = undefined;
+    phoneVault.unsupportedPaths.delete("notes/question?.md");
+
+    await desktopVault.move("notes/question?.md", "notes/question？.md");
+    await desktop.synchronize();
+    const phoneResult = await phone.synchronize();
+
+    expect(phoneResult).toMatchObject({ downloaded: 1, status: "complete" });
+    expect(phoneVault.readText("notes/question？.md")).toBe(
+      "portable after rename",
+    );
+    const head = await phoneRemote.readHead();
+    if (!head) {
+      throw new Error("Expected remote Head");
+    }
+    const snapshot = await phoneRemote.readSnapshot(head.value);
+    expect(Object.values(snapshot.entries)).toContainEqual(
+      expect.objectContaining({ kind: "live", path: "notes/question？.md" }),
     );
   });
 
@@ -848,6 +908,55 @@ describe("SyncService", () => {
       uploaded: 0,
     });
     expect(phoneVault.readCount).toBe(0);
+  });
+
+  it("does not overwrite a tracked local edit that grows beyond the mobile limit", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopVault = new MemoryVault();
+    await desktopVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("remote"),
+    );
+    await new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: await RemoteStore.open({
+        objects,
+        prefix: "chosen-prefix",
+        vaultKey,
+      }),
+      replicaId: "desktop",
+    }).initializeNew("vault-1");
+
+    const phoneVault = new MemoryVault();
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const phone = new SyncService({
+      cache: new MemorySyncCache(),
+      local: phoneVault,
+      maxAutomaticFileBytes: 10,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+    await phone.synchronize();
+    await phoneVault.write(
+      "notes/example.md",
+      new TextEncoder().encode("local content above limit"),
+    );
+
+    const first = await phone.synchronize();
+    const second = await phone.synchronize();
+
+    expect(first).toMatchObject({ status: "action-required", uploaded: 0 });
+    expect(second).toMatchObject({ status: "action-required", uploaded: 0 });
+    expect(phoneVault.readText("notes/example.md")).toBe(
+      "local content above limit",
+    );
+    expect((await phoneRemote.readHead())?.value.generation).toBe(1);
   });
 
   it("does not publish a Bulk Deletion before confirmation", async () => {

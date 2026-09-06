@@ -65,6 +65,7 @@ export interface ReplicaObservation {
   deferredEntryIds?: string[];
   files: ObservedFile[];
   replicaId: string;
+  unmaterializedEntryIds?: string[];
 }
 
 export interface DeleteLocalAction {
@@ -261,6 +262,9 @@ export class SyncEngine {
       local.files.map((file) => [file.path, file] as const),
     );
     const deferredEntryIds = new Set(local.deferredEntryIds ?? []);
+    const unmaterializedEntryIds = new Set(
+      local.unmaterializedEntryIds ?? [],
+    );
 
     for (const file of local.files) {
       const remoteEntry = file.entryId
@@ -424,11 +428,13 @@ export class SyncEngine {
         continue;
       }
       const isPresent = localByEntryId.has(baseEntry.entryId);
-      const isDeferred = deferredEntryIds.has(baseEntry.entryId);
+      const absenceIsNotDeletion =
+        deferredEntryIds.has(baseEntry.entryId) ||
+        unmaterializedEntryIds.has(baseEntry.entryId);
       const remoteEntry = remote.entries[baseEntry.entryId];
       if (
         !isPresent &&
-        !isDeferred &&
+        !absenceIsNotDeletion &&
         remoteEntry?.kind === "live" &&
         remoteEntry.revision.revisionId === baseEntry.revision.revisionId
       ) {
@@ -443,7 +449,7 @@ export class SyncEngine {
         });
       } else if (
         !isPresent &&
-        !isDeferred &&
+        !absenceIsNotDeletion &&
         remoteEntry?.kind === "live" &&
         remoteEntry.revision.revisionId !== baseEntry.revision.revisionId
       ) {
@@ -455,6 +461,27 @@ export class SyncEngine {
           kind: "delete-edit",
           path: baseEntry.path,
           remoteRevision: remoteEntry.revision,
+        });
+      }
+    }
+
+    for (const remoteEntry of remoteEntries) {
+      if (
+        remoteEntry.kind !== "live" ||
+        !unmaterializedEntryIds.has(remoteEntry.entryId) ||
+        deferredEntryIds.has(remoteEntry.entryId)
+      ) {
+        continue;
+      }
+      const isPresent =
+        localByEntryId.has(remoteEntry.entryId) ||
+        localByPath.has(remoteEntry.path);
+      if (!isPresent) {
+        localActions.push({
+          entryId: remoteEntry.entryId,
+          kind: "download-remote",
+          path: remoteEntry.path,
+          revision: remoteEntry.revision,
         });
       }
     }

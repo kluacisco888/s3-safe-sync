@@ -36,6 +36,7 @@ export interface CachedFileState extends LocalFileInfo {
 export interface CachedSyncState {
   files: Record<string, CachedFileState>;
   snapshot: VaultSnapshot;
+  unmaterializedEntryIds?: string[];
 }
 
 export interface SyncCachePort {
@@ -281,7 +282,11 @@ export class SyncService {
         );
       }),
     );
-    await this.options.cache.save({ files: stableCacheFiles, snapshot });
+    await this.options.cache.save({
+      files: stableCacheFiles,
+      snapshot,
+      unmaterializedEntryIds: [],
+    });
   }
 
   private reportProgress(progress: SyncProgress): void {
@@ -676,13 +681,42 @@ export class SyncService {
         return [];
       },
     );
-    const deferredEntryIds = deferredDownloadEntries.map(
-      (entry) => entry.entryId,
+    const deferredEntryIds = new Set(
+      deferredDownloadEntries.map((entry) => entry.entryId),
     );
-    deferredEntryIds.push(...scan.skippedTrackedEntryIds);
+    for (const entryId of scan.skippedTrackedEntryIds) {
+      deferredEntryIds.add(entryId);
+    }
+    const cachedLiveEntriesByPath = new Map(
+      Object.values(cached?.snapshot.entries ?? {}).flatMap((entry) =>
+        entry.kind === "live" ? ([[entry.path, entry]] as const) : [],
+      ),
+    );
+    for (const path of scan.unsyncedLocalPaths) {
+      const cachedEntry = cachedLiveEntriesByPath.get(path);
+      if (cachedEntry) {
+        deferredEntryIds.add(cachedEntry.entryId);
+      }
+    }
+    const materializedEntryIds = new Set(
+      Object.values(cached?.files ?? {}).map((file) => file.entryId),
+    );
+    const unmaterializedEntryIds = new Set(
+      cached?.unmaterializedEntryIds ?? [],
+    );
+    if (cached && cached.unmaterializedEntryIds === undefined) {
+      for (const entry of Object.values(cached.snapshot.entries)) {
+        if (
+          entry.kind === "live" &&
+          !materializedEntryIds.has(entry.entryId)
+        ) {
+          unmaterializedEntryIds.add(entry.entryId);
+        }
+      }
+    }
     const observation: ReplicaObservation = {
       basedOnCommitId: cached?.snapshot.commitId,
-      deferredEntryIds,
+      deferredEntryIds: [...deferredEntryIds],
       files: scanned.map((file) => ({
         contentHash: file.contentHash,
         entryId: entryIdByPath.get(file.path),
@@ -690,6 +724,7 @@ export class SyncService {
         size: file.size,
       })),
       replicaId: this.options.replicaId,
+      unmaterializedEntryIds: [...unmaterializedEntryIds],
     };
     const plan = this.engine.reconcile({
       base: cached?.snapshot,
@@ -735,7 +770,7 @@ export class SyncService {
       return {
         bulkDeletion: plan.bulkDeletion,
         deferredDownloadEntries,
-        deferredDownloads: deferredEntryIds.length,
+        deferredDownloads: deferredEntryIds.size,
         deleted: 0,
         downloaded: 0,
         localIssues,
@@ -1071,11 +1106,16 @@ export class SyncService {
         await this.options.local.write(pendingWrite.path, pendingWrite.body);
       }
     }
-    await this.options.cache.save(await this.buildCache(remote));
+    await this.options.cache.save(
+      await this.buildCache(
+        remote,
+        deferredDownloadEntries.map((entry) => entry.entryId),
+      ),
+    );
     return {
       bulkDeletion: plan.bulkDeletion,
       deferredDownloadEntries,
-      deferredDownloads: deferredEntryIds.length,
+      deferredDownloads: deferredEntryIds.size,
       deleted,
       downloaded,
       localIssues,
@@ -1092,22 +1132,49 @@ export class SyncService {
     };
   }
 
-  private async buildCache(snapshot: VaultSnapshot): Promise<CachedSyncState> {
+  private async buildCache(
+    snapshot: VaultSnapshot,
+    additionalUnmaterializedEntryIds: Iterable<string> = [],
+  ): Promise<CachedSyncState> {
     const current = await this.options.cache.load();
-    const scanned = (await this.scanFiles(current)).files;
+    const scan = await this.scanFiles(current);
     const files: Record<string, CachedFileState> = {};
     const liveEntriesByPath = new Map(
       Object.values(snapshot.entries).flatMap((entry) =>
         entry.kind === "live" ? ([[entry.path, entry]] as const) : [],
       ),
     );
-    for (const file of scanned) {
+    for (const file of scan.files) {
       const entry = liveEntriesByPath.get(file.path);
       if (entry && entry.revision.contentHash === file.contentHash) {
         files[file.path] = { ...file, entryId: entry.entryId };
       }
     }
-    return { files, snapshot };
+    const skippedTrackedEntryIds = new Set(scan.skippedTrackedEntryIds);
+    for (const cachedFile of Object.values(current?.files ?? {})) {
+      if (
+        skippedTrackedEntryIds.has(cachedFile.entryId) &&
+        snapshot.entries[cachedFile.entryId]?.kind === "live"
+      ) {
+        files[cachedFile.path] = cachedFile;
+      }
+    }
+    const materializedEntryIds = new Set(
+      Object.values(files).map((file) => file.entryId),
+    );
+    const unmaterializedEntryIds = new Set([
+      ...(current?.unmaterializedEntryIds ?? []),
+      ...additionalUnmaterializedEntryIds,
+    ]);
+    return {
+      files,
+      snapshot,
+      unmaterializedEntryIds: [...unmaterializedEntryIds].filter(
+        (entryId) =>
+          snapshot.entries[entryId]?.kind === "live" &&
+          !materializedEntryIds.has(entryId),
+      ),
+    };
   }
 
   private async scanFiles(

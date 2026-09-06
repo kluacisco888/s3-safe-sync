@@ -1,6 +1,7 @@
 import { normalizePath, Platform, TFile, type Vault } from "obsidian";
 
 import type { LocalFileInfo, LocalVaultPort } from "../sync/sync-service";
+import { deleteVaultPath } from "./vault-delete";
 
 const EXCLUDED_SEGMENTS = new Set([
   ".git",
@@ -39,10 +40,11 @@ export class ObsidianVaultPort implements LocalVaultPort {
   constructor(private readonly vault: Vault) {}
 
   async delete(path: string): Promise<void> {
-    const file = this.vault.getAbstractFileByPath(normalizePath(path));
-    if (file) {
-      await this.vault.trash(file, true);
-    }
+    await deleteVaultPath(
+      this.vault,
+      normalizePath(path),
+      (candidate) => candidate instanceof TFile,
+    );
   }
 
   list(): Promise<LocalFileInfo[]> {

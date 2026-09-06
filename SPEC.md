@@ -18,7 +18,7 @@ The plugin does not run after Obsidian is closed, provide telemetry, synchronize
 
 ## Sync Scope
 
-Include ordinary files of every extension. Exclude `.obsidian`, dot-prefixed path segments, underscore-prefixed path segments, version-control directories, `node_modules`, temporary office files, and configured glob patterns. Remote paths that the current device cannot create are deferred without becoming deletions and require a rename on another device. Bookmarks and configuration synchronization are outside the first release.
+Include ordinary files of every extension. Exclude `.obsidian`, dot-prefixed path segments, underscore-prefixed path segments, version-control directories, `node_modules`, temporary office files, and configured glob patterns. Remote paths that the current device cannot create are deferred without becoming deletions and require a rename on another device. A previously deferred Entry remains known as unmaterialized and is downloaded when its path later becomes supported instead of treating its absence as a local deletion. Bookmarks and configuration synchronization are outside the first release.
 
 ## Remote layout
 
