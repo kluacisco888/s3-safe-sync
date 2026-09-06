@@ -125,7 +125,7 @@ liveDescribe("AwsS3ObjectStore live integration", () => {
     await expect(first.readHead()).resolves.toMatchObject({
       value: { commitId: "commit-a", generation: 2 },
     });
-  });
+  }, 20_000);
 
   it("round-trips a multipart object through ranged downloads", async () => {
     const body = new Uint8Array(5 * 1024 * 1024 + 17);
@@ -139,5 +139,5 @@ liveDescribe("AwsS3ObjectStore live integration", () => {
     expect(downloaded?.body.byteLength).toBe(body.byteLength);
     expect(downloaded?.body[0]).toBe(1);
     expect(downloaded?.body.at(-1)).toBe(255);
-  });
+  }, 20_000);
 });
