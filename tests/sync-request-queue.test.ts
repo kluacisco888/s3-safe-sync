@@ -57,6 +57,35 @@ describe("SyncRequestQueue", () => {
     });
   });
 
+  it("does not promote an ordinary request queued behind a full check", async () => {
+    let finishFirstSync: (() => void) | undefined;
+    const run = vi
+      .fn<(options: SyncRunOptions) => Promise<void>>()
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finishFirstSync = resolve;
+          }),
+      )
+      .mockResolvedValue(undefined);
+    const queue = new SyncRequestQueue(run);
+
+    const fullCheck = queue.request({ fullHashVerification: true });
+    await Promise.resolve();
+    const ordinaryRequest = queue.request();
+    finishFirstSync?.();
+    await Promise.all([fullCheck, ordinaryRequest]);
+
+    expect(run).toHaveBeenNthCalledWith(1, {
+      allowBulkDeletion: false,
+      fullHashVerification: true,
+    });
+    expect(run).toHaveBeenNthCalledWith(2, {
+      allowBulkDeletion: false,
+      fullHashVerification: false,
+    });
+  });
+
   it("serializes direct operations with queued synchronization", async () => {
     const events: string[] = [];
     let releaseDirect = (): void => undefined;

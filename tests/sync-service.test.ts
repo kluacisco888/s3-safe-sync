@@ -16,6 +16,8 @@ import {
 } from "../src/storage/object-store";
 import { RemoteStore } from "../src/storage/remote-store";
 import { SyncRequestQueue } from "../src/sync/sync-request-queue";
+import { sha256Content } from "../src/sync/content-hash";
+import { LocalStateChangedError } from "../src/sync/errors";
 
 class MemoryObjectStore implements ObjectStore {
   private sequence = 0;
@@ -171,6 +173,39 @@ class MemoryVault implements LocalVaultPort {
       bytes: body.slice(),
       modifiedAt: existing.modifiedAt,
     });
+  }
+}
+
+class StreamingMemoryVault extends MemoryVault {
+  directReadCount = 0;
+  hashCount = 0;
+
+  override read(path: string): Promise<Uint8Array> {
+    this.directReadCount += 1;
+    return super.read(path);
+  }
+
+  async hashContent(
+    path: string,
+    options: {
+      onProgress?: (hashedBytes: number) => void;
+      yieldToHost?: () => Promise<void>;
+    } = {},
+  ): Promise<{ contentHash: string; size: number }> {
+    this.hashCount += 1;
+    const content = await super.read(path);
+    for (let hashedBytes = 2; hashedBytes < content.byteLength; hashedBytes += 2) {
+      options.onProgress?.(hashedBytes);
+      await options.yieldToHost?.();
+    }
+    if (content.byteLength > 0) {
+      options.onProgress?.(content.byteLength);
+      await options.yieldToHost?.();
+    }
+    return {
+      contentHash: await sha256Content(content),
+      size: content.byteLength,
+    };
   }
 }
 
@@ -1563,17 +1598,23 @@ describe("SyncService", () => {
     await local.write("notes/changed.md", new TextEncoder().encode("first"));
     await local.write("notes/unchanged.md", new TextEncoder().encode("stable"));
     const progress: SyncProgress[] = [];
+    let yieldCount = 0;
     const service = new SyncService({
       cache: new MemorySyncCache(),
       local,
       onProgress: (update) => progress.push(update),
       remote,
       replicaId: "desktop",
+      yieldDuringHashing: () => {
+        yieldCount += 1;
+        return Promise.resolve();
+      },
     });
     await service.initializeNew("vault-1");
     local.readCount = 0;
     local.readPaths.length = 0;
     progress.length = 0;
+    yieldCount = 0;
     await local.write("notes/changed.md", new TextEncoder().encode("second"));
 
     const result = await service.synchronize([], {
@@ -1587,6 +1628,102 @@ describe("SyncService", () => {
     ]);
     expect(progress.filter((update) => update.phase === "hashing").at(-1))
       .toMatchObject({ totalBytes: 6, transferredBytes: 6 });
+    expect(yieldCount).toBe(1);
+  });
+
+  it("uses a local streaming hash capability instead of reading the whole file", async () => {
+    const objects = new MemoryObjectStore();
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey: Uint8Array.from({ length: 32 }, (_, index) => index),
+    });
+    const local = new StreamingMemoryVault();
+    await local.write("notes/example.md", new TextEncoder().encode("example"));
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      remote,
+      replicaId: "desktop",
+    });
+
+    await service.initializeNew("vault-1");
+
+    expect(local.hashCount).toBe(1);
+    expect(local.directReadCount).toBe(1);
+  });
+
+  it("accumulates streamed hash progress without double-counting bytes", async () => {
+    const objects = new MemoryObjectStore();
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey: Uint8Array.from({ length: 32 }, (_, index) => index),
+    });
+    const local = new StreamingMemoryVault();
+    await local.write("notes/one.md", new TextEncoder().encode("abcd"));
+    await local.write("notes/two.md", new TextEncoder().encode("abcdef"));
+    const progress: SyncProgress[] = [];
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      onProgress: (update) => progress.push(update),
+      remote,
+      replicaId: "desktop",
+    });
+
+    await service.initializeNew("vault-1");
+
+    const hashing = progress.filter((update) => update.phase === "hashing");
+    expect(
+      hashing.map(({ completed, transferredBytes }) => ({
+        completed,
+        transferredBytes,
+      })),
+    ).toEqual([
+      { completed: 0, transferredBytes: 0 },
+      { completed: 0, transferredBytes: 0 },
+      { completed: 0, transferredBytes: 2 },
+      { completed: 0, transferredBytes: 4 },
+      { completed: 1, transferredBytes: 4 },
+      { completed: 1, transferredBytes: 4 },
+      { completed: 1, transferredBytes: 6 },
+      { completed: 1, transferredBytes: 8 },
+      { completed: 1, transferredBytes: 10 },
+      { completed: 2, transferredBytes: 10 },
+    ]);
+    expect(hashing.at(-1)).toMatchObject({
+      completed: 2,
+      total: 2,
+      totalBytes: 10,
+      transferredBytes: 10,
+    });
+  });
+
+  it("rejects a file changed after streamed hashing before publishing Head", async () => {
+    const objects = new MemoryObjectStore();
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey: Uint8Array.from({ length: 32 }, (_, index) => index),
+    });
+    const local = new StreamingMemoryVault();
+    await local.write("notes/example.md", new TextEncoder().encode("before"));
+    local.beforeStat = async (path) => {
+      local.beforeStat = undefined;
+      await local.write(path, new TextEncoder().encode("after!"));
+    };
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      remote,
+      replicaId: "desktop",
+    });
+
+    await expect(service.initializeNew("vault-1")).rejects.toMatchObject({
+      path: "notes/example.md",
+    } satisfies Partial<LocalStateChangedError>);
+    await expect(remote.readHead()).resolves.toBeUndefined();
   });
 
   it("reuses cached hashes when an incremental metadata scan is unchanged", async () => {
@@ -1600,15 +1737,21 @@ describe("SyncService", () => {
     const local = new MemoryVault();
     await local.write("notes/one.md", new TextEncoder().encode("one"));
     await local.write("notes/two.md", new TextEncoder().encode("two"));
+    let yieldCount = 0;
     const service = new SyncService({
       cache: new MemorySyncCache(),
       local,
       remote,
       replicaId: "desktop",
+      yieldDuringHashing: () => {
+        yieldCount += 1;
+        return Promise.resolve();
+      },
     });
     await service.initializeNew("vault-1");
     local.readCount = 0;
     local.readPaths.length = 0;
+    yieldCount = 0;
 
     const result = await service.synchronize([], {
       fullHashVerification: false,
@@ -1620,6 +1763,7 @@ describe("SyncService", () => {
       uploaded: 0,
     });
     expect(local.readPaths).toEqual([]);
+    expect(yieldCount).toBe(0);
   });
 
   it("hashes a dirty path even when its size and modified time are unchanged", async () => {

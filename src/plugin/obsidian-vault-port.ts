@@ -1,8 +1,23 @@
-import { normalizePath, Platform, TFile, type Vault } from "obsidian";
+import {
+  FileSystemAdapter,
+  normalizePath,
+  Platform,
+  TFile,
+  type Vault,
+} from "obsidian";
 
-import type { LocalFileInfo, LocalVaultPort } from "../sync/sync-service";
+import type {
+  LocalContentHash,
+  LocalFileInfo,
+  LocalHashOptions,
+  LocalVaultPort,
+} from "../sync/sync-service";
 import { sha256Content as sha256 } from "../sync/content-hash";
 import { LocalStateChangedError } from "../sync/errors";
+import {
+  hashDesktopFile,
+  type DesktopHashDependencies,
+} from "./desktop-streaming-hash";
 import { deleteVaultPath } from "./vault-delete";
 import {
   recoverPendingVaultWrites,
@@ -71,6 +86,51 @@ export class ObsidianVaultPort implements LocalVaultPort {
         size: file.stat.size,
       }))
       .sort((left, right) => left.path.localeCompare(right.path));
+  }
+
+  async hashContent(
+    path: string,
+    options: LocalHashOptions = {},
+  ): Promise<LocalContentHash> {
+    await this.ensureRecovered();
+    const normalized = normalizePath(path);
+    const file = this.vault.getAbstractFileByPath(normalized);
+    if (!(file instanceof TFile)) {
+      throw new LocalStateChangedError(path);
+    }
+    if (
+      Platform.isDesktopApp &&
+      this.vault.adapter instanceof FileSystemAdapter
+    ) {
+      const nodeRequire = (
+        window as Window & { require: (moduleId: string) => unknown }
+      ).require;
+      const cryptoModule = nodeRequire("node:crypto") as Pick<
+        DesktopHashDependencies,
+        "createHash"
+      >;
+      const fileSystemModule = nodeRequire("node:fs/promises") as Pick<
+        DesktopHashDependencies,
+        "open" | "stat"
+      >;
+      return hashDesktopFile(
+        this.vault.adapter.getFullPath(normalized),
+        {
+          createHash: cryptoModule.createHash,
+          open: fileSystemModule.open,
+          stat: fileSystemModule.stat,
+        },
+        { ...options, errorPath: path },
+      );
+    }
+
+    await options.yieldToHost?.();
+    const content = new Uint8Array(await this.vault.readBinary(file));
+    options.onProgress?.(content.byteLength);
+    return {
+      contentHash: await sha256(content),
+      size: content.byteLength,
+    };
   }
 
   async move(

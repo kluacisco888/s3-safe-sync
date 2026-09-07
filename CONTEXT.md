@@ -89,7 +89,7 @@ A shared encrypted 30-day, content-free history of synchronization plans, outcom
 _Avoid_: Debug log, note history
 
 **Full Hash Verification**:
-A device-local integrity pass that reads and hashes every eligible Vault file after cache loss, on manual request, or at least once every 24 hours. It is not shared history and does not contact S3 for file contents.
+A device-local integrity pass that reads and hashes every eligible Vault file after cache loss, from the explicit integrity-check action, or on the configured 1, 7, 14, or 30-day schedule (7 days by default). It is not shared history and does not contact S3 for file contents.
 _Avoid_: Sync Audit, remote verification
 
 **Pending Path Rename**:

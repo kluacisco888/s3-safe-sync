@@ -26,11 +26,25 @@ export interface LocalFileInfo {
   size: number;
 }
 
+export interface LocalContentHash {
+  contentHash: string;
+  size: number;
+}
+
+export interface LocalHashOptions {
+  onProgress?: (hashedBytes: number) => void;
+  yieldToHost?: () => Promise<void>;
+}
+
 export interface LocalVaultPort {
   delete(
     path: string,
     expectedContentHash?: string | null,
   ): Promise<void>;
+  hashContent?(
+    path: string,
+    options?: LocalHashOptions,
+  ): Promise<LocalContentHash>;
   list(): Promise<LocalFileInfo[]>;
   move(
     fromPath: string,
@@ -71,6 +85,7 @@ export interface SyncServiceOptions {
   onProgress?: (progress: SyncProgress) => void;
   remote: RemoteStore;
   replicaId: string;
+  yieldDuringHashing?: () => Promise<void>;
 }
 
 export interface SyncProgress {
@@ -1983,14 +1998,7 @@ export class SyncService {
     }
     let completed = 0;
     let transferredBytes = 0;
-    const reportHashed = (
-      file?: LocalFileInfo,
-      completedSize?: number,
-    ): void => {
-      if (completedSize !== undefined) {
-        completed += 1;
-        transferredBytes += completedSize;
-      }
+    const reportHashed = (file?: LocalFileInfo): void => {
       if (reportProgress) {
         this.reportProgress({
           completed,
@@ -2001,6 +2009,11 @@ export class SyncService {
           transferredBytes,
         });
       }
+    };
+    const finishHash = (file: LocalFileInfo, hashedBytes: number): void => {
+      transferredBytes += Math.max(0, file.size - hashedBytes);
+      completed += 1;
+      reportHashed(file);
     };
     if (filesToHash.length > 0) {
       reportHashed();
@@ -2030,6 +2043,39 @@ export class SyncService {
         continue;
       }
       reportHashed(file);
+      if (this.options.local.hashContent) {
+        let hashedBytes = 0;
+        const hashed = await this.options.local.hashContent(file.path, {
+          onProgress: (currentBytes) => {
+            const boundedBytes = Math.min(
+              file.size,
+              Math.max(hashedBytes, currentBytes),
+            );
+            transferredBytes += boundedBytes - hashedBytes;
+            hashedBytes = boundedBytes;
+            reportHashed(file);
+          },
+          yieldToHost: this.options.yieldDuringHashing,
+        });
+        const current = await this.options.local.stat(file.path);
+        if (
+          !current ||
+          current.modifiedAt !== file.modifiedAt ||
+          current.size !== file.size ||
+          hashed.size !== file.size
+        ) {
+          throw new LocalStateChangedError(file.path);
+        }
+        const verifiedFile = {
+          ...file,
+          contentHash: hashed.contentHash,
+        };
+        files.push(verifiedFile);
+        options.retryHashMemo?.set(file.path, verifiedFile);
+        finishHash(file, hashedBytes);
+        continue;
+      }
+      await this.options.yieldDuringHashing?.();
       const content = await this.options.local.read(file.path);
       const current = await this.options.local.stat(file.path);
       if (
@@ -2047,7 +2093,7 @@ export class SyncService {
       };
       files.push(verifiedFile);
       options.retryHashMemo?.set(file.path, verifiedFile);
-      reportHashed(file, file.size);
+      finishHash(file, 0);
     }
     return {
       files,

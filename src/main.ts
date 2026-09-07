@@ -8,11 +8,13 @@ import {
 import { VaultCrypto } from "./crypto/vault-crypto";
 import { RemotelySaveMigration } from "./migration/remotely-save-migration";
 import { CredentialStore, type AwsCredentials } from "./plugin/credential-store";
+import { createCooperativeYield } from "./plugin/cooperative-yield";
 import { StatusModal, VersionHistoryModal } from "./plugin/modals";
 import { ObsidianVaultPort, isInSyncScope } from "./plugin/obsidian-vault-port";
 import { SerializedDataWriter } from "./plugin/serialized-data-writer";
 import { automaticMobileFileLimit } from "./plugin/mobile-file-limit";
 import { formatSyncProgress } from "./plugin/sync-progress";
+import { SyncProgressThrottle } from "./plugin/sync-progress-throttle";
 import {
   DEFAULT_SETTINGS,
   S3VaultSyncSettingsTab,
@@ -31,7 +33,10 @@ import {
 } from "./sync/sync-service";
 import { DirtyPathTracker } from "./sync/dirty-path-tracker";
 import { LocalStateChangedError } from "./sync/errors";
-import { isFullHashVerificationDue } from "./sync/full-hash-verification-policy";
+import {
+  isFullHashVerificationDue,
+  normalizeFullHashVerificationIntervalDays,
+} from "./sync/full-hash-verification-policy";
 import type {
   BulkDeletionPlan,
   ConflictedEntry,
@@ -122,6 +127,8 @@ export default class S3VaultSyncPlugin
   private readonly syncRequests = new SyncRequestQueue((options) =>
     this.performSync(options),
   );
+  private readonly syncProgressThrottle = new SyncProgressThrottle();
+  private readonly yieldDuringHashing = createCooperativeYield();
   private status: PluginStatus = "Not configured";
   private statusDetail = "Enter AWS settings and a Vault password.";
   private statusElement: HTMLElement | undefined;
@@ -148,6 +155,13 @@ export default class S3VaultSyncPlugin
       },
       id: "sync-now",
       name: "Sync now",
+    });
+    this.addCommand({
+      callback: () => {
+        void this.verifyAllFiles();
+      },
+      id: "run-full-integrity-check",
+      name: "Run full integrity check",
     });
     this.addCommand({
       callback: () => {
@@ -479,6 +493,10 @@ export default class S3VaultSyncPlugin
   }
 
   async syncNow(): Promise<void> {
+    return this.requestSync();
+  }
+
+  async verifyAllFiles(): Promise<void> {
     return this.requestSync({ fullHashVerification: true });
   }
 
@@ -534,6 +552,7 @@ export default class S3VaultSyncPlugin
       remote,
       onProgress: (progress) => this.updateSyncProgress(progress),
       replicaId: this.data.settings.replicaId,
+      yieldDuringHashing: this.yieldDuringHashing,
     });
   }
 
@@ -556,13 +575,18 @@ export default class S3VaultSyncPlugin
 
   private async loadPluginData(): Promise<void> {
     const stored = (await this.loadData()) as Partial<PersistedPluginData> | null;
+    const settings = { ...DEFAULT_SETTINGS, ...stored?.settings };
+    settings.fullHashVerificationIntervalDays =
+      normalizeFullHashVerificationIntervalDays(
+        settings.fullHashVerificationIntervalDays,
+      );
     this.data = {
       cache: stored?.cache,
       fullHashVerificationRequired:
         stored?.fullHashVerificationRequired ?? false,
       lastFullHashVerificationAt: stored?.lastFullHashVerificationAt,
       pendingPathRenames: stored?.pendingPathRenames ?? {},
-      settings: { ...DEFAULT_SETTINGS, ...stored?.settings },
+      settings,
     };
     this.pathRenames = new PathRenameTracker(this.data.pendingPathRenames);
     if (!this.data.settings.replicaId) {
@@ -591,12 +615,18 @@ export default class S3VaultSyncPlugin
     const pathRenameSnapshot = this.pathRenames.capture();
     const fullHashVerification =
       requestedFullHashVerification ||
-      isFullHashVerificationDue(
-        this.data.lastFullHashVerificationAt,
-        this.data.cache !== undefined,
-        Date.now(),
-        this.data.fullHashVerificationRequired === true,
-      );
+      (document.visibilityState === "visible" &&
+        isFullHashVerificationDue(
+          this.data.lastFullHashVerificationAt,
+          this.data.cache !== undefined,
+          Date.now(),
+          this.data.fullHashVerificationRequired === true,
+          this.data.settings.fullHashVerificationIntervalDays *
+            24 *
+            60 *
+            60 *
+            1_000,
+        ));
     try {
       if (
         fullHashVerification &&
@@ -843,11 +873,8 @@ export default class S3VaultSyncPlugin
   private requestSync(
     options: SyncRequestOptions = {},
   ): Promise<void> {
-    const fullHashVerification =
-      options.fullHashVerification === true ||
-      this.data.fullHashVerificationRequired === true;
     this.clearHeadRetryTimer();
-    return this.syncRequests.request({ ...options, fullHashVerification });
+    return this.syncRequests.request(options);
   }
 
   private setStatus(
@@ -855,6 +882,9 @@ export default class S3VaultSyncPlugin
     detail: string,
     progressLabel?: string,
   ): void {
+    if (status !== "Syncing") {
+      this.syncProgressThrottle.reset();
+    }
     this.status = status;
     this.statusDetail = detail;
     this.progressLabel = progressLabel;
@@ -875,6 +905,9 @@ export default class S3VaultSyncPlugin
   }
 
   private updateSyncProgress(progress: SyncProgress): void {
+    if (!this.syncProgressThrottle.shouldRender(progress, performance.now())) {
+      return;
+    }
     const formatted = formatSyncProgress(progress);
     this.setStatus("Syncing", formatted.detail, formatted.label);
   }

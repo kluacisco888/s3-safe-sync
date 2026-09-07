@@ -8,11 +8,17 @@ import {
 } from "obsidian";
 
 import type { AwsCredentials } from "./credential-store";
+import {
+  DEFAULT_FULL_HASH_VERIFICATION_INTERVAL_DAYS,
+  SUPPORTED_FULL_HASH_VERIFICATION_INTERVAL_DAYS,
+  normalizeFullHashVerificationIntervalDays,
+} from "../sync/full-hash-verification-policy";
 
 export interface S3VaultSyncSettings {
   bucket: string;
   confirmedRemotelySaveDisabled: boolean;
   deviceName: string;
+  fullHashVerificationIntervalDays: number;
   paused: boolean;
   prefix: string;
   region: string;
@@ -25,6 +31,8 @@ export const DEFAULT_SETTINGS: S3VaultSyncSettings = {
   bucket: "",
   confirmedRemotelySaveDisabled: false,
   deviceName: "My device",
+  fullHashVerificationIntervalDays:
+    DEFAULT_FULL_HASH_VERIFICATION_INTERVAL_DAYS,
   paused: false,
   prefix: "obs-sync",
   region: "us-east-1",
@@ -48,6 +56,7 @@ export interface SettingsController {
   saveAwsCredentials(credentials: AwsCredentials): Promise<void>;
   saveSettings(): Promise<void>;
   syncNow(): Promise<void>;
+  verifyAllFiles(): Promise<void>;
 }
 
 const asPasswordInput = (component: TextComponent): TextComponent => {
@@ -180,9 +189,37 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
         }),
       );
 
+    new Setting(containerEl)
+      .setName("Full integrity check interval")
+      .setDesc(
+        "Automatic sync remains incremental. This interval controls how often every eligible file is read and hashed.",
+      )
+      .addDropdown((dropdown) => {
+        for (const days of SUPPORTED_FULL_HASH_VERIFICATION_INTERVAL_DAYS) {
+          dropdown.addOption(
+            String(days),
+            days === 1 ? "Every day" : `Every ${days} days`,
+          );
+        }
+        return dropdown
+          .setValue(
+            String(
+              normalizeFullHashVerificationIntervalDays(
+                settings.fullHashVerificationIntervalDays,
+              ),
+            ),
+          )
+          .onChange(async (value) => {
+            settings.fullHashVerificationIntervalDays =
+              normalizeFullHashVerificationIntervalDays(Number(value));
+            await this.controller.saveSettings();
+          });
+      });
+
     const syncDescription =
       "Checks the encrypted remote Head and reconciles this device.";
     let manualSyncRunning = false;
+    let fullVerificationRunning = false;
     let syncButton: ButtonComponent | undefined;
     const syncSetting = new Setting(containerEl)
       .setName("Sync now")
@@ -191,12 +228,31 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
         syncButton = button;
         button.setButtonText("Sync now").onClick(async () => {
           manualSyncRunning = true;
-          button.setDisabled(true);
           renderStatus();
           try {
             await this.controller.syncNow();
           } finally {
             manualSyncRunning = false;
+            this.display();
+          }
+        });
+      });
+
+    let fullVerificationButton: ButtonComponent | undefined;
+    const fullVerificationSetting = new Setting(containerEl)
+      .setName("Full integrity check")
+      .setDesc(
+        "Reads and hashes every eligible file. This can take a long time for large Vaults.",
+      )
+      .addButton((button) => {
+        fullVerificationButton = button;
+        button.setButtonText("Check all files").onClick(async () => {
+          fullVerificationRunning = true;
+          renderStatus();
+          try {
+            await this.controller.verifyAllFiles();
+          } finally {
+            fullVerificationRunning = false;
             this.display();
           }
         });
@@ -214,6 +270,18 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
         syncSetting.setDesc(status);
         syncButton.setButtonText(progressLabel ?? "Syncing…");
       }
+      if (fullVerificationRunning && fullVerificationButton) {
+        fullVerificationSetting.setDesc(status);
+        fullVerificationButton.setButtonText(
+          progressLabel ?? "Checking all files…",
+        );
+      }
+      syncButton?.setDisabled(
+        manualSyncRunning || fullVerificationRunning,
+      );
+      fullVerificationButton?.setDisabled(
+        manualSyncRunning || fullVerificationRunning,
+      );
     };
     this.stopStatusUpdates = this.controller.onStatusChange(renderStatus);
   }
