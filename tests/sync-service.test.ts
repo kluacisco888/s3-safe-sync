@@ -1766,6 +1766,33 @@ describe("SyncService", () => {
     expect(yieldCount).toBe(0);
   });
 
+  it("does not publish a new Head for a no-op full verification", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const local = new MemoryVault();
+    await local.write("notes/example.md", new TextEncoder().encode("stable"));
+    const service = new SyncService({
+      cache: new MemorySyncCache(),
+      local,
+      remote,
+      replicaId: "desktop",
+    });
+    await service.initializeNew("vault-1");
+    const initialHead = await remote.readHead();
+
+    const result = await service.synchronize([], {
+      fullHashVerification: true,
+    });
+
+    expect(result).toMatchObject({ status: "complete", uploaded: 0 });
+    await expect(remote.readHead()).resolves.toEqual(initialHead);
+  });
+
   it("hashes a dirty path even when its size and modified time are unchanged", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);

@@ -32,6 +32,10 @@ export class SyncRequestQueue {
     return this.running;
   }
 
+  requestIfIdle(): Promise<void> {
+    return this.running ?? this.request();
+  }
+
   runExclusive<T>(operation: () => Promise<T>): Promise<T> {
     const run = this.exclusiveTail.then(operation, operation);
     this.exclusiveTail = run.then(

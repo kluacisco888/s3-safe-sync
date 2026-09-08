@@ -86,6 +86,43 @@ describe("SyncRequestQueue", () => {
     });
   });
 
+  it("does not queue a periodic poll while synchronization is already active", async () => {
+    let finishSync: (() => void) | undefined;
+    const run = vi
+      .fn<(options: SyncRunOptions) => Promise<void>>()
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finishSync = resolve;
+          }),
+      );
+    const queue = new SyncRequestQueue(run);
+
+    const activeSync = queue.request();
+    await Promise.resolve();
+    const periodicPolls = Array.from({ length: 10 }, () =>
+      queue.requestIfIdle(),
+    );
+    finishSync?.();
+    await Promise.all([activeSync, ...periodicPolls]);
+
+    expect(run).toHaveBeenCalledOnce();
+    expect(queue.isRunning).toBe(false);
+  });
+
+  it("runs a periodic poll when synchronization is idle", async () => {
+    const run = vi.fn(async () => undefined);
+    const queue = new SyncRequestQueue(run);
+
+    await queue.requestIfIdle();
+
+    expect(run).toHaveBeenCalledOnce();
+    expect(run).toHaveBeenCalledWith({
+      allowBulkDeletion: false,
+      fullHashVerification: false,
+    });
+  });
+
   it("serializes direct operations with queued synchronization", async () => {
     const events: string[] = [];
     let releaseDirect = (): void => undefined;

@@ -20,6 +20,9 @@ const formatBytes = (bytes: number): string => {
   return `${value.toFixed(digits)} ${units[unitIndex]}`;
 };
 
+export const formatStatusBarText = (detail: string): string =>
+  `S3 Sync: ${detail}`;
+
 export const formatSyncProgress = (
   progress: SyncProgress,
 ): { detail: string; label: string } => {

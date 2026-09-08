@@ -13,7 +13,10 @@ import { StatusModal, VersionHistoryModal } from "./plugin/modals";
 import { ObsidianVaultPort, isInSyncScope } from "./plugin/obsidian-vault-port";
 import { SerializedDataWriter } from "./plugin/serialized-data-writer";
 import { automaticMobileFileLimit } from "./plugin/mobile-file-limit";
-import { formatSyncProgress } from "./plugin/sync-progress";
+import {
+  formatStatusBarText,
+  formatSyncProgress,
+} from "./plugin/sync-progress";
 import { SyncProgressThrottle } from "./plugin/sync-progress-throttle";
 import {
   DEFAULT_SETTINGS,
@@ -199,13 +202,18 @@ export default class S3VaultSyncPlugin
     this.registerInterval(
       window.setInterval(() => {
         if (!this.data.settings.paused && document.visibilityState === "visible") {
-          void this.requestAutomaticSync();
+          void this.requestPeriodicSync();
         }
       }, 120_000),
     );
     this.registerDomEvent(document, "visibilitychange", () => {
-      if (!this.data.settings.paused) {
-        void this.requestAutomaticSync();
+      if (this.data.settings.paused) {
+        return;
+      }
+      if (document.visibilityState === "visible") {
+        void this.requestPeriodicSync();
+      } else {
+        this.requestFinalSync();
       }
     });
     this.registerDomEvent(window, "pagehide", () => {
@@ -870,6 +878,13 @@ export default class S3VaultSyncPlugin
     return this.requestSync();
   }
 
+  private requestPeriodicSync(): Promise<void> {
+    if (this.headRetryTimer !== undefined) {
+      return Promise.resolve();
+    }
+    return this.syncRequests.requestIfIdle();
+  }
+
   private requestSync(
     options: SyncRequestOptions = {},
   ): Promise<void> {
@@ -888,7 +903,7 @@ export default class S3VaultSyncPlugin
     this.status = status;
     this.statusDetail = detail;
     this.progressLabel = progressLabel;
-    this.statusElement?.setText(`S3 Sync: ${progressLabel ? detail : status}`);
+    this.statusElement?.setText(formatStatusBarText(detail));
     this.statusElement?.setAttr("aria-label", this.getStatusText());
     this.statusElement?.setAttr("title", this.getStatusText());
     this.statusElement?.toggleClass(
