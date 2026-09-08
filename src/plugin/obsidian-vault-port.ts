@@ -70,14 +70,15 @@ export class ObsidianVaultPort implements LocalVaultPort {
     }
     await this.ensureRecovered();
     this.assertActive();
-    await withVaultMutationLock(this.vault.adapter, () =>
-      deleteVaultPath(
+    await withVaultMutationLock(this.vault.adapter, () => {
+      this.assertActive();
+      return deleteVaultPath(
         this.vault,
         normalizePath(path),
         (candidate) => candidate instanceof TFile,
         expectedContentHash,
-      ),
-    );
+      );
+    });
   }
 
   async list(): Promise<LocalFileInfo[]> {
@@ -263,6 +264,8 @@ export class ObsidianVaultPort implements LocalVaultPort {
       normalized,
       body,
       expectedCurrentHash,
+      undefined,
+      this.assertActive,
     );
   }
 

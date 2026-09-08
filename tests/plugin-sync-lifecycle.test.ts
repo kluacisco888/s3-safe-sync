@@ -48,6 +48,8 @@ import { DEFAULT_SETTINGS } from "../src/plugin/settings";
 import { AwsS3ObjectStore } from "../src/storage/aws-s3-object-store";
 import { executeObsidianHttpRequest } from "../src/storage/obsidian-http";
 import { RemoteStore } from "../src/storage/remote-store";
+import { ObsidianVaultPort } from "../src/plugin/obsidian-vault-port";
+import { withVaultMutationLock } from "../src/plugin/safe-vault-write";
 
 const setup = async (initialized = true) => {
   vi.useFakeTimers();
@@ -63,6 +65,7 @@ const setup = async (initialized = true) => {
     beforeBlobRead?: () => void;
     headFailure?: "network" | "corrupt";
     failNextBlobPut?: boolean;
+    afterProbePut?: () => void;
   } = {};
   host.requestUrl.mockImplementation(async (request: {
     url: string; method: string; body?: ArrayBuffer; headers: Record<string, string>;
@@ -105,6 +108,7 @@ const setup = async (initialized = true) => {
     } else {
       throw new Error(`Unexpected request method: ${request.method}`);
     }
+    if (request.method === "PUT" && key.includes(".s3-vault-sync-probe-")) hooks.afterProbePut?.();
     return {
       arrayBuffer: body.slice().buffer,
       headers: { date: new Date().toUTCString(), "last-modified": new Date().toUTCString(), ...(etag ? { etag } : {}) },
@@ -196,6 +200,50 @@ afterEach(() => {
 });
 
 describe("plugin synchronization lifecycle", () => {
+  it("does not delete after its session stops while waiting for a mutation lock", async () => {
+    const { app } = await setup();
+    const trash = vi.fn(async () => {});
+    app.vault.trash = trash;
+    let release!: () => void;
+    let acquired!: () => void;
+    const locked = new Promise<void>(resolve => { acquired = resolve; });
+    const holding = withVaultMutationLock(app.vault.adapter, () => new Promise<void>(resolve => { release = resolve; acquired(); }));
+    await locked;
+    let stopped = false;
+    const local = new ObsidianVaultPort(app.vault, () => { if (stopped) throw new Error("stopped"); });
+    const deleting = local.delete("notes/example.md");
+    await vi.advanceTimersByTimeAsync(1);
+    stopped = true;
+    release();
+    await holding;
+    await expect(deleting).rejects.toThrow("stopped");
+    expect(trash).not.toHaveBeenCalled();
+  });
+
+  it("does not remove an unowned probe-like object to make a prefix appear empty", async () => {
+    const { plugin, objects } = await setup(false);
+    const key = "test-prefix/.s3-vault-sync-probe-00000000-0000-4000-8000-000000000000";
+    const original = { body: new TextEncoder().encode("user-owned object"), etag: "user-etag" };
+    objects.set(key, original);
+    await expect(plugin.initializeOrUnlock("test-password")).rejects.toThrow("prefix is not empty");
+    expect(objects.get(key)).toEqual(original);
+  });
+
+  it("recovers its probe when unload interrupts an accepted conditional PUT", async () => {
+    const { plugin, hooks, app, objects } = await setup(false);
+    hooks.afterProbePut = () => {
+      hooks.afterProbePut = undefined;
+      plugin.onunload();
+    };
+    await expect(plugin.initializeOrUnlock("test-password")).rejects.toThrow("stopped");
+    expect([...objects.keys()].some(key => key.includes(".s3-vault-sync-probe-"))).toBe(true);
+    const replacement = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
+    await replacement.onload();
+    await expect(replacement.initializeOrUnlock("test-password")).resolves.toBeUndefined();
+    expect(objects.has("test-prefix/v1/head")).toBe(true);
+    expect([...objects.keys()].some(key => key.includes(".s3-vault-sync-probe-"))).toBe(false);
+  });
+
   it.each(["bucket", "region", "prefix"] as const)("does not bind a changed %s after initialization starts", async field => {
     const { plugin, hooks, objects } = await setup(false);
     hooks.beforeBlobRead = () => {

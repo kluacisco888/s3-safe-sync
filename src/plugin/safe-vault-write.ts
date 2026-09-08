@@ -214,12 +214,15 @@ export const safeReplaceVaultFile = async (
   body: Uint8Array,
   expectedCurrentHash: string | null | undefined,
   createId: () => string = () => crypto.randomUUID(),
+  assertActive: () => void = () => undefined,
 ): Promise<void> => {
   if (!isSafeTargetPath(targetPath)) {
     throw new Error(`Refusing to write an unsafe Vault path: ${targetPath}`);
   }
   return withVaultMutationLock(adapter, async () => {
+    assertActive();
     await recoverPendingVaultWritesUnlocked(adapter);
+    assertActive();
     if (!(await adapter.exists(STAGING_DIRECTORY))) {
       await adapter.mkdir(STAGING_DIRECTORY);
     }

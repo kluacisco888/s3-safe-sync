@@ -57,7 +57,7 @@ import {
 import { AwsS3ObjectStore } from "./storage/aws-s3-object-store";
 import { BootstrapStore } from "./storage/bootstrap-store";
 import { executeObsidianHttpRequest } from "./storage/obsidian-http";
-import { probeObjectStore } from "./storage/object-store-probe";
+import { isProbeObjectKey, probeObjectStore } from "./storage/object-store-probe";
 import {
   HeadChangedError,
   RemoteStateError,
@@ -92,6 +92,7 @@ interface PersistedPluginData {
     vaultId: string;
     phase: "uploading" | "publishing";
   };
+  pendingProbes?: Array<{ bucket: string; region: string; prefix: string; key: string }>;
   settings: S3VaultSyncSettings;
 }
 
@@ -408,6 +409,11 @@ export default class S3VaultSyncPlugin
       assertTarget();
       const objects = this.createObjectStore();
       const prefix = normalizePrefix(this.data.settings.prefix);
+      const ownedProbeKeys = new Set((this.data.pendingProbes ?? [])
+        .filter(probe => probe.bucket === bucket && probe.region === region && probe.prefix === prefix &&
+          isProbeObjectKey(probe.key, prefix))
+        .map(probe => probe.key));
+      for (const key of ownedProbeKeys) await objects.delete(key);
       const bootstrap = new BootstrapStore(objects, prefix);
       const existing = await bootstrap.read();
       const isNewRemote = existing === undefined;
@@ -426,7 +432,7 @@ export default class S3VaultSyncPlugin
         vaultKey = await VaultCrypto.unwrapKey(password, existing.envelope);
       } else {
         const existingKeys = await objects.list(prefix ? `${prefix}/` : "");
-        if (existingKeys.length > 0) {
+        if (existingKeys.some(key => !ownedProbeKeys.has(key))) {
           throw new Error("The selected S3 prefix is not empty");
         }
         const legacyPrefix = normalizePrefix(
@@ -461,7 +467,11 @@ export default class S3VaultSyncPlugin
             );
           }
         }
-        await probeObjectStore(objects, prefix);
+        await probeObjectStore(objects, prefix, async key => {
+          ownedProbeKeys.add(key);
+          this.data.pendingProbes = [...(this.data.pendingProbes ?? []), { bucket, region, prefix, key }];
+          await this.savePluginData();
+        });
         vaultId = crypto.randomUUID();
         vaultKey = VaultCrypto.generateVaultKey();
         this.data.pendingInitialization = {
@@ -517,6 +527,8 @@ export default class S3VaultSyncPlugin
       this.credentials.saveVaultKey(vaultKey);
       this.data.settings.vaultId = vaultId;
       this.data.pendingInitialization = undefined;
+      this.data.pendingProbes = (this.data.pendingProbes ?? []).filter(probe =>
+        !(probe.bucket === bucket && probe.region === region && probe.prefix === prefix && ownedProbeKeys.has(probe.key)));
       await this.savePluginData();
       this.setStatus("Idle", "Encrypted Remote Store is ready.");
       new Notice("S3 Vault Sync is ready");
@@ -651,6 +663,7 @@ export default class S3VaultSyncPlugin
       lastFullHashVerificationAt: stored?.lastFullHashVerificationAt,
       pendingPathRenames: stored?.pendingPathRenames ?? {},
       pendingInitialization: stored?.pendingInitialization,
+      pendingProbes: stored?.pendingProbes ?? [],
       settings,
     };
     this.pathRenames = new PathRenameTracker(this.data.pendingPathRenames);

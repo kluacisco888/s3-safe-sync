@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   recoverPendingVaultWrites,
   safeReplaceVaultFile,
+  withVaultMutationLock,
   type SafeWriteAdapter,
 } from "../src/plugin/safe-vault-write";
 
@@ -141,6 +142,25 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
 }
 
 describe("safeReplaceVaultFile", () => {
+  it("does not start a stopped write after waiting for the mutation lock", async () => {
+    const adapter = new MemorySafeWriteAdapter();
+    adapter.files.set("notes/example.md", bytes("before"));
+    let release!: () => void;
+    let acquired!: () => void;
+    const locked = new Promise<void>(resolve => { acquired = resolve; });
+    const holding = withVaultMutationLock(adapter, () => new Promise<void>(resolve => { release = resolve; acquired(); }));
+    await locked;
+    let stopped = false;
+    const writing = safeReplaceVaultFile(adapter, "notes/example.md", bytes("after"), undefined,
+      () => "stopped-write", () => { if (stopped) throw new Error("stopped"); });
+    stopped = true;
+    release();
+    await holding;
+    await expect(writing).rejects.toThrow("stopped");
+    expect(new TextDecoder().decode(adapter.files.get("notes/example.md"))).toBe("before");
+    expect(adapter.calls.some(call => call.startsWith("write"))).toBe(false);
+  });
+
   it.each([
     ["Obsidian configuration", ".obsidian/plugins/example.md"],
     ["an absolute path", "/notes/example.md"],
