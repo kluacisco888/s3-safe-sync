@@ -1,6 +1,6 @@
 {
   "name": "s3-vault-sync",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Synchronize Obsidian Vault files through Amazon S3 with end-to-end encryption and deletion-safe history.",
   "main": "main.js",
   "type": "module",
