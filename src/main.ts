@@ -398,11 +398,14 @@ export default class S3VaultSyncPlugin
   }
 
   private async initializeOrUnlockExclusive(password: string): Promise<void> {
+    const assertTarget = this.captureTargetGuard();
+    const { bucket, region } = this.data.settings;
     try {
       if (!password) {
         throw new Error("Enter the Vault password first");
       }
       this.setStatus("Checking", "Checking S3 and the encrypted Remote Store.");
+      assertTarget();
       const objects = this.createObjectStore();
       const prefix = normalizePrefix(this.data.settings.prefix);
       const bootstrap = new BootstrapStore(objects, prefix);
@@ -462,8 +465,8 @@ export default class S3VaultSyncPlugin
         vaultId = crypto.randomUUID();
         vaultKey = VaultCrypto.generateVaultKey();
         this.data.pendingInitialization = {
-          bucket: this.data.settings.bucket,
-          region: this.data.settings.region,
+          bucket,
+          region,
           prefix,
           vaultId,
           phase: "uploading",
@@ -509,6 +512,8 @@ export default class S3VaultSyncPlugin
         this.data.pendingPathRenames = {};
         this.pathRenames = new PathRenameTracker();
       }
+      assertTarget();
+      this.session.assertActive();
       this.credentials.saveVaultKey(vaultKey);
       this.data.settings.vaultId = vaultId;
       this.data.pendingInitialization = undefined;
@@ -558,6 +563,7 @@ export default class S3VaultSyncPlugin
   }
 
   private createObjectStore(): AwsS3ObjectStore {
+    const assertTarget = this.captureTargetGuard();
     const { bucket, region } = this.data.settings;
     const credentials = this.credentials.loadAwsCredentials();
     if (!bucket || !region || !this.data.settings.prefix) {
@@ -574,8 +580,10 @@ export default class S3VaultSyncPlugin
         : undefined,
       execute: async (request) => {
         this.session.assertActive();
+        assertTarget();
         const response = await executeObsidianHttpRequest(request, this.session.signal);
         this.session.assertActive();
+        assertTarget();
         return response;
       },
       region,
@@ -588,17 +596,22 @@ export default class S3VaultSyncPlugin
   private createSyncService(
     remote: RemoteStore,
   ): SyncService {
+    const assertTarget = this.captureTargetGuard();
     const cache: SyncCachePort = {
       load: () => Promise.resolve(this.data.cache),
       save: async (state) => {
         this.session.assertActive();
+        assertTarget();
         this.data.cache = state;
         await this.savePluginData();
       },
     };
     return new SyncService({
       cache,
-      local: new ObsidianVaultPort(this.app.vault, () => this.session.assertActive()),
+      local: new ObsidianVaultPort(this.app.vault, () => {
+        this.session.assertActive();
+        assertTarget();
+      }),
       maxAutomaticFileBytes: mobileAutomaticFileLimit,
       remote,
       onProgress: (progress) => this.updateSyncProgress(progress),
@@ -645,6 +658,17 @@ export default class S3VaultSyncPlugin
       this.data.settings.replicaId = crypto.randomUUID();
       await this.savePluginData();
     }
+  }
+
+  private captureTargetGuard(): () => void {
+    const { bucket, region, prefix } = this.data.settings;
+    return () => {
+      const current = this.data.settings;
+      if (current.bucket !== bucket || current.region !== region ||
+          normalizePrefix(current.prefix) !== normalizePrefix(prefix)) {
+        throw new Error("S3 target changed during synchronization. Check the target and retry.");
+      }
+    };
   }
 
   private async performSync({

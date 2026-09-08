@@ -196,6 +196,20 @@ afterEach(() => {
 });
 
 describe("plugin synchronization lifecycle", () => {
+  it.each(["bucket", "region", "prefix"] as const)("does not bind a changed %s after initialization starts", async field => {
+    const { plugin, hooks, objects } = await setup(false);
+    hooks.beforeBlobRead = () => {
+      hooks.beforeBlobRead = undefined;
+      plugin.getSettings()[field] += "-changed";
+    };
+    await expect(plugin.initializeOrUnlock("test-password")).rejects.toThrow("S3 target changed");
+    expect(plugin.getSettings().vaultId).toBeUndefined();
+    expect(objects.has("test-prefix/v1/head")).toBe(false);
+    expect(host.data).toMatchObject({ pendingInitialization: {
+      bucket: "test-bucket", region: "us-east-1", prefix: "test-prefix", phase: "uploading",
+    } });
+  });
+
   it("does not register an instance unloaded while its settings were loading", async () => {
     const { plugin, app } = await setup();
     plugin.onunload();
