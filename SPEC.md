@@ -35,7 +35,7 @@ The user chooses an empty S3 prefix. All identifiers below are opaque or fixed p
 <prefix>/v1/audits/<random-id>
 ```
 
-Immutable objects use `If-None-Match: *`. Head uses `If-Match` with its previously read ETag, or `If-None-Match: *` during initialization. A rejected Head write reloads and reconciles instead of overwriting, using jittered exponential backoff and a bounded automatic retry schedule so concurrent Replicas do not remain in a sticky error state.
+Immutable objects use `If-None-Match: *`. Head uses `If-Match` with its previously read ETag, or `If-None-Match: *` during initialization. Mutable Head reads bypass intermediary caches, and response ETags are normalized to an HTTP entity tag before reuse in conditional requests. A rejected Head write reloads and reconciles instead of overwriting, using jittered exponential backoff and a bounded automatic retry schedule so concurrent Replicas do not remain in a sticky error state.
 
 ## State model
 
@@ -72,6 +72,7 @@ Paths, hashes, entry metadata, deletion records, conflicts, commits, snapshots, 
 - Dirty paths carry monotonic in-memory versions. A completed run acknowledges only the event versions it captured, so an edit that arrives during synchronization always remains queued for a follow-up run. Pending Path Renames and an incomplete Full Hash Verification are persisted across restart.
 - All writes to the device-local plugin data file are serialized. Each queued write snapshots the latest cache, verification, and rename state only when it starts, so an older slow write cannot finish last and replace newer evidence.
 - A missing, unauthenticated, or dangling Head enters read-only Repair Mode.
+- A transport failure while authenticating a Recovery Copy is reported as that transport failure and never reclassified as proof that the copy is missing. Only missing, unauthenticated, or hash-mismatched copies produce the recovery-integrity action state, which identifies the affected Vault path.
 - S3 capability probes verify conditional create/update, read, list, and delete before initialization.
 - S3 Versioning and a 30-day noncurrent-version lifecycle are an independent safety layer.
 - Physical expiry cleanup is disabled during Beta. Before it is enabled, expiration must create an accepted cleanup decision followed by at least 24 hours of grace before physical deletion.

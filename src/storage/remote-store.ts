@@ -336,7 +336,14 @@ export class RemoteStore {
     if (!stored) {
       return undefined;
     }
-    return this.cipher.decryptData(stored.body);
+    try {
+      return await this.cipher.decryptData(stored.body);
+    } catch (error) {
+      throw new RemoteStateError(
+        `Remote Blob ${blobId} cannot be authenticated`,
+        error,
+      );
+    }
   }
 
   async readCommit(commitId: string): Promise<CommitRecord | undefined> {

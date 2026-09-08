@@ -8,6 +8,51 @@ import {
 import { ObjectPreconditionError } from "../src/storage/object-store";
 
 describe("AwsS3ObjectStore", () => {
+  it("bypasses a cached Head read and normalizes its ETag before a conditional write", async () => {
+    const store = new AwsS3ObjectStore({
+      accessKeyId: "AKIDEXAMPLE",
+      bucket: "example-bucket",
+      execute: async (request): Promise<HttpResponseOutput> => {
+        if (request.method === "GET") {
+          const fresh = request.headers["cache-control"] === "no-cache";
+          return {
+            body: new TextEncoder().encode(fresh ? "current" : "stale"),
+            headers: {
+              date: "Sat, 05 Sep 2026 00:00:00 GMT",
+              etag: fresh ? "current-etag" : "stale-etag",
+              "last-modified": "Sat, 05 Sep 2026 00:00:00 GMT",
+            },
+            status: 200,
+          };
+        }
+        if (request.method === "PUT") {
+          return {
+            body: new Uint8Array(),
+            headers: {
+              date: "Sat, 05 Sep 2026 00:00:01 GMT",
+              etag: "next-etag",
+            },
+            status:
+              request.headers["if-match"] === '"current-etag"' ? 200 : 412,
+          };
+        }
+        throw new Error(`Unexpected request: ${request.method}`);
+      },
+      region: "us-east-1",
+      secretAccessKey: "secret-example",
+    });
+
+    const current = await store.get("chosen-prefix/v1/head");
+    expect(new TextDecoder().decode(current?.body)).toBe("current");
+    expect(current?.etag).toBe('"current-etag"');
+
+    await expect(
+      store.put("chosen-prefix/v1/head", new TextEncoder().encode("next"), {
+        ifMatch: current?.etag,
+      }),
+    ).resolves.toMatchObject({ etag: '"next-etag"' });
+  });
+
   it("uploads a large S3 object through bounded multipart requests", async () => {
     const partBytes = 5 * 1024 * 1024;
     const source = new Uint8Array(partBytes * 2 + 3);

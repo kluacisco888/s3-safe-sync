@@ -1507,8 +1507,65 @@ describe("SyncService", () => {
       new TextEncoder().encode("corrupted ciphertext"),
     );
 
-    await expect(phone.synchronize()).rejects.toThrow(
+    const synchronization = phone.synchronize();
+    await expect(synchronization).rejects.toThrow(
       "No authenticated remote recovery exists",
+    );
+    await expect(synchronization).rejects.toThrow("notes/example.md");
+
+    expect(phoneVault.readText("notes/example.md")).toBe("v1");
+  });
+
+  it("reports a recovery read network failure without claiming the copy is missing", async () => {
+    const objects = new MemoryObjectStore();
+    const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const desktopRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const phoneRemote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey,
+    });
+    const desktopVault = new MemoryVault();
+    const phoneVault = new MemoryVault();
+    await desktopVault.write("notes/example.md", new TextEncoder().encode("v1"));
+    const desktop = new SyncService({
+      cache: new MemorySyncCache(),
+      local: desktopVault,
+      remote: desktopRemote,
+      replicaId: "desktop",
+    });
+    const phone = new SyncService({
+      cache: new MemorySyncCache(),
+      local: phoneVault,
+      remote: phoneRemote,
+      replicaId: "phone",
+    });
+    await desktop.initializeNew("vault-1");
+    await phone.synchronize();
+    const initialHead = await desktopRemote.readHead();
+    if (!initialHead) {
+      throw new Error("Expected initialized Head");
+    }
+    const initial = await desktopRemote.readSnapshot(initialHead.value);
+    const first = Object.values(initial.entries)[0];
+    if (first?.kind !== "live") {
+      throw new Error("Expected first live Revision");
+    }
+    await desktopVault.write("notes/example.md", new TextEncoder().encode("v2"));
+    await desktop.synchronize();
+    objects.onGet = (key) => {
+      if (key.endsWith(`/blobs/${first.revision.blobId}`)) {
+        objects.onGet = undefined;
+        throw new Error("temporary recovery read network failure");
+      }
+    };
+
+    await expect(phone.synchronize()).rejects.toThrow(
+      "temporary recovery read network failure",
     );
 
     expect(phoneVault.readText("notes/example.md")).toBe("v1");

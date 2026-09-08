@@ -76,6 +76,14 @@ const requiredHeader = (
   return value;
 };
 
+const requiredEntityTag = (headers: Record<string, string>): string => {
+  const value = requiredHeader(headers, "etag").trim();
+  if (!value) {
+    throw new Error("AWS S3 returned an empty ETag");
+  }
+  return /^(?:W\/)?".*"$/u.test(value) ? value : `"${value}"`;
+};
+
 const parseContentRange = (
   value: string,
 ): { end: number; start: number; total: number } => {
@@ -184,8 +192,16 @@ export class AwsS3ObjectStore implements ObjectStore {
 
   async get(key: string): Promise<StoredObject | undefined> {
     const path = encodeKeyPath(key);
+    const freshReadHeaders: Record<string, string> = key.endsWith("/v1/head")
+      ? { "cache-control": "no-cache" }
+      : {};
     if (this.downloadChunkBytes === undefined) {
-      const response = await this.request("GET", path);
+      const response = await this.request(
+        "GET",
+        path,
+        undefined,
+        freshReadHeaders,
+      );
       if (response.status === 404) {
         return undefined;
       }
@@ -194,12 +210,13 @@ export class AwsS3ObjectStore implements ObjectStore {
       }
       return {
         body: response.body,
-        etag: requiredHeader(response.headers, "etag"),
+        etag: requiredEntityTag(response.headers),
         lastModified: requiredHeader(response.headers, "last-modified"),
         serverDate: requiredHeader(response.headers, "date"),
       };
     }
     const first = await this.request("GET", path, undefined, {
+      ...freshReadHeaders,
       range: `bytes=0-${this.downloadChunkBytes - 1}`,
     });
     if (first.status === 404) {
@@ -208,7 +225,7 @@ export class AwsS3ObjectStore implements ObjectStore {
     if (first.status === 200) {
       return {
         body: first.body,
-        etag: requiredHeader(first.headers, "etag"),
+        etag: requiredEntityTag(first.headers),
         lastModified: requiredHeader(first.headers, "last-modified"),
         serverDate: requiredHeader(first.headers, "date"),
       };
@@ -225,7 +242,7 @@ export class AwsS3ObjectStore implements ObjectStore {
     ) {
       throw new Error(`AWS S3 returned an unexpected first byte range for ${key}`);
     }
-    const etag = requiredHeader(first.headers, "etag");
+    const etag = requiredEntityTag(first.headers);
     const body = new Uint8Array(firstRange.total);
     body.set(first.body, 0);
     let offset = firstRange.end + 1;
@@ -235,6 +252,7 @@ export class AwsS3ObjectStore implements ObjectStore {
         firstRange.total - 1,
       );
       const response = await this.request("GET", path, undefined, {
+        ...freshReadHeaders,
         "if-match": etag,
         range: `bytes=${offset}-${end}`,
       });
@@ -249,7 +267,7 @@ export class AwsS3ObjectStore implements ObjectStore {
         received.end !== end ||
         received.total !== firstRange.total ||
         response.body.byteLength !== end - offset + 1 ||
-        requiredHeader(response.headers, "etag") !== etag
+        requiredEntityTag(response.headers) !== etag
       ) {
         throw new Error(`AWS S3 returned an inconsistent byte range for ${key}`);
       }
@@ -313,7 +331,7 @@ export class AwsS3ObjectStore implements ObjectStore {
     }
     return {
       body: new Uint8Array(),
-      etag: requiredHeader(response.headers, "etag"),
+      etag: requiredEntityTag(response.headers),
       lastModified: requiredHeader(response.headers, "date"),
       serverDate: requiredHeader(response.headers, "date"),
     };
@@ -359,7 +377,7 @@ export class AwsS3ObjectStore implements ObjectStore {
           this.throwResponseError(uploaded, `upload part ${partNumber} of ${key}`);
         }
         parts.push({
-          etag: requiredHeader(uploaded.headers, "etag"),
+          etag: requiredEntityTag(uploaded.headers),
           partNumber,
         });
         partNumber += 1;

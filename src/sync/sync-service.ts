@@ -13,6 +13,7 @@ import {
 import {
   type CommitRecord,
   type HeadRecord,
+  RemoteStateError,
   RemoteStore,
 } from "../storage/remote-store";
 import { LocalStateChangedError } from "./errors";
@@ -1871,12 +1872,15 @@ export class SyncService {
       try {
         await this.assertRemoteRevision(revision);
         return;
-      } catch {
+      } catch (error) {
+        if (!(error instanceof RemoteStateError)) {
+          throw error;
+        }
         // Another retained copy with the same plaintext hash may still be valid.
       }
     }
-    throw new Error(
-      `No authenticated remote recovery exists for local content of Entry ${entryId}`,
+    throw new RemoteStateError(
+      `No authenticated remote recovery exists for local content at ${entry.path} (Entry ${entryId})`,
     );
   }
 
@@ -1884,9 +1888,13 @@ export class SyncService {
     let plaintext: Uint8Array | undefined;
     try {
       plaintext = await this.options.remote.readBlob(revision.blobId);
-    } catch {
-      throw new Error(
+    } catch (error) {
+      if (!(error instanceof RemoteStateError)) {
+        throw error;
+      }
+      throw new RemoteStateError(
         `Remote Revision ${revision.revisionId} cannot be authenticated`,
+        error,
       );
     }
     if (
@@ -1894,7 +1902,7 @@ export class SyncService {
       plaintext.byteLength !== revision.size ||
       (await sha256(plaintext)) !== revision.contentHash
     ) {
-      throw new Error(
+      throw new RemoteStateError(
         `Remote Revision ${revision.revisionId} failed content verification`,
       );
     }
