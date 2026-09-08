@@ -1,7 +1,7 @@
 {
   "name": "s3-vault-sync",
   "version": "0.1.0",
-  "description": "Deletion-safe encrypted Obsidian synchronization through Amazon S3.",
+  "description": "Synchronize Obsidian Vault files through Amazon S3 with end-to-end encryption and deletion-safe history.",
   "main": "main.js",
   "type": "module",
   "scripts": {
@@ -19,6 +19,14 @@
     "sync"
   ],
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kluacisco888/s3-safe-sync.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kluacisco888/s3-safe-sync/issues"
+  },
+  "homepage": "https://github.com/kluacisco888/s3-safe-sync#readme",
   "dependencies": {
     "@aws-crypto/sha256-browser": "^5.2.0",
     "@fyears/rclone-crypt": "0.0.7",

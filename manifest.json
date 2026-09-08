@@ -1,9 +1,10 @@
 {
   "id": "s3-vault-sync",
-  "name": "S3 Vault Sync",
+  "name": "S3 Safe Sync",
   "version": "0.1.0",
   "minAppVersion": "1.12.3",
-  "description": "Deletion-safe encrypted synchronization for Obsidian through Amazon S3.",
-  "author": "S3 Vault Sync contributors",
+  "description": "Synchronize Vault files through your own Amazon S3 bucket with end-to-end encryption and deletion-safe history.",
+  "author": "kluacisco888",
+  "authorUrl": "https://github.com/kluacisco888",
   "isDesktopOnly": false
 }
