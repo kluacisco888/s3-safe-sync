@@ -27,6 +27,53 @@ const liveSnapshot = (): VaultSnapshot => ({
 });
 
 describe("SyncEngine", () => {
+  it("bounds path inspections when one note changes in a large Vault", () => {
+    const count = 1_521;
+    const entries: VaultSnapshot["entries"] = {};
+    let pathReads = 0;
+    const files = Array.from({ length: count }, (_, index) => {
+      const entryId = `entry-${index}`;
+      const path = `1-Projects/项目-${index}/文章.md`;
+      entries[entryId] = {
+        entryId,
+        kind: "live",
+        path,
+        revision: {
+          blobId: `blob-${index}`,
+          contentHash: "sha256:original",
+          createdAt: "2026-09-08T00:00:00.000Z",
+          revisionId: `revision-${index}`,
+          size: 50,
+        },
+      };
+      return {
+        contentHash: index === 0 ? "sha256:edited" : "sha256:original",
+        entryId,
+        get path() {
+          pathReads += 1;
+          return path;
+        },
+        size: 50,
+      };
+    });
+    const snapshot: VaultSnapshot = {
+      commitId: "base", entries, protocolVersion: 1, vaultId: "vault-1",
+    };
+    const plan = new SyncEngine().reconcile({
+      base: snapshot,
+      local: { basedOnCommitId: "base", files, replicaId: "desktop" },
+      remote: snapshot,
+    });
+
+    expect(plan.localActions).toEqual([]);
+    expect(plan.conflicts).toEqual([]);
+    expect(plan.remoteChanges).toMatchObject([
+      { kind: "upload-local", entryId: "entry-0", path: "1-Projects/项目-0/文章.md" },
+    ]);
+    // Bound repeated work without depending on machine speed or a specific index.
+    expect(pathReads).toBeLessThan(count * 20);
+  });
+
   it("does not resurrect an entry deleted while a Replica was offline", () => {
     const base = liveSnapshot();
     const remote: VaultSnapshot = {

@@ -1602,7 +1602,9 @@ describe("SyncService", () => {
       }
     };
 
-    await expect(service.synchronize()).rejects.toMatchObject({
+    const synchronization = service.synchronize();
+    await expect(synchronization).rejects.toBeInstanceOf(LocalStateChangedError);
+    await expect(synchronization).rejects.toMatchObject({
       name: "LocalStateChangedError",
       path,
     });
@@ -1652,7 +1654,9 @@ describe("SyncService", () => {
       }
     };
 
-    await expect(service.synchronize()).rejects.toMatchObject({
+    const synchronization = service.synchronize();
+    await expect(synchronization).rejects.toBeInstanceOf(LocalStateChangedError);
+    await expect(synchronization).rejects.toMatchObject({
       name: "LocalStateChangedError", path,
     });
     expect(await remote.readHead()).toEqual(originalHead);

@@ -223,11 +223,19 @@ export class SyncEngine {
 
   reconcile({ base, local, remote }: ReconcileInput): SyncPlan {
     const pathsByCanonicalForm = new Map<string, string[]>();
+    const localFilesByCanonicalPath = new Map<string, ObservedFile[]>();
+    const boundLocalEntryIds = new Set<string>();
     for (const file of local.files) {
       const canonical = canonicalVaultPath(file.path);
       const paths = pathsByCanonicalForm.get(canonical) ?? [];
       paths.push(file.path);
       pathsByCanonicalForm.set(canonical, paths);
+      const files = localFilesByCanonicalPath.get(canonical) ?? [];
+      files.push(file);
+      localFilesByCanonicalPath.set(canonical, files);
+      if (file.entryId !== undefined) {
+        boundLocalEntryIds.add(file.entryId);
+      }
     }
     for (const entry of Object.values(remote.entries)) {
       if (entry.kind !== "live") {
@@ -267,13 +275,8 @@ export class SyncEngine {
         continue;
       }
       const baseEntry = base?.entries[remoteEntry.entryId];
-      const hasBoundLocalClaimant = local.files.some(
-        (file) => file.entryId === remoteEntry.entryId,
-      );
-      for (const file of local.files.filter(
-        (candidate) =>
-          canonicalVaultPath(candidate.path) === canonical,
-      )) {
+      const hasBoundLocalClaimant = boundLocalEntryIds.has(remoteEntry.entryId);
+      for (const file of localFilesByCanonicalPath.get(canonical) ?? []) {
         const belongsToRemoteEntry = file.entryId === remoteEntry.entryId;
         const occupiesItsPreviousPath =
           file.entryId === undefined &&
