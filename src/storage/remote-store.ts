@@ -234,13 +234,15 @@ export class RemoteStore {
     }
   }
 
-  async initialize(input: InitializeInput): Promise<void> {
+  async initialize(input: InitializeInput, beforeHeadPublication?: () => Promise<void>): Promise<void> {
     this.assertMatchingCommitAndHead(input);
     await this.writeImmutableCommit(input.commit);
+    const encryptedHead = await this.encryptJson(input.head);
+    await beforeHeadPublication?.();
     try {
       await this.objects.put(
         this.headKey,
-        await this.encryptJson(input.head),
+        encryptedHead,
         { ifNoneMatch: true },
       );
     } catch (error) {

@@ -55,6 +55,7 @@ export interface SettingsController {
   ): () => void;
   saveAwsCredentials(credentials: AwsCredentials): Promise<void>;
   saveSettings(): Promise<void>;
+  togglePause(): Promise<void>;
   syncNow(): Promise<void>;
   verifyAllFiles(): Promise<void>;
 }
@@ -184,8 +185,7 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
       .setDesc("Local file changes remain in the Vault until sync resumes.")
       .addToggle((toggle) =>
         toggle.setValue(settings.paused).onChange(async (value) => {
-          settings.paused = value;
-          await this.controller.saveSettings();
+          if (value !== settings.paused) await this.controller.togglePause();
         }),
       );
 

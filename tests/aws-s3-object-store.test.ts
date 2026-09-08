@@ -8,6 +8,20 @@ import {
 import { ObjectPreconditionError } from "../src/storage/object-store";
 
 describe("AwsS3ObjectStore", () => {
+  it("revalidates mutable listings before trusting that commit history is absent", async () => {
+    const store = new AwsS3ObjectStore({
+      accessKeyId: "test", secretAccessKey: "test", bucket: "example-bucket", region: "us-east-1",
+      execute: async request => ({
+        status: 200,
+        headers: {},
+        body: new TextEncoder().encode(request.headers["cache-control"] === "no-cache"
+          ? "<ListBucketResult><Contents><Key>prefix/v1/commits/accepted</Key></Contents></ListBucketResult>"
+          : "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>"),
+      }),
+    });
+    await expect(store.list("prefix/v1/commits/")).resolves.toEqual(["prefix/v1/commits/accepted"]);
+  });
+
   it("bypasses a cached Head read and normalizes its ETag before a conditional write", async () => {
     const store = new AwsS3ObjectStore({
       accessKeyId: "AKIDEXAMPLE",

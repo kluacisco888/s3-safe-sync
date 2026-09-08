@@ -55,16 +55,21 @@ const ANDROID_UNSUPPORTED_PATH_CHARACTERS = /[*"<>:|?]/u;
 export class ObsidianVaultPort implements LocalVaultPort {
   private recovery: Promise<void> | undefined;
 
-  constructor(private readonly vault: Vault) {}
+  constructor(
+    private readonly vault: Vault,
+    private readonly assertActive: () => void = () => undefined,
+  ) {}
 
   async delete(
     path: string,
     expectedContentHash?: string | null,
   ): Promise<void> {
+    this.assertActive();
     if (!isSafeTargetPath(path)) {
       throw new Error(`Refusing to delete an unsafe Vault path: ${path}`);
     }
     await this.ensureRecovered();
+    this.assertActive();
     await withVaultMutationLock(this.vault.adapter, () =>
       deleteVaultPath(
         this.vault,
@@ -139,11 +144,13 @@ export class ObsidianVaultPort implements LocalVaultPort {
     expectedSourceHash?: string,
     expectedTargetHash?: string | null,
   ): Promise<void> {
+    this.assertActive();
     if (!isSafeTargetPath(fromPath) || !isSafeTargetPath(toPath)) {
       throw new Error(`Refusing to move an unsafe Vault path: ${toPath}`);
     }
     await this.ensureRecovered();
     await withVaultMutationLock(this.vault.adapter, async () => {
+      this.assertActive();
       const normalizedSource = normalizePath(fromPath);
       const file = this.vault.getAbstractFileByPath(normalizedSource);
       if (!(file instanceof TFile)) {
@@ -235,6 +242,7 @@ export class ObsidianVaultPort implements LocalVaultPort {
     body: Uint8Array,
     expectedCurrentHash?: string | null,
   ): Promise<void> {
+    this.assertActive();
     if (!isSafeTargetPath(path)) {
       throw new Error(`Refusing to write an unsafe Vault path: ${path}`);
     }
@@ -249,6 +257,7 @@ export class ObsidianVaultPort implements LocalVaultPort {
     if (parent) {
       await this.ensureFolder(parent);
     }
+    this.assertActive();
     await safeReplaceVaultFile(
       this.vault.adapter,
       normalized,

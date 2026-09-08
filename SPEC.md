@@ -17,6 +17,7 @@ The plugin does not run after Obsidian is closed, provide telemetry, synchronize
 - Delay mobile attachments above 10 MB until Wi-Fi by default. For this limit, `.md`, `.canvas`, and `.base` are note files; other paths are attachments.
 - Offer a 30-day per-file Version History and an encrypted shared Conflict Center.
 - Keep manual sync and pause controls at the top of the status view. Deleted-file paths are selectable and copyable, and UTF-8 recovery content up to 1 MiB can be previewed read-only before restoration.
+- An open status view subscribes to progress and pause changes without rebuilding its recovery list on each progress update. Saving unrelated settings preserves active synchronization and error status; resuming from settings schedules synchronization immediately.
 
 ## Sync Scope
 
@@ -69,12 +70,16 @@ Paths, hashes, entry metadata, deletion records, conflicts, commits, snapshots, 
 
 - Bulk deletion over 100 entries or 20 percent of current entries requires confirmation bound to the exact Entry ID set; any changed deletion set requires a new confirmation.
 - Automatic sync, initialization, deferred downloads, imports, previews, and all restore or Conflict actions share one per-plugin serial operation queue so an older operation cannot overwrite a newer cache.
+- A per-Vault plugin session survives module reload through a shared symbol on the host Vault. Unloading cancels network waits, stops later operations and timers, and prevents later cache writes; the replacement waits for in-flight local writes and prior operations before loading its data. Final best-effort sync is requested by window lifecycle events before plugin unloading, not after the session is stopped.
+- Each HTTP request has a 120-second wait limit. Timeout or session cancellation discards late responses; Obsidian cannot cancel an already-dispatched remote write, so immutable writes and Head conditional writes remain mandatory and the next attempt reloads Head. Mutable listings and bootstrap reads request cache revalidation.
+- A scan's observed hash never substitutes an ordinary Entry's accepted merge base merely because it matches Version History. Only a known unmaterialized deferred Entry uses its retained local Revision as the older base.
 - Dirty paths carry monotonic in-memory versions. A completed run acknowledges only the event versions it captured, so an edit that arrives during synchronization always remains queued for a follow-up run. Pending Path Renames and an incomplete Full Hash Verification are persisted across restart.
 - During ordinary synchronization, if an editor save changes a file after planning but before its upload or conflict preparation, treat it as a local change and retry after edits settle. Do not publish the stale planned content or show a generic sync error for this race.
 - All writes to the device-local plugin data file are serialized. Each queued write snapshots the latest cache, verification, and rename state only when it starts, so an older slow write cannot finish last and replace newer evidence.
 - A missing, unauthenticated, or dangling Head enters read-only Repair Mode.
 - A transport failure while authenticating a Recovery Copy is reported as that transport failure and never reclassified as proof that the copy is missing. Only missing, unauthenticated, or hash-mismatched copies produce the recovery-integrity action state, which identifies the affected Vault path.
 - S3 capability probes verify conditional create/update, read, list, and delete before initialization.
+- Before creating the Key Envelope, persist an initialization checkpoint bound to bucket, region, prefix, and Vault ID. The originating device can retry a failed content upload with its password if the checkpoint is still uploading and the remote has no commits. Before publishing the first Head, persist the publishing phase. Missing Head after publication may have started, after commit history exists, or without a matching checkpoint remains Repair Mode; initialization recovery never resets accepted history.
 - S3 Versioning and a 30-day noncurrent-version lifecycle are an independent safety layer.
 - Physical expiry cleanup is disabled during Beta. Before it is enabled, expiration must create an accepted cleanup decision followed by at least 24 hours of grace before physical deletion.
 - The plugin never deletes a legacy Remotely Save prefix or offers one-click remote destruction.

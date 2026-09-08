@@ -7,3 +7,7 @@ The cache may reuse a content hash only when the listed path, size, and modifica
 Ephemeral hashes verified during one Head-CAS retry chain may be reused by later attempts only while their path, size, and modification time remain unchanged. A failed or uncommitted Full Hash Verification remains durably required. Host rename observations are persisted separately with their expected Entry IDs and are consumed by synchronization rather than mutating the cache outside the serial operation queue.
 
 All local plugin-data writes share an ordered writer. A queued write clones the latest combined state when execution begins, preventing a slower earlier save from overwriting a newer Sync Cache, Pending Path Rename, or verification requirement.
+
+An observed hash matching a historical Revision does not prove that it was the accepted base: it may be a user's new revert made during synchronization. Only Entries explicitly marked unmaterialized may recover their older deferred base from history. Ordinary Entries retain the accepted snapshot Revision as their base.
+
+A host-Vault-scoped session survives hot reload. A stopped instance cannot start further I/O or data writes, and replacement loading waits for already-started local writes to settle. HTTP waits terminate on session cancellation or after 120 seconds; any already-dispatched S3 write remains protected by its conditional headers.

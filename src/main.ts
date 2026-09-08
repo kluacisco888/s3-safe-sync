@@ -12,6 +12,7 @@ import { createCooperativeYield } from "./plugin/cooperative-yield";
 import { StatusModal, VersionHistoryModal } from "./plugin/modals";
 import { ObsidianVaultPort, isInSyncScope } from "./plugin/obsidian-vault-port";
 import { SerializedDataWriter } from "./plugin/serialized-data-writer";
+import { SyncSession, SyncStoppedError } from "./plugin/sync-session";
 import { automaticMobileFileLimit } from "./plugin/mobile-file-limit";
 import { formatSyncProgress } from "./plugin/sync-progress";
 import { SyncProgressThrottle } from "./plugin/sync-progress-throttle";
@@ -84,6 +85,13 @@ interface PersistedPluginData {
   fullHashVerificationRequired?: boolean;
   lastFullHashVerificationAt?: number;
   pendingPathRenames?: PersistedPathRenames;
+  pendingInitialization?: {
+    bucket: string;
+    region: string;
+    prefix: string;
+    vaultId: string;
+    phase: "uploading" | "publishing";
+  };
   settings: S3VaultSyncSettings;
 }
 
@@ -107,6 +115,7 @@ export default class S3VaultSyncPlugin
   extends Plugin
   implements SettingsController
 {
+  private session!: SyncSession;
   private changeTimer: number | undefined;
   private readonly dirtyPaths = new DirtyPathTracker();
   private headRetryAttempt = 0;
@@ -122,10 +131,13 @@ export default class S3VaultSyncPlugin
   private pendingDeferredDownloads: DeferredDownloadEntry[] = [];
   private readonly pluginDataWriter = new SerializedDataWriter(
     () => this.data,
-    (snapshot) => this.saveData(snapshot),
+    (snapshot) => {
+      this.session.assertActive();
+      return this.saveData(snapshot);
+    },
   );
   private readonly syncRequests = new SyncRequestQueue((options) =>
-    this.performSync(options),
+    this.session.run(() => this.performSync(options)),
   );
   private readonly syncProgressThrottle = new SyncProgressThrottle();
   private readonly yieldDuringHashing = createCooperativeYield();
@@ -138,6 +150,9 @@ export default class S3VaultSyncPlugin
   private progressLabel: string | undefined;
 
   async onload(): Promise<void> {
+    this.session = new SyncSession(this.app.vault);
+    await this.session.ready;
+    this.session.assertActive();
     await this.loadPluginData();
     this.credentials = new CredentialStore(this.app.secretStorage);
     this.addSettingTab(new S3VaultSyncSettingsTab(this.app, this));
@@ -222,9 +237,7 @@ export default class S3VaultSyncPlugin
   }
 
   onunload(): void {
-    if (document.visibilityState === "hidden") {
-      this.requestFinalSync();
-    }
+    void this.session.close();
     if (this.changeTimer !== undefined) {
       window.clearTimeout(this.changeTimer);
     }
@@ -378,7 +391,7 @@ export default class S3VaultSyncPlugin
 
   async initializeOrUnlock(password: string): Promise<void> {
     return this.syncRequests.runExclusive(() =>
-      this.initializeOrUnlockExclusive(password),
+      this.session.run(() => this.initializeOrUnlockExclusive(password)),
     );
   }
 
@@ -446,6 +459,14 @@ export default class S3VaultSyncPlugin
         await probeObjectStore(objects, prefix);
         vaultId = crypto.randomUUID();
         vaultKey = VaultCrypto.generateVaultKey();
+        this.data.pendingInitialization = {
+          bucket: this.data.settings.bucket,
+          region: this.data.settings.region,
+          prefix,
+          vaultId,
+          phase: "uploading",
+        };
+        await this.savePluginData();
         await bootstrap.initialize({
           envelope: await VaultCrypto.wrapKey({ password, vaultKey }),
           protocolVersion: 1,
@@ -459,12 +480,28 @@ export default class S3VaultSyncPlugin
         throw new Error("The selected prefix belongs to a different Vault");
       }
       if (!currentHead) {
-        if (!isNewRemote) {
+        const pending = this.data.pendingInitialization;
+        const canResume = pending?.phase === "uploading" &&
+          pending.vaultId === vaultId && pending.prefix === prefix &&
+          pending.bucket === this.data.settings.bucket && pending.region === this.data.settings.region &&
+          (await objects.list(`${prefix ? `${prefix}/` : ""}v1/commits/`)).length === 0;
+        if (!isNewRemote && !canResume) {
           throw new RepairModeError(
             "Key Envelope exists but Head is missing; writes are disabled for repair",
           );
         }
-        await this.createSyncService(remote).initializeNew(vaultId);
+        await this.createSyncService(remote).initializeNew(vaultId, async () => {
+          this.session.assertActive();
+          const previous = this.data.pendingInitialization;
+          if (!previous) throw new Error("Initialization checkpoint is missing");
+          this.data.pendingInitialization = { ...previous, phase: "publishing" };
+          try {
+            await this.savePluginData();
+          } catch (error) {
+            this.data.pendingInitialization = previous;
+            throw error;
+          }
+        });
         this.data.fullHashVerificationRequired = false;
         this.data.lastFullHashVerificationAt = Date.now();
         this.data.pendingPathRenames = {};
@@ -472,6 +509,7 @@ export default class S3VaultSyncPlugin
       }
       this.credentials.saveVaultKey(vaultKey);
       this.data.settings.vaultId = vaultId;
+      this.data.pendingInitialization = undefined;
       await this.savePluginData();
       this.setStatus("Idle", "Encrypted Remote Store is ready.");
       new Notice("S3 Vault Sync is ready");
@@ -532,7 +570,12 @@ export default class S3VaultSyncPlugin
       downloadChunkBytes: Platform.isAndroidApp
         ? ANDROID_DOWNLOAD_CHUNK_BYTES
         : undefined,
-      execute: executeObsidianHttpRequest,
+      execute: async (request) => {
+        this.session.assertActive();
+        const response = await executeObsidianHttpRequest(request, this.session.signal);
+        this.session.assertActive();
+        return response;
+      },
       region,
       uploadChunkBytes: Platform.isAndroidApp
         ? ANDROID_UPLOAD_CHUNK_BYTES
@@ -546,13 +589,14 @@ export default class S3VaultSyncPlugin
     const cache: SyncCachePort = {
       load: () => Promise.resolve(this.data.cache),
       save: async (state) => {
+        this.session.assertActive();
         this.data.cache = state;
         await this.savePluginData();
       },
     };
     return new SyncService({
       cache,
-      local: new ObsidianVaultPort(this.app.vault),
+      local: new ObsidianVaultPort(this.app.vault, () => this.session.assertActive()),
       maxAutomaticFileBytes: mobileAutomaticFileLimit,
       remote,
       onProgress: (progress) => this.updateSyncProgress(progress),
@@ -564,7 +608,7 @@ export default class S3VaultSyncPlugin
   private runExclusiveSyncService<T>(
     operation: (service: SyncService) => Promise<T>,
   ): Promise<T> {
-    return this.syncRequests.runExclusive(async () => {
+    return this.syncRequests.runExclusive(() => this.session.run(async () => {
       const vaultKey = this.credentials.loadVaultKey();
       if (!vaultKey) {
         throw new Error("Unlock the encrypted Vault first");
@@ -575,7 +619,7 @@ export default class S3VaultSyncPlugin
         vaultKey,
       });
       return operation(this.createSyncService(remote));
-    });
+    }));
   }
 
   private async loadPluginData(): Promise<void> {
@@ -591,6 +635,7 @@ export default class S3VaultSyncPlugin
         stored?.fullHashVerificationRequired ?? false,
       lastFullHashVerificationAt: stored?.lastFullHashVerificationAt,
       pendingPathRenames: stored?.pendingPathRenames ?? {},
+      pendingInitialization: stored?.pendingInitialization,
       settings,
     };
     this.pathRenames = new PathRenameTracker(this.data.pendingPathRenames);
@@ -741,6 +786,7 @@ export default class S3VaultSyncPlugin
         );
       }
     } catch (error) {
+      if (error instanceof SyncStoppedError) return;
       if (error instanceof HeadChangedError) {
         this.scheduleHeadRetry(fullHashVerification);
       } else if (error instanceof LocalStateChangedError) {
@@ -755,6 +801,7 @@ export default class S3VaultSyncPlugin
       }
     } finally {
       if (
+        !this.session.signal.aborted &&
         this.data.settings.paused &&
         this.status !== "Error" &&
         this.status !== "Action required"
@@ -772,6 +819,7 @@ export default class S3VaultSyncPlugin
   }
 
   private scheduleHeadRetry(fullHashVerification = false): void {
+    if (this.session.signal.aborted) return;
     this.data.fullHashVerificationRequired ||= fullHashVerification;
     if (this.data.settings.paused || this.headRetryTimer !== undefined) {
       return;
@@ -810,6 +858,7 @@ export default class S3VaultSyncPlugin
   }
 
   private refreshConfiguredStatus(): void {
+    if (this.syncRequests.isRunning || !["Idle", "Paused", "Not configured"].includes(this.status)) return;
     if (this.data.settings.paused) {
       this.setStatus("Paused", "Automatic sync is paused on this device.");
     } else if (
@@ -825,6 +874,7 @@ export default class S3VaultSyncPlugin
 
   private registerVaultEvents(): void {
     const schedule = (file: TAbstractFile): void => {
+      if (this.session.signal.aborted) return;
       if (isInSyncScope(file.path)) {
         this.dirtyPaths.mark(file.path);
         this.scheduleAfterLocalChange();
@@ -835,6 +885,7 @@ export default class S3VaultSyncPlugin
     this.registerEvent(this.app.vault.on("delete", schedule));
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
+        if (this.session.signal.aborted) return;
         const dirtyRenamePaths = this.pathRenames.record(
           Object.values(this.data.cache?.files ?? {}),
           oldPath,
@@ -857,11 +908,11 @@ export default class S3VaultSyncPlugin
   }
 
   private async savePluginData(): Promise<void> {
-    await this.pluginDataWriter.save();
+    await this.session.run(() => this.pluginDataWriter.save());
   }
 
   private scheduleAfterLocalChange(): void {
-    if (this.data.settings.paused) {
+    if (this.session.signal.aborted || this.data.settings.paused) {
       return;
     }
     if (this.changeTimer !== undefined) {
@@ -874,7 +925,7 @@ export default class S3VaultSyncPlugin
   }
 
   private requestFinalSync(): void {
-    if (this.data && !this.data.settings.paused) {
+    if (!this.session.signal.aborted && this.data && !this.data.settings.paused) {
       void this.requestAutomaticSync();
     }
   }
@@ -884,16 +935,22 @@ export default class S3VaultSyncPlugin
   }
 
   private requestPeriodicSync(): Promise<void> {
+    if (this.session.signal.aborted) return Promise.resolve();
     return this.syncRequests.requestPeriodic(
       this.headRetryTimer !== undefined,
-    );
+    ).catch((error: unknown) => {
+      if (!(error instanceof SyncStoppedError)) throw error;
+    });
   }
 
   private requestSync(
     options: SyncRequestOptions = {},
   ): Promise<void> {
+    if (this.session.signal.aborted) return Promise.resolve();
     this.clearHeadRetryTimer();
-    return this.syncRequests.request(options);
+    return this.syncRequests.request(options).catch((error: unknown) => {
+      if (!(error instanceof SyncStoppedError)) throw error;
+    });
   }
 
   private setStatus(
@@ -901,6 +958,7 @@ export default class S3VaultSyncPlugin
     detail: string,
     progressLabel?: string,
   ): void {
+    if (this.session.signal.aborted) return;
     if (status !== "Syncing") {
       this.syncProgressThrottle.reset();
     }
@@ -932,6 +990,7 @@ export default class S3VaultSyncPlugin
   }
 
   private showError(error: unknown): void {
+    if (this.session.signal.aborted || error instanceof SyncStoppedError) return;
     const message = error instanceof Error ? error.message : "Unknown sync error";
     this.setStatus(
       error instanceof RepairModeError || error instanceof RemoteStateError

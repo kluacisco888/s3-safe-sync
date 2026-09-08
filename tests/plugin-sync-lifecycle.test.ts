@@ -5,6 +5,7 @@ const host = vi.hoisted((): {
   data: unknown;
   notices: string[];
   requestUrl: ReturnType<typeof vi.fn>;
+  beforeSave?: () => Promise<void>;
 } => ({
   data: undefined,
   notices: [],
@@ -20,7 +21,7 @@ vi.mock("obsidian", () => ({
   Plugin: class {
     constructor(public app: unknown, public manifest: unknown) {}
     loadData() { return Promise.resolve(structuredClone(host.data)); }
-    saveData(data: unknown) { host.data = structuredClone(data); return Promise.resolve(); }
+    async saveData(data: unknown) { await host.beforeSave?.(); host.data = structuredClone(data); }
     addCommand() {}
     addRibbonIcon() {}
     addSettingTab() {}
@@ -45,16 +46,18 @@ import { AwsS3ObjectStore } from "../src/storage/aws-s3-object-store";
 import { executeObsidianHttpRequest } from "../src/storage/obsidian-http";
 import { RemoteStore } from "../src/storage/remote-store";
 
-const setup = async () => {
+const setup = async (initialized = true) => {
   vi.useFakeTimers();
   vi.stubGlobal("window", globalThis);
   vi.stubGlobal("document", { visibilityState: "visible" });
   host.notices = [];
+  host.beforeSave = undefined;
   const objects = new Map<string, { body: Uint8Array; etag: string }>();
   let sequence = 0;
   const hooks: {
     beforeBlobRead?: () => void;
     headFailure?: "network" | "corrupt";
+    failNextBlobPut?: boolean;
   } = {};
   host.requestUrl.mockImplementation(async (request: {
     url: string; method: string; body?: ArrayBuffer; headers: Record<string, string>;
@@ -81,13 +84,19 @@ const setup = async () => {
       }
     } else if (request.method === "PUT") {
       const current = objects.get(key);
-      if ((request.headers["if-none-match"] && current) ||
+      if (key.includes("/blobs/") && hooks.failNextBlobPut) {
+        hooks.failNextBlobPut = false;
+        status = 503;
+      } else if ((request.headers["if-none-match"] && current) ||
           (request.headers["if-match"] && request.headers["if-match"] !== current?.etag)) {
         status = 412;
       } else {
         etag = `"etag-${++sequence}"`;
         objects.set(key, { body: new Uint8Array(request.body ?? new ArrayBuffer(0)), etag });
       }
+    } else if (request.method === "DELETE") {
+      objects.delete(key);
+      status = 204;
     } else {
       throw new Error(`Unexpected request method: ${request.method}`);
     }
@@ -163,9 +172,16 @@ const setup = async () => {
       unmaterializedEntryIds: [],
     },
   };
+  if (!initialized) {
+    objects.clear();
+    host.data = { settings: {
+      ...DEFAULT_SETTINGS, bucket: "test-bucket", prefix: "test-prefix", paused: true,
+      replicaId: "desktop",
+    } };
+  }
   const plugin = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
   await plugin.onload();
-  return { plugin, remote, hooks, edit, localText: () => text };
+  return { plugin, remote, hooks, edit, localText: () => text, app, objects };
 };
 
 afterEach(() => {
@@ -175,6 +191,85 @@ afterEach(() => {
 });
 
 describe("plugin synchronization lifecycle", () => {
+  it("keeps the active sync status when an unrelated setting is saved", async () => {
+    const { plugin } = await setup();
+    const stop = plugin.onStatusChange(status => {
+      if (status.text.includes("Checking metadata")) {
+        stop();
+        plugin.getSettings().deviceName = "Renamed device";
+        void plugin.saveSettings();
+        expect(plugin.getStatusText()).toBe(status.text);
+      }
+    });
+    await plugin.togglePause();
+    expect(host.notices).toEqual([]);
+  });
+
+  it("retries an interrupted initial upload with the same envelope after reload", async () => {
+    const { plugin, hooks, app, objects } = await setup(false);
+    hooks.failNextBlobPut = true;
+    await expect(plugin.initializeOrUnlock("test-password")).rejects.toThrow("503");
+    const envelope = objects.get("test-prefix/v1/key-envelope");
+    expect(envelope).toBeDefined();
+    expect(objects.has("test-prefix/v1/head")).toBe(false);
+    const interruptedCheckpoint = structuredClone(host.data);
+    plugin.onunload();
+    const replacement = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
+    await replacement.onload();
+    await expect(replacement.initializeOrUnlock("test-password")).resolves.toBeUndefined();
+    expect(objects.get("test-prefix/v1/key-envelope")).toEqual(envelope);
+    expect(objects.has("test-prefix/v1/head")).toBe(true);
+    expect(replacement.getSettings().vaultId).toBeTruthy();
+    objects.delete("test-prefix/v1/head");
+    await expect(replacement.initializeOrUnlock("test-password")).rejects.toThrow("Head is missing");
+    expect(objects.has("test-prefix/v1/head")).toBe(false);
+    replacement.onunload();
+    host.data = interruptedCheckpoint;
+    const rolledBackCache = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
+    await rolledBackCache.onload();
+    await expect(rolledBackCache.initializeOrUnlock("test-password")).rejects.toThrow("Head is missing");
+  });
+
+  it("waits for an old in-flight data write before loading a replacement instance", async () => {
+    const { plugin, app } = await setup();
+    let releaseWrite!: () => void;
+    let writeStarted = false;
+    host.beforeSave = () => {
+      host.beforeSave = undefined;
+      writeStarted = true;
+      return new Promise<void>(resolve => { releaseWrite = resolve; });
+    };
+    plugin.getSettings().deviceName = "old setting";
+    const saving = plugin.saveSettings();
+    await vi.waitFor(() => expect(writeStarted).toBe(true));
+    plugin.onunload();
+    const replacement = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
+    let loaded = false;
+    const loading = replacement.onload().then(() => { loaded = true; });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(loaded).toBe(false);
+    releaseWrite();
+    await Promise.all([saving, loading]);
+    expect(replacement.getSettings().deviceName).toBe("old setting");
+    replacement.getSettings().deviceName = "new setting";
+    await replacement.saveSettings();
+    await expect(plugin.saveSettings()).rejects.toThrow("stopped");
+    expect(host.data).toMatchObject({ settings: { deviceName: "new setting" } });
+  });
+
+  it("does not publish or schedule another run after unloading during a read", async () => {
+    const { plugin, remote, hooks, edit } = await setup();
+    edit("A draft not yet uploaded.");
+    hooks.beforeBlobRead = () => {
+      hooks.beforeBlobRead = undefined;
+      plugin.onunload();
+    };
+    await plugin.togglePause();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect((await remote.readHead())?.value.commitId).toBe("initial");
+    expect(host.notices).toEqual([]);
+  });
+
   it("automatically retries an editor save after five seconds without a failure notice", async () => {
     const { plugin, remote, hooks, edit, localText } = await setup();
     edit("A paragraph in progress.");

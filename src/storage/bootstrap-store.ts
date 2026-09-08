@@ -76,7 +76,7 @@ export class BootstrapStore {
   }
 
   async read(): Promise<BootstrapRecord | undefined> {
-    const stored = await this.objects.get(this.key);
+    const stored = await this.objects.get(this.key, { revalidate: true });
     if (!stored) {
       return undefined;
     }

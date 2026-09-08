@@ -1674,6 +1674,42 @@ describe("SyncService", () => {
     expect(await remote.readHead()).toEqual(acceptedHead);
   });
 
+  it("publishes an edit back to historical content made during another file's sync", async () => {
+    const objects = new MemoryObjectStore();
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey: Uint8Array.from({ length: 32 }, (_, index) => index),
+    });
+    const local = new MemoryVault();
+    const cache = new MemorySyncCache();
+    const service = new SyncService({ cache, local, remote, replicaId: "desktop" });
+    await local.write("target.md", new TextEncoder().encode("historical"));
+    await local.write("other.md", new TextEncoder().encode("other-v1"));
+    await service.initializeNew("vault-1");
+    await local.write("target.md", new TextEncoder().encode("remote-current"));
+    await service.synchronize();
+    await local.write("other.md", new TextEncoder().encode("other-v2"));
+    objects.onPut = async (key) => {
+      if (key.endsWith("/head")) {
+        objects.onPut = undefined;
+        await local.write("target.md", new TextEncoder().encode("historical"));
+      }
+    };
+    await service.synchronize();
+
+    await expect(service.synchronize()).resolves.toMatchObject({
+      downloaded: 0, uploaded: 1, status: "complete",
+    });
+    expect(local.readText("target.md")).toBe("historical");
+    const replica = new MemoryVault();
+    await new SyncService({
+      cache: new MemorySyncCache(), local: replica, remote, replicaId: "reader",
+    }).synchronize();
+    expect(replica.readText("target.md")).toBe("historical");
+    expect(replica.readText("other.md")).toBe("other-v2");
+  });
+
   it("publishes a local edit as a new encrypted Revision", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);

@@ -334,7 +334,7 @@ export class AwsS3ObjectStore implements ObjectStore {
       if (continuationToken) {
         query["continuation-token"] = continuationToken;
       }
-      const response = await this.request("GET", "/", undefined, {}, query);
+      const response = await this.request("GET", "/", undefined, { "cache-control": "no-cache" }, query);
       if (response.status !== 200) {
         this.throwResponseError(response, `list ${prefix}`);
       }

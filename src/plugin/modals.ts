@@ -28,6 +28,7 @@ export interface StatusModalController {
     | BulkDeletionPlan
     | undefined;
   getStatusText(): string;
+  onStatusChange(listener: (status: { text: string }) => void): () => void;
   importCandidate(path: string): Promise<void>;
   isPaused(): boolean;
   keepConflictDeleted(entryId: string): Promise<void>;
@@ -129,6 +130,8 @@ class DeletedFilePreviewModal extends Modal {
 }
 
 export class StatusModal extends Modal {
+  private stopStatusUpdates: (() => void) | undefined;
+  private pauseButton: HTMLButtonElement | undefined;
   constructor(
     app: App,
     private readonly controller: StatusModalController,
@@ -137,18 +140,26 @@ export class StatusModal extends Modal {
   }
 
   onOpen(): void {
+    this.stopStatusUpdates?.();
     this.contentEl.empty();
     this.contentEl.createEl("h2", { text: "S3 Vault Sync" });
-    this.contentEl.createEl("p", { text: this.controller.getStatusText() });
+    const status = this.contentEl.createEl("p", { text: this.controller.getStatusText() });
     this.renderActions();
     this.renderBulkDeletion();
     this.renderConflicts();
     this.renderLocalIssues();
     this.renderDeferredDownloads();
     this.renderDeletedRecoveries();
+    this.stopStatusUpdates = this.controller.onStatusChange(display => {
+      status.setText(display.text);
+      this.pauseButton?.setText(this.controller.isPaused() ? "Resume" : "Pause");
+    });
   }
 
   onClose(): void {
+    this.stopStatusUpdates?.();
+    this.stopStatusUpdates = undefined;
+    this.pauseButton = undefined;
     this.contentEl.empty();
   }
 
@@ -158,13 +169,12 @@ export class StatusModal extends Modal {
     actions.createEl("button", { text: "Sync now" }).addEventListener("click", () => {
       void this.controller.syncNow().then(() => this.onOpen());
     });
-    actions
-      .createEl("button", {
-        text: this.controller.isPaused() ? "Resume" : "Pause",
-      })
-      .addEventListener("click", () => {
-        void this.controller.togglePause().then(() => this.onOpen());
-      });
+    this.pauseButton = actions.createEl("button", {
+      text: this.controller.isPaused() ? "Resume" : "Pause",
+    });
+    this.pauseButton.addEventListener("click", () => {
+      void this.controller.togglePause().then(() => this.onOpen());
+    });
     if (this.controller.getPendingBulkDeletion()) {
       actions
         .createEl("button", {

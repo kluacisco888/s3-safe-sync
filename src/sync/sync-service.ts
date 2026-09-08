@@ -222,7 +222,7 @@ export class SyncService {
 
   constructor(private readonly options: SyncServiceOptions) {}
 
-  async initializeNew(vaultId: string): Promise<void> {
+  async initializeNew(vaultId: string, beforeHeadPublication?: () => Promise<void>): Promise<void> {
     if (await this.options.remote.readHead()) {
       throw new Error("Remote Store is already initialized");
     }
@@ -331,7 +331,7 @@ export class SyncService {
       totalBytes,
       transferredBytes,
     });
-    await this.options.remote.initialize({ commit, head });
+    await this.options.remote.initialize({ commit, head }, beforeHeadPublication);
     const snapshot: VaultSnapshot = {
       commitId,
       entries,
@@ -1753,8 +1753,7 @@ export class SyncService {
       const entry = cached.snapshot.entries[cachedFile.entryId];
       if (
         entry?.kind !== "live" ||
-        (!unmaterializedEntryIds.has(entry.entryId) &&
-          entry.revision.contentHash === cachedFile.contentHash)
+        !unmaterializedEntryIds.has(entry.entryId)
       ) {
         continue;
       }
