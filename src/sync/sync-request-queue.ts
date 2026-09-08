@@ -32,7 +32,10 @@ export class SyncRequestQueue {
     return this.running;
   }
 
-  requestIfIdle(): Promise<void> {
+  requestPeriodic(headRetryScheduled: boolean): Promise<void> {
+    if (headRetryScheduled) {
+      return Promise.resolve();
+    }
     return this.running ?? this.request();
   }
 

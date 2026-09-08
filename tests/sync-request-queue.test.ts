@@ -101,7 +101,7 @@ describe("SyncRequestQueue", () => {
     const activeSync = queue.request();
     await Promise.resolve();
     const periodicPolls = Array.from({ length: 10 }, () =>
-      queue.requestIfIdle(),
+      queue.requestPeriodic(false),
     );
     finishSync?.();
     await Promise.all([activeSync, ...periodicPolls]);
@@ -114,13 +114,23 @@ describe("SyncRequestQueue", () => {
     const run = vi.fn(async () => undefined);
     const queue = new SyncRequestQueue(run);
 
-    await queue.requestIfIdle();
+    await queue.requestPeriodic(false);
 
     expect(run).toHaveBeenCalledOnce();
     expect(run).toHaveBeenCalledWith({
       allowBulkDeletion: false,
       fullHashVerification: false,
     });
+  });
+
+  it("does not run a periodic poll during Head retry backoff", async () => {
+    const run = vi.fn(async () => undefined);
+    const queue = new SyncRequestQueue(run);
+
+    await queue.requestPeriodic(true);
+
+    expect(run).not.toHaveBeenCalled();
+    expect(queue.isRunning).toBe(false);
   });
 
   it("serializes direct operations with queued synchronization", async () => {

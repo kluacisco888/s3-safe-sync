@@ -1,21 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  formatStatusBarText,
-  formatSyncProgress,
-} from "../src/plugin/sync-progress";
+import { formatSyncProgress } from "../src/plugin/sync-progress";
 
 describe("formatSyncProgress", () => {
-  it("keeps the current synchronization detail visible in the status bar", () => {
-    expect(
-      formatStatusBarText(
-        "Another device published first. Retrying automatically in 39 seconds.",
-      ),
-    ).toBe(
-      "S3 Sync: Another device published first. Retrying automatically in 39 seconds.",
-    );
-  });
-
   it("formats a compact label and a detailed current-file message", () => {
     expect(
       formatSyncProgress({

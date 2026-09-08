@@ -13,10 +13,7 @@ import { StatusModal, VersionHistoryModal } from "./plugin/modals";
 import { ObsidianVaultPort, isInSyncScope } from "./plugin/obsidian-vault-port";
 import { SerializedDataWriter } from "./plugin/serialized-data-writer";
 import { automaticMobileFileLimit } from "./plugin/mobile-file-limit";
-import {
-  formatStatusBarText,
-  formatSyncProgress,
-} from "./plugin/sync-progress";
+import { formatSyncProgress } from "./plugin/sync-progress";
 import { SyncProgressThrottle } from "./plugin/sync-progress-throttle";
 import {
   DEFAULT_SETTINGS,
@@ -879,10 +876,9 @@ export default class S3VaultSyncPlugin
   }
 
   private requestPeriodicSync(): Promise<void> {
-    if (this.headRetryTimer !== undefined) {
-      return Promise.resolve();
-    }
-    return this.syncRequests.requestIfIdle();
+    return this.syncRequests.requestPeriodic(
+      this.headRetryTimer !== undefined,
+    );
   }
 
   private requestSync(
@@ -903,7 +899,7 @@ export default class S3VaultSyncPlugin
     this.status = status;
     this.statusDetail = detail;
     this.progressLabel = progressLabel;
-    this.statusElement?.setText(formatStatusBarText(detail));
+    this.statusElement?.setText(`S3 Sync: ${detail}`);
     this.statusElement?.setAttr("aria-label", this.getStatusText());
     this.statusElement?.setAttr("title", this.getStatusText());
     this.statusElement?.toggleClass(
