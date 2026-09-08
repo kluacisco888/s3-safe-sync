@@ -6,10 +6,13 @@ const host = vi.hoisted((): {
   notices: string[];
   requestUrl: ReturnType<typeof vi.fn>;
   beforeSave?: () => Promise<void>;
+  beforeLoad?: () => Promise<void>;
+  registrationCount: number;
 } => ({
   data: undefined,
   notices: [],
   requestUrl: vi.fn(),
+  registrationCount: 0,
 }));
 
 vi.mock("obsidian", () => ({
@@ -20,9 +23,9 @@ vi.mock("obsidian", () => ({
   Platform: { isDesktop: false, isDesktopApp: false, isMobile: false },
   Plugin: class {
     constructor(public app: unknown, public manifest: unknown) {}
-    loadData() { return Promise.resolve(structuredClone(host.data)); }
+    async loadData() { await host.beforeLoad?.(); return structuredClone(host.data); }
     async saveData(data: unknown) { await host.beforeSave?.(); host.data = structuredClone(data); }
-    addCommand() {}
+    addCommand() { host.registrationCount += 1; }
     addRibbonIcon() {}
     addSettingTab() {}
     registerDomEvent() {}
@@ -52,6 +55,8 @@ const setup = async (initialized = true) => {
   vi.stubGlobal("document", { visibilityState: "visible" });
   host.notices = [];
   host.beforeSave = undefined;
+  host.beforeLoad = undefined;
+  host.registrationCount = 0;
   const objects = new Map<string, { body: Uint8Array; etag: string }>();
   let sequence = 0;
   const hooks: {
@@ -191,6 +196,24 @@ afterEach(() => {
 });
 
 describe("plugin synchronization lifecycle", () => {
+  it("does not register an instance unloaded while its settings were loading", async () => {
+    const { plugin, app } = await setup();
+    plugin.onunload();
+    let finish!: () => void;
+    host.beforeLoad = () => {
+      host.beforeLoad = undefined;
+      return new Promise<void>(resolve => { finish = resolve; });
+    };
+    const loadingPlugin = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
+    const loading = loadingPlugin.onload().then(() => "loaded", () => "stopped");
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    const before = host.registrationCount;
+    loadingPlugin.onunload();
+    finish();
+    expect(await loading).toBe("stopped");
+    expect(host.registrationCount).toBe(before);
+  });
+
   it("keeps the active sync status when an unrelated setting is saved", async () => {
     const { plugin } = await setup();
     const stop = plugin.onStatusChange(status => {

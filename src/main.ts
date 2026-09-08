@@ -153,7 +153,8 @@ export default class S3VaultSyncPlugin
     this.session = new SyncSession(this.app.vault);
     await this.session.ready;
     this.session.assertActive();
-    await this.loadPluginData();
+    await this.session.run(() => this.loadPluginData());
+    this.session.assertActive();
     this.credentials = new CredentialStore(this.app.secretStorage);
     this.addSettingTab(new S3VaultSyncSettingsTab(this.app, this));
     this.addRibbonIcon("refresh-cw", "Open S3 Vault Sync", () => {
@@ -206,6 +207,7 @@ export default class S3VaultSyncPlugin
     }
     this.refreshConfiguredStatus();
     this.app.workspace.onLayoutReady(() => {
+      if (this.session.signal.aborted) return;
       this.registerVaultEvents();
       if (!this.data.settings.paused) {
         void this.requestAutomaticSync();
