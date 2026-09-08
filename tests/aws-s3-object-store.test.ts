@@ -14,7 +14,10 @@ describe("AwsS3ObjectStore", () => {
       bucket: "example-bucket",
       execute: async (request): Promise<HttpResponseOutput> => {
         if (request.method === "GET") {
-          const fresh = request.headers["cache-control"] === "no-cache";
+          const fresh =
+            request.headers["cache-control"] === "no-cache" &&
+            new URL(request.url).searchParams.get("response-cache-control") ===
+              "no-store";
           return {
             body: new TextEncoder().encode(fresh ? "current" : "stale"),
             headers: {
@@ -42,7 +45,9 @@ describe("AwsS3ObjectStore", () => {
       secretAccessKey: "secret-example",
     });
 
-    const current = await store.get("chosen-prefix/v1/head");
+    const current = await store.get("chosen-prefix/v1/head", {
+      revalidate: true,
+    });
     expect(new TextDecoder().decode(current?.body)).toBe("current");
     expect(current?.etag).toBe('"current-etag"');
 
@@ -51,6 +56,33 @@ describe("AwsS3ObjectStore", () => {
         ifMatch: current?.etag,
       }),
     ).resolves.toMatchObject({ etag: '"next-etag"' });
+  });
+
+  it.each([
+    'W/"weak-etag"',
+    '"contains space"',
+    '"one", "two"',
+    '"line\nbreak"',
+  ])("rejects an unusable ETag: %s", async (etag) => {
+    const store = new AwsS3ObjectStore({
+      accessKeyId: "AKIDEXAMPLE",
+      bucket: "example-bucket",
+      execute: async () => ({
+        body: new TextEncoder().encode("head"),
+        headers: {
+          date: "Sat, 05 Sep 2026 00:00:00 GMT",
+          etag,
+          "last-modified": "Sat, 05 Sep 2026 00:00:00 GMT",
+        },
+        status: 200,
+      }),
+      region: "us-east-1",
+      secretAccessKey: "secret-example",
+    });
+
+    await expect(
+      store.get("chosen-prefix/v1/head", { revalidate: true }),
+    ).rejects.toThrow("strong ETag");
   });
 
   it("uploads a large S3 object through bounded multipart requests", async () => {
@@ -89,7 +121,7 @@ describe("AwsS3ObjectStore", () => {
           completeIfNoneMatch = request.headers["if-none-match"];
           return {
             body: new TextEncoder().encode(
-              "<CompleteMultipartUploadResult><ETag>&quot;complete-etag&quot;</ETag></CompleteMultipartUploadResult>",
+              "<CompleteMultipartUploadResult><ETag>complete-etag</ETag></CompleteMultipartUploadResult>",
             ),
             headers: { date: "Sat, 05 Sep 2026 00:00:00 GMT" },
             status: 200,

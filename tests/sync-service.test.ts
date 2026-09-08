@@ -14,7 +14,10 @@ import {
   type ObjectStore,
   type StoredObject,
 } from "../src/storage/object-store";
-import { RemoteStore } from "../src/storage/remote-store";
+import {
+  RemoteStateError,
+  RemoteStore,
+} from "../src/storage/remote-store";
 import { SyncRequestQueue } from "../src/sync/sync-request-queue";
 import { sha256Content } from "../src/sync/content-hash";
 import { LocalStateChangedError } from "../src/sync/errors";
@@ -1407,9 +1410,11 @@ describe("SyncService", () => {
       `chosen-prefix/v1/blobs/${deleted.recovery.blobId}`,
     );
 
-    await expect(phone.synchronize()).rejects.toThrow(
+    const synchronization = phone.synchronize();
+    await expect(synchronization).rejects.toThrow(
       "Vault Snapshot references missing blobs",
     );
+    await expect(synchronization).rejects.toThrow("notes/example.md");
 
     expect(phoneVault.readText("notes/example.md")).toBe(
       "only recoverable copy",
@@ -1512,6 +1517,7 @@ describe("SyncService", () => {
       "No authenticated remote recovery exists",
     );
     await expect(synchronization).rejects.toThrow("notes/example.md");
+    await expect(synchronization).rejects.toBeInstanceOf(RemoteStateError);
 
     expect(phoneVault.readText("notes/example.md")).toBe("v1");
   });
@@ -1564,9 +1570,11 @@ describe("SyncService", () => {
       }
     };
 
-    await expect(phone.synchronize()).rejects.toThrow(
+    const synchronization = phone.synchronize();
+    await expect(synchronization).rejects.toThrow(
       "temporary recovery read network failure",
     );
+    await expect(synchronization).rejects.not.toBeInstanceOf(RemoteStateError);
 
     expect(phoneVault.readText("notes/example.md")).toBe("v1");
   });

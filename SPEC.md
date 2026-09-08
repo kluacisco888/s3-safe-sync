@@ -35,7 +35,7 @@ The user chooses an empty S3 prefix. All identifiers below are opaque or fixed p
 <prefix>/v1/audits/<random-id>
 ```
 
-Immutable objects use `If-None-Match: *`. Head uses `If-Match` with its previously read ETag, or `If-None-Match: *` during initialization. Mutable Head reads bypass intermediary caches, and response ETags are normalized to an HTTP entity tag before reuse in conditional requests. A rejected Head write reloads and reconciles instead of overwriting, using jittered exponential backoff and a bounded automatic retry schedule so concurrent Replicas do not remain in a sticky error state.
+Immutable objects use `If-None-Match: *`. Head uses `If-Match` with its previously read ETag, or `If-None-Match: *` during initialization. Mutable Head reads request origin revalidation and a no-store response, and strong response ETags are normalized to an HTTP entity tag before reuse in conditional requests; weak or malformed ETags stop synchronization. A rejected Head write reloads and reconciles instead of overwriting, using jittered exponential backoff and a bounded automatic retry schedule so concurrent Replicas do not remain in a sticky error state.
 
 ## State model
 

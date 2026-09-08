@@ -267,7 +267,7 @@ describe("RemoteStore", () => {
     await objects.delete("chosen-prefix/v1/blobs/blob-1");
 
     await expect(remote.readSnapshot(currentHead.value)).rejects.toThrow(
-      "Vault Snapshot references missing blobs: blob-1",
+      "Vault Snapshot references missing blobs for paths: notes/example.md",
     );
   });
 

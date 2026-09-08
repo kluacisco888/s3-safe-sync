@@ -252,7 +252,9 @@ export class RemoteStore {
   }
 
   async readHead(): Promise<VersionedHead | undefined> {
-    const stored = await this.objects.get(this.headKey);
+    const stored = await this.objects.get(this.headKey, {
+      revalidate: true,
+    });
     if (!stored) {
       return undefined;
     }
@@ -400,30 +402,38 @@ export class RemoteStore {
   ): Promise<void> {
     const blobPrefix = this.key("blobs/");
     const available = new Set(await this.objects.list(blobPrefix));
-    const referencedBlobIds = new Set<string>();
+    const pathsByBlobId = new Map<string, Set<string>>();
+    const addReference = (blobId: string, path: string): void => {
+      const paths = pathsByBlobId.get(blobId) ?? new Set<string>();
+      paths.add(path);
+      pathsByBlobId.set(blobId, paths);
+    };
     for (const entry of Object.values(snapshot.entries)) {
       if (entry.kind === "live") {
-        referencedBlobIds.add(entry.revision.blobId);
+        addReference(entry.revision.blobId, entry.path);
       } else if (entry.kind === "conflicted") {
         for (const candidate of entry.candidates) {
-          referencedBlobIds.add(candidate.blobId);
+          addReference(candidate.blobId, entry.path);
         }
         if (entry.recovery) {
-          referencedBlobIds.add(entry.recovery.blobId);
+          addReference(entry.recovery.blobId, entry.path);
         }
       } else if (entry.recovery) {
-        referencedBlobIds.add(entry.recovery.blobId);
+        addReference(entry.recovery.blobId, entry.path);
       }
       for (const revision of entry.history ?? []) {
-        referencedBlobIds.add(revision.blobId);
+        addReference(revision.blobId, entry.path);
       }
     }
-    const missing = [...referencedBlobIds].filter(
+    const missing = [...pathsByBlobId.keys()].filter(
       (blobId) => !available.has(`${blobPrefix}${blobId}`),
     );
     if (missing.length > 0) {
+      const affectedPaths = new Set(
+        missing.flatMap((blobId) => [...(pathsByBlobId.get(blobId) ?? [])]),
+      );
       throw new RemoteStateError(
-        `Vault Snapshot references missing blobs: ${missing.sort().join(", ")}`,
+        `Vault Snapshot references missing blobs for paths: ${[...affectedPaths].sort().join(", ")}`,
       );
     }
   }

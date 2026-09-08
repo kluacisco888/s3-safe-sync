@@ -10,9 +10,16 @@ export interface ObjectPutOptions {
   ifNoneMatch?: boolean;
 }
 
+export interface ObjectGetOptions {
+  revalidate?: boolean;
+}
+
 export interface ObjectStore {
   delete(key: string): Promise<void>;
-  get(key: string): Promise<StoredObject | undefined>;
+  get(
+    key: string,
+    options?: ObjectGetOptions,
+  ): Promise<StoredObject | undefined>;
   list(prefix: string): Promise<string[]>;
   put(
     key: string,

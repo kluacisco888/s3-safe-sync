@@ -4,6 +4,7 @@ import { SignatureV4 } from "@smithy/signature-v4";
 import { XMLParser } from "fast-xml-parser";
 
 import {
+  type ObjectGetOptions,
   ObjectPreconditionError,
   type ObjectPutOptions,
   type ObjectStore,
@@ -76,13 +77,34 @@ const requiredHeader = (
   return value;
 };
 
-const requiredEntityTag = (headers: Record<string, string>): string => {
-  const value = requiredHeader(headers, "etag").trim();
-  if (!value) {
-    throw new Error("AWS S3 returned an empty ETag");
+const normalizeEntityTag = (rawValue: string): string => {
+  const value = rawValue.trim();
+  if (value.startsWith("W/")) {
+    throw new Error("AWS S3 returned a weak ETag; If-Match requires a strong ETag");
   }
-  return /^(?:W\/)?".*"$/u.test(value) ? value : `"${value}"`;
+  const quoted = value.startsWith('"') && value.endsWith('"');
+  const opaqueTag = quoted ? value.slice(1, -1) : value;
+  const invalidCharacter = [...opaqueTag].some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return !(
+      codePoint === 0x21 ||
+      (codePoint >= 0x23 && codePoint <= 0x7e) ||
+      (codePoint >= 0x80 && codePoint <= 0xff)
+    );
+  });
+  if (
+    !opaqueTag ||
+    invalidCharacter ||
+    value.startsWith('"') !== value.endsWith('"') ||
+    (!quoted && opaqueTag.includes(","))
+  ) {
+    throw new Error("AWS S3 returned an invalid strong ETag");
+  }
+  return `"${opaqueTag}"`;
 };
+
+const requiredEntityTag = (headers: Record<string, string>): string =>
+  normalizeEntityTag(requiredHeader(headers, "etag"));
 
 const parseContentRange = (
   value: string,
@@ -190,10 +212,16 @@ export class AwsS3ObjectStore implements ObjectStore {
     }
   }
 
-  async get(key: string): Promise<StoredObject | undefined> {
+  async get(
+    key: string,
+    options: ObjectGetOptions = {},
+  ): Promise<StoredObject | undefined> {
     const path = encodeKeyPath(key);
-    const freshReadHeaders: Record<string, string> = key.endsWith("/v1/head")
+    const freshReadHeaders: Record<string, string> = options.revalidate
       ? { "cache-control": "no-cache" }
+      : {};
+    const freshReadQuery: Record<string, string> = options.revalidate
+      ? { "response-cache-control": "no-store" }
       : {};
     if (this.downloadChunkBytes === undefined) {
       const response = await this.request(
@@ -201,6 +229,7 @@ export class AwsS3ObjectStore implements ObjectStore {
         path,
         undefined,
         freshReadHeaders,
+        freshReadQuery,
       );
       if (response.status === 404) {
         return undefined;
@@ -215,10 +244,16 @@ export class AwsS3ObjectStore implements ObjectStore {
         serverDate: requiredHeader(response.headers, "date"),
       };
     }
-    const first = await this.request("GET", path, undefined, {
-      ...freshReadHeaders,
-      range: `bytes=0-${this.downloadChunkBytes - 1}`,
-    });
+    const first = await this.request(
+      "GET",
+      path,
+      undefined,
+      {
+        ...freshReadHeaders,
+        range: `bytes=0-${this.downloadChunkBytes - 1}`,
+      },
+      freshReadQuery,
+    );
     if (first.status === 404) {
       return undefined;
     }
@@ -251,11 +286,17 @@ export class AwsS3ObjectStore implements ObjectStore {
         offset + this.downloadChunkBytes - 1,
         firstRange.total - 1,
       );
-      const response = await this.request("GET", path, undefined, {
-        ...freshReadHeaders,
-        "if-match": etag,
-        range: `bytes=${offset}-${end}`,
-      });
+      const response = await this.request(
+        "GET",
+        path,
+        undefined,
+        {
+          ...freshReadHeaders,
+          "if-match": etag,
+          range: `bytes=${offset}-${end}`,
+        },
+        freshReadQuery,
+      );
       if (response.status !== 206) {
         this.throwResponseError(response, `read byte range ${offset}-${end} of ${key}`);
       }
@@ -404,10 +445,12 @@ export class AwsS3ObjectStore implements ObjectStore {
       }
       return {
         body: new Uint8Array(),
-        etag: readXmlElement(
-          completed.body,
-          "CompleteMultipartUploadResult",
-          "ETag",
+        etag: normalizeEntityTag(
+          readXmlElement(
+            completed.body,
+            "CompleteMultipartUploadResult",
+            "ETag",
+          ),
         ),
         lastModified: requiredHeader(completed.headers, "date"),
         serverDate: requiredHeader(completed.headers, "date"),
