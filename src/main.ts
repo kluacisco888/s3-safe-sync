@@ -753,6 +753,14 @@ export default class S3VaultSyncPlugin
       } else {
         this.showError(error);
       }
+    } finally {
+      if (
+        this.data.settings.paused &&
+        this.status !== "Error" &&
+        this.status !== "Action required"
+      ) {
+        this.setStatus("Paused", "Automatic sync is paused on this device.");
+      }
     }
   }
 

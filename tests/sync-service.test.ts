@@ -1579,6 +1579,97 @@ describe("SyncService", () => {
     expect(phoneVault.readText("notes/example.md")).toBe("v1");
   });
 
+  it("retries a draft edited after planning without publishing partial content", async () => {
+    const objects = new MemoryObjectStore();
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey: Uint8Array.from({ length: 32 }, (_, index) => index),
+    });
+    const path = "notes/example.md";
+    const local = new MemoryVault();
+    const cache = new MemorySyncCache();
+    const service = new SyncService({ cache, local, remote, replicaId: "desktop" });
+    await local.write(path, new TextEncoder().encode("Original article."));
+    await service.initializeNew("vault-1");
+    const originalHead = await remote.readHead();
+    const originalCache = structuredClone(cache.state);
+    await local.write(path, new TextEncoder().encode("A paragraph in progress."));
+    objects.onGet = async (key) => {
+      if (key.includes("/blobs/")) {
+        objects.onGet = undefined;
+        await local.write(path, new TextEncoder().encode("A complete paragraph with its final sentence."));
+      }
+    };
+
+    await expect(service.synchronize()).rejects.toMatchObject({
+      name: "LocalStateChangedError",
+      path,
+    });
+    expect(await remote.readHead()).toEqual(originalHead);
+    expect(cache.state).toEqual(originalCache);
+    expect(local.readText(path)).toBe("A complete paragraph with its final sentence.");
+
+    await expect(service.synchronize()).resolves.toMatchObject({ status: "complete", uploaded: 1 });
+    const entry = Object.values(cache.state?.snapshot.entries ?? {})[0];
+    if (entry?.kind !== "live") throw new Error("Expected live Revision");
+    expect(new TextDecoder().decode(await remote.readBlob(entry.revision.blobId))).toBe(
+      "A complete paragraph with its final sentence.",
+    );
+    const acceptedHead = await remote.readHead();
+    await expect(service.synchronize()).resolves.toMatchObject({
+      status: "complete", uploaded: 0, downloaded: 0,
+    });
+    expect(await remote.readHead()).toEqual(acceptedHead);
+  });
+
+  it("retries typing during conflict preparation and preserves both authors", async () => {
+    const objects = new MemoryObjectStore();
+    const remote = await RemoteStore.open({
+      objects,
+      prefix: "chosen-prefix",
+      vaultKey: Uint8Array.from({ length: 32 }, (_, index) => index),
+    });
+    const path = "notes/example.md";
+    const local = new MemoryVault();
+    const cache = new MemorySyncCache();
+    const service = new SyncService({ cache, local, remote, replicaId: "desktop" });
+    await local.write(path, new TextEncoder().encode("Opening.\n\nClosing.\n"));
+    await service.initializeNew("vault-1");
+    const otherLocal = new MemoryVault();
+    const other = new SyncService({
+      cache: new MemorySyncCache(), local: otherLocal, remote, replicaId: "other",
+    });
+    await other.synchronize();
+    await otherLocal.write(path, new TextEncoder().encode("Opening.\n\nClosing from the other device.\n"));
+    await other.synchronize();
+    const originalHead = await remote.readHead();
+    await local.write(path, new TextEncoder().encode("Opening with a draft.\n\nClosing.\n"));
+    objects.onGet = async (key) => {
+      if (key.includes("/blobs/")) {
+        objects.onGet = undefined;
+        await local.write(path, new TextEncoder().encode("Opening with the complete paragraph.\n\nClosing.\n"));
+      }
+    };
+
+    await expect(service.synchronize()).rejects.toMatchObject({
+      name: "LocalStateChangedError", path,
+    });
+    expect(await remote.readHead()).toEqual(originalHead);
+    expect(local.readText(path)).toBe("Opening with the complete paragraph.\n\nClosing.\n");
+
+    await expect(service.synchronize()).resolves.toMatchObject({ status: "complete" });
+    await other.synchronize();
+    const merged = "Opening with the complete paragraph.\n\nClosing from the other device.\n";
+    expect(local.readText(path)).toBe(merged);
+    expect(otherLocal.readText(path)).toBe(merged);
+    const acceptedHead = await remote.readHead();
+    await expect(service.synchronize()).resolves.toMatchObject({
+      status: "complete", uploaded: 0, downloaded: 0,
+    });
+    expect(await remote.readHead()).toEqual(acceptedHead);
+  });
+
   it("publishes a local edit as a new encrypted Revision", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);

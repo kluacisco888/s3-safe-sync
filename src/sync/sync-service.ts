@@ -1329,7 +1329,7 @@ export class SyncService {
             plaintext.byteLength !== change.file.size ||
             (await sha256(plaintext)) !== change.file.contentHash
           ) {
-            throw new Error(`Local file changed while reading ${change.path}`);
+            throw new LocalStateChangedError(change.path);
           }
           const blobId = crypto.randomUUID();
           await this.options.remote.writeBlob(blobId, plaintext);
@@ -1392,7 +1392,7 @@ export class SyncService {
           plaintext.byteLength !== conflict.localFile.size ||
           (await sha256(plaintext)) !== conflict.localFile.contentHash
         ) {
-          throw new Error(`Local file changed while reading ${localPath}`);
+          throw new LocalStateChangedError(localPath);
         }
         const blobId = crypto.randomUUID();
         await this.options.remote.writeBlob(blobId, plaintext);
