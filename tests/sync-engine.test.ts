@@ -31,6 +31,7 @@ describe("SyncEngine", () => {
     const count = 1_521;
     const entries: VaultSnapshot["entries"] = {};
     let pathReads = 0;
+    let entryIdReads = 0;
     const files = Array.from({ length: count }, (_, index) => {
       const entryId = `entry-${index}`;
       const path = `1-Projects/项目-${index}/文章.md`;
@@ -48,7 +49,10 @@ describe("SyncEngine", () => {
       };
       return {
         contentHash: index === 0 ? "sha256:edited" : "sha256:original",
-        entryId,
+        get entryId() {
+          entryIdReads += 1;
+          return entryId;
+        },
         get path() {
           pathReads += 1;
           return path;
@@ -72,6 +76,7 @@ describe("SyncEngine", () => {
     ]);
     // Bound repeated work without depending on machine speed or a specific index.
     expect(pathReads).toBeLessThan(count * 20);
+    expect(entryIdReads).toBeLessThan(count * 20);
   });
 
   it("does not resurrect an entry deleted while a Replica was offline", () => {
