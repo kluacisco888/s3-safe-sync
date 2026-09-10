@@ -49,7 +49,9 @@ export interface SettingsController {
   getProgressLabel(): string | undefined;
   getSettings(): S3VaultSyncSettings;
   getStatusText(): string;
+  hasAwsCredentials(): boolean;
   initializeOrUnlock(password: string): Promise<void>;
+  isVaultUnlocked(): boolean;
   onStatusChange(
     listener: (status: SyncStatusDisplay) => void,
   ): () => void;
@@ -62,7 +64,23 @@ export interface SettingsController {
 
 const asPasswordInput = (component: TextComponent): TextComponent => {
   component.inputEl.type = "password";
+  component.inputEl.autocomplete = "off";
+  component.inputEl.autocapitalize = "none";
+  component.inputEl.spellcheck = false;
   return component;
+};
+
+const addVisibilityButton = (
+  setting: Setting,
+  component: TextComponent,
+): void => {
+  setting.addButton((button) =>
+    button.setButtonText("Show").onClick(() => {
+      const showing = component.inputEl.type === "text";
+      component.inputEl.type = showing ? "password" : "text";
+      button.setButtonText(showing ? "Show" : "Hide");
+    }),
+  );
 };
 
 export class S3VaultSyncSettingsTab extends PluginSettingTab {
@@ -124,60 +142,106 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
 
     let accessKeyId = "";
     let secretAccessKey = "";
+    let saveCredentialsButton: ButtonComponent | undefined;
+    const updateCredentialButton = (): void => {
+      saveCredentialsButton?.setDisabled(!accessKeyId || !secretAccessKey);
+    };
+    const credentialDescription = this.controller.hasAwsCredentials()
+      ? "Credentials are saved in Obsidian SecretStorage on this device. Enter both fields to replace them."
+      : "Stored only in Obsidian SecretStorage on this device.";
+    const accessKeySetting = new Setting(containerEl)
+      .setName("Access Key ID")
+      .setDesc(credentialDescription);
+    accessKeySetting.settingEl.addClass("s3-vault-sync-secret-setting");
+    accessKeySetting.addText((text) => {
+      asPasswordInput(text)
+        .setPlaceholder("Access Key ID")
+        .onChange((value) => {
+          accessKeyId = value.trim();
+          updateCredentialButton();
+        });
+      addVisibilityButton(accessKeySetting, text);
+    });
+
+    const secretKeySetting = new Setting(containerEl)
+      .setName("Secret Access Key");
+    secretKeySetting.settingEl.addClass("s3-vault-sync-secret-setting");
+    secretKeySetting.addText((text) => {
+      asPasswordInput(text)
+        .setPlaceholder("Secret Access Key")
+        .onChange((value) => {
+          secretAccessKey = value;
+          updateCredentialButton();
+        });
+      addVisibilityButton(secretKeySetting, text);
+    });
+
     new Setting(containerEl)
-      .setName("AWS credentials")
-      .setDesc("Stored only in Obsidian SecretStorage for this Vault.")
-      .addText((text) =>
-        text
-          .setPlaceholder("Access Key ID")
-          .onChange((value) => {
-            accessKeyId = value.trim();
-          }),
-      )
-      .addText((text) =>
-        asPasswordInput(text)
-          .setPlaceholder("Secret Access Key")
-          .onChange((value) => {
-            secretAccessKey = value;
-          }),
-      )
-      .addButton((button) =>
-        button.setButtonText("Save credentials").onClick(async () => {
-          await this.controller.saveAwsCredentials({
-            accessKeyId,
-            secretAccessKey,
+      .setName("Save AWS credentials")
+      .setDesc("Both values are required when saving or replacing credentials.")
+      .addButton((button) => {
+        saveCredentialsButton = button;
+        button
+          .setButtonText("Save credentials")
+          .setDisabled(true)
+          .onClick(async () => {
+            await this.controller.saveAwsCredentials({
+              accessKeyId,
+              secretAccessKey,
+            });
+            accessKeyId = "";
+            secretAccessKey = "";
+            this.display();
           });
-        }),
-      );
+      });
 
     let password = "";
     let initializationRunning = false;
     let initializeButton: ButtonComponent | undefined;
     let renderStatus = (): void => {};
-    const passwordDescription =
-      "Creates a new encrypted remote Vault or unlocks an existing one.";
+    const vaultUnlocked = this.controller.isVaultUnlocked();
+    const passwordDescription = vaultUnlocked
+      ? "Unlocked on this device. The password is not stored; the Vault Key is kept in Obsidian SecretStorage."
+      : "The password is not stored. After a successful unlock, the Vault Key is kept in Obsidian SecretStorage.";
     const passwordSetting = new Setting(containerEl)
       .setName("Vault password")
-      .setDesc(passwordDescription)
-      .addText((text) =>
-        asPasswordInput(text).onChange((value) => {
-          password = value;
-        }),
+      .setDesc(passwordDescription);
+    passwordSetting.settingEl.addClass("s3-vault-sync-secret-setting");
+    passwordSetting.addText((text) => {
+      asPasswordInput(text).onChange((value) => {
+        password = value;
+        initializeButton?.setDisabled(!password || initializationRunning);
+        initializeButton?.setButtonText(
+          vaultUnlocked ? "Unlock again" : "Initialize or unlock",
+        );
+      });
+      addVisibilityButton(passwordSetting, text);
+    });
+
+    const encryptionSetting = new Setting(containerEl)
+      .setName("Vault encryption")
+      .setDesc(
+        vaultUnlocked
+          ? "This device remains unlocked across restarts unless its Obsidian SecretStorage is cleared."
+          : "Creates a new encrypted remote Vault or unlocks an existing one.",
       )
       .addButton((button) => {
         initializeButton = button;
-        button.setButtonText("Initialize or unlock").onClick(async () => {
-          initializationRunning = true;
-          button.setDisabled(true);
-          renderStatus();
-          try {
-            await this.controller.initializeOrUnlock(password);
-          } finally {
-            initializationRunning = false;
-            password = "";
-            this.display();
-          }
-        });
+        button
+          .setButtonText(vaultUnlocked ? "Unlock again" : "Initialize or unlock")
+          .setDisabled(true)
+          .onClick(async () => {
+            initializationRunning = true;
+            button.setDisabled(true);
+            renderStatus();
+            try {
+              await this.controller.initializeOrUnlock(password);
+            } finally {
+              initializationRunning = false;
+              password = "";
+              this.display();
+            }
+          });
       });
 
     new Setting(containerEl)
@@ -263,7 +327,7 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
       const progressLabel = this.controller.getProgressLabel();
       statusSetting.setDesc(status);
       if (initializationRunning && initializeButton) {
-        passwordSetting.setDesc(status);
+        encryptionSetting.setDesc(status);
         initializeButton.setButtonText(progressLabel ?? "Initializing…");
       }
       if (manualSyncRunning && syncButton) {

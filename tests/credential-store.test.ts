@@ -30,7 +30,8 @@ describe("CredentialStore", () => {
     store.saveAwsCredentials(credentials);
     store.saveVaultKey(vaultKey);
 
-    expect(store.loadAwsCredentials()).toEqual(credentials);
-    expect(store.loadVaultKey()).toEqual(vaultKey);
+    const reloadedStore = new CredentialStore(secrets);
+    expect(reloadedStore.loadAwsCredentials()).toEqual(credentials);
+    expect(reloadedStore.loadVaultKey()).toEqual(vaultKey);
   });
 });

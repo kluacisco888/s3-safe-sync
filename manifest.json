@@ -1,7 +1,7 @@
 {
   "id": "s3-vault-sync",
   "name": "S3 Safe Sync",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "minAppVersion": "1.12.3",
   "description": "Synchronize Vault files through your own Amazon S3 bucket with end-to-end encryption and deletion-safe history.",
   "author": "kluacisco888",

@@ -49,6 +49,8 @@ For each device, enter:
 
 Credentials and the unlocked Vault key are stored in Obsidian SecretStorage. The Vault password itself is not stored. Vault Markdown files remain ordinary local files; encryption protects data placed in S3.
 
+Credential and password fields are masked by default and provide temporary Show/Hide controls. On mobile, each secret uses its own full-width row. After a successful unlock, the settings page reports that the device is unlocked; the password field remains empty because the stored Vault Key, not the password, is reused across restarts.
+
 For a new shared Vault, initialize one trusted desktop first. Let it finish, then configure other devices with the same bucket, prefix, and password. Disable Remotely Save before migrating and never let both plugins write to the same data during cutover.
 
 ## Suggested IAM policy

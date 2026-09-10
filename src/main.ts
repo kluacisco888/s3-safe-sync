@@ -398,6 +398,16 @@ export default class S3VaultSyncPlugin
     );
   }
 
+  hasAwsCredentials(): boolean {
+    return this.credentials.loadAwsCredentials() !== undefined;
+  }
+
+  isVaultUnlocked(): boolean {
+    return Boolean(
+      this.data.settings.vaultId && this.credentials.loadVaultKey(),
+    );
+  }
+
   private async initializeOrUnlockExclusive(password: string): Promise<void> {
     const assertTarget = this.captureTargetGuard();
     const { bucket, region } = this.data.settings;
