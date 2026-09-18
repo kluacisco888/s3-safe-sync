@@ -112,6 +112,21 @@ const trashFileIfPresent = async (
   }
 };
 
+const restoreBackupWithoutOverwrite = async (
+  adapter: SafeWriteAdapter,
+  journal: WriteJournal,
+  backupHash: string,
+): Promise<void> => {
+  // Copy must reject an existing destination, including one created after our last read.
+  await adapter.copy(journal.backupPath, journal.targetPath);
+  if (
+    (await readHash(adapter, journal.targetPath)) !== backupHash ||
+    (await readHash(adapter, journal.backupPath)) !== backupHash
+  ) {
+    throw new Error(`Restored backup needs review for ${journal.targetPath}; preserving ${journal.journalPath} and staged content`);
+  }
+};
+
 const recoverJournal = async (
   adapter: SafeWriteAdapter,
   journal: WriteJournal,
@@ -120,15 +135,13 @@ const recoverJournal = async (
   const backupExists = await adapter.exists(journal.backupPath);
   const targetHash = await readHash(adapter, journal.targetPath);
   if (backupExists) {
-    if (targetHash === journal.expectedHash) {
+    if (targetHash === journal.expectedHash ||
+      (typeof journal.originalHash === "string" && targetHash === journal.originalHash)) {
       const backupHash = await readHash(adapter, journal.backupPath);
       if (
         journal.originalHash === undefined ||
         backupHash !== journal.originalHash
       ) {
-        if (allowUnknownTarget) {
-          await adapter.rename(journal.backupPath, journal.targetPath);
-        }
         throw new Error(
           `Staged backup needs review for ${journal.targetPath}; preserving ${journal.journalPath} and staged content`,
         );
@@ -140,14 +153,15 @@ const recoverJournal = async (
         journal.originalHash === undefined ||
         backupHash !== journal.originalHash
       ) {
-        if (allowUnknownTarget) {
-          await adapter.rename(journal.backupPath, journal.targetPath);
+        if (allowUnknownTarget && backupHash !== undefined) {
+          await restoreBackupWithoutOverwrite(adapter, journal, backupHash);
         }
         throw new Error(
           `Staged backup needs review for ${journal.targetPath}; preserving ${journal.journalPath} and staged content`,
         );
       }
-      await adapter.rename(journal.backupPath, journal.targetPath);
+      await restoreBackupWithoutOverwrite(adapter, journal, backupHash);
+      await trashFileIfPresent(adapter, journal.backupPath);
     } else {
       throw new Error(
         `Staged write needs review for ${journal.targetPath}; preserving ${journal.journalPath} and ${journal.backupPath}`,

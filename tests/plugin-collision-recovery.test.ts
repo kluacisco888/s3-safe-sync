@@ -3,12 +3,12 @@ import type { App, PluginManifest, Vault } from "obsidian";
 
 const host = vi.hoisted(() => {
   const stored: Record<string, unknown> = {};
-  return {stored, failSave: false, request: vi.fn()};
+  return {stored, failSave: false, isMobile: false, request: vi.fn()};
 });
 vi.mock("obsidian", () => ({
   App: class {}, PluginSettingTab: class {}, Modal: class {}, Setting: class {}, FileSystemAdapter: class {},
   TFile: class { constructor(public path: string, public stat: {mtime: number; size: number}) {} },
-  Platform: {isDesktop: false, isDesktopApp: false, isMobile: false, isAndroidApp: false},
+  Platform: {isDesktop: false, isDesktopApp: false, get isMobile() {return host.isMobile;}, isAndroidApp: false},
   normalizePath: (path: string) => path,
   requestUrl: host.request,
   Notice: class {messageEl = {createEl: () => ({addEventListener: () => {}})}; hide() {}},
@@ -26,17 +26,18 @@ import { sha256Content } from "../src/sync/content-hash";
 import { DEFAULT_SETTINGS } from "../src/plugin/settings";
 import { VaultCrypto } from "../src/crypto/vault-crypto";
 import { BootstrapStore } from "../src/storage/bootstrap-store";
-import { RemoteStore } from "../src/storage/remote-store";
+import { RemoteStore, type CommitChange } from "../src/storage/remote-store";
 import type { ObjectStore, StoredObject } from "../src/storage/object-store";
 import { ObsidianVaultPort } from "../src/plugin/obsidian-vault-port";
 
-afterEach(() => {vi.unstubAllGlobals(); host.failSave = false; host.request.mockReset();});
+afterEach(() => {vi.unstubAllGlobals(); host.failSave = false; host.isMobile = false; host.request.mockReset();});
 
 const start = async (files: Map<string, string>, secrets = new Map<string, string>()) => {
   vi.stubGlobal("window", {setInterval: () => 1, clearTimeout: () => {}, setTimeout: () => 1});
   vi.stubGlobal("document", {visibilityState: "hidden"});
   const vault = {
     adapter: {exists: async () => false},
+    getFiles: () => [...files].map(([path, body]) => Object.assign(new TFile(), {path, stat: {mtime: 1, size: new TextEncoder().encode(body).byteLength}})),
     getAbstractFileByPath: (path: string) => files.has(path) ? Object.assign(new TFile(), {path, stat: {mtime: 1, size: files.get(path)!.length}}) : null,
     readBinary: async (file: {path: string}) => new TextEncoder().encode(files.get(file.path)).buffer,
   };
@@ -59,6 +60,79 @@ const initial = async () => {
 };
 
 describe("plugin collision recovery persistence", () => {
+  it.each([{paused: false, deferred: false}, {paused: true, deferred: false}, {paused: false, deferred: true}])(
+    "keeps remaining imports actionable without treating device-limit deferrals as errors (paused=$paused, deferred=$deferred)", async ({paused, deferred}) => {
+    host.stored = {settings: {...DEFAULT_SETTINGS, replicaId: "test", bucket: "fixture", vaultId: "vault"}};
+    const data = new Map<string, StoredObject>();
+    let sequence = 0;
+    const objects: ObjectStore = {
+      get: async key => data.get(key), list: async prefix => [...data.keys()].filter(key => key.startsWith(prefix)),
+      delete: async key => {data.delete(key);},
+      put: async (key, body) => {
+        const value = {body, etag: `"test-${++sequence}"`, lastModified: "Fri, 18 Sep 2026 00:00:00 GMT"};
+        data.set(key, value); return value;
+      },
+    };
+    const vaultKey = new Uint8Array(32);
+    const remote = await RemoteStore.open({objects, prefix: "obs-sync", vaultKey});
+    const changes: CommitChange[] = [];
+    if (deferred) {
+      host.isMobile = true;
+      vi.stubGlobal("navigator", {connection: {type: "cellular"}});
+      const body = new Uint8Array(11 * 1024 * 1024);
+      await remote.writeBlob("large-blob", body);
+      changes.push({kind: "set-entry", entry: {kind: "live", entryId: "large", path: "large.bin", revision: {
+        blobId: "large-blob", revisionId: "large-revision", size: body.byteLength,
+        contentHash: await sha256Content(body), createdAt: "2026-09-18T00:00:00Z",
+      }}});
+    }
+    await remote.initialize({head: {commitId: "first", generation: 1, protocolVersion: 1, vaultId: "vault"},
+      commit: {commitId: "first", vaultId: "vault", protocolVersion: 1, createdAt: "2026-09-18T00:00:00Z", replicaId: "fixture", parentIds: [], changes}});
+    host.request.mockImplementation(async (request: {url: string; method: string; headers: Record<string, string>; body?: ArrayBuffer}) => {
+      const url = new URL(request.url);
+      if (url.searchParams.get("list-type") === "2") {
+        expect(request.method).toBe("GET");
+        const prefix = url.searchParams.get("prefix") ?? "";
+        const contents = [...data.keys()].filter(key => key.startsWith(prefix)).map(key => `<Contents><Key>${key}</Key></Contents>`).join("");
+        return {status: 200, arrayBuffer: new TextEncoder().encode(`<ListBucketResult><IsTruncated>false</IsTruncated>${contents}</ListBucketResult>`).buffer, headers: {}};
+      }
+      const key = decodeURIComponent(url.pathname.slice(1));
+      let stored = data.get(key);
+      if (request.method === "PUT") {
+        const headers = Object.fromEntries(Object.entries(request.headers).map(([name, value]) => [name.toLowerCase(), value]));
+        if ((headers["if-none-match"] && stored) || (headers["if-match"] && headers["if-match"] !== stored?.etag)) {
+          return {status: 412, arrayBuffer: new ArrayBuffer(0), headers: {}};
+        }
+        stored = await objects.put(key, new Uint8Array(request.body!));
+      } else expect(request.method).toBe("GET");
+      return {status: stored ? 200 : 404, arrayBuffer: request.method === "PUT" ? new ArrayBuffer(0) : stored?.body.slice().buffer ?? new ArrayBuffer(0),
+        headers: {etag: stored?.etag ?? '"missing"', date: "Fri, 18 Sep 2026 00:00:00 GMT", "last-modified": "Fri, 18 Sep 2026 00:00:00 GMT"}};
+    });
+    const secrets = new Map([["s3-vault-sync-access-key-id", "fixture-access"], ["s3-vault-sync-secret-access-key", "fixture-secret"],
+      ["s3-vault-sync-vault-key", btoa(String.fromCharCode(...vaultKey))]]);
+    const plugin = await start(new Map([["first.md", "first"], ["second.md", "second"]]), secrets);
+    const statuses: string[] = [];
+    plugin.onStatusChange(status => statuses.push(status.text));
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^Action required:/);
+    expect(plugin.getLocalIssues()).toHaveLength(2);
+    if (paused) await plugin.togglePause();
+    await plugin.importCandidate("first.md");
+    expect(plugin.getLocalIssues()).toEqual([{kind: "import-candidate", path: "second.md"}]);
+    expect(plugin.getStatusText()).toMatch(/^Action required:/);
+    expect(statuses.at(-1)).toMatch(/^Action required:/);
+    await plugin.importCandidate("second.md");
+    expect(plugin.getLocalIssues()).toEqual([]);
+    expect(plugin.getStatusText()).toMatch(paused ? /^Paused:/ : /^Idle:/);
+    if (deferred) {
+      expect(plugin.getDeferredDownloads()).toEqual([{entryId: "large", path: "large.bin", reason: "device-limit", size: 11 * 1024 * 1024}]);
+      expect(plugin.getStatusText()).toContain("Deferred downloads: 1");
+    }
+    expect(Object.values((await remote.readSnapshot((await remote.readHead())!.value)).entries).map(entry => entry.path).sort())
+      .toEqual(deferred ? ["first.md", "large.bin", "second.md"] : ["first.md", "second.md"]);
+    plugin.onunload();
+  });
+
   it("detects canonical folder names and file ancestors even when no synchronizable files are listed", async () => {
     const vault = {adapter: {exists: async () => false}, getAllLoadedFiles: () => [
       {path: "EMPTY.md"}, Object.assign(new TFile(), {path: "parent.md"}),

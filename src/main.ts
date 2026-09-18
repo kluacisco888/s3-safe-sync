@@ -495,7 +495,7 @@ export default class S3VaultSyncPlugin
       this.pendingLocalIssues = this.pendingLocalIssues.filter(
         (issue) => issue.kind !== "import-candidate" || issue.path !== path,
       );
-      this.setStatus("Idle", "Local file uploaded to S3 as a new file.");
+      this.reportManualCompletion("Local file uploaded to S3 as a new file.");
     } catch (error) {
       this.showError(error);
       throw error;
@@ -510,7 +510,7 @@ export default class S3VaultSyncPlugin
       this.pendingDeferredDownloads = this.pendingDeferredDownloads.filter(
         (entry) => entry.entryId !== entryId,
       );
-      this.setStatus("Idle", "Large file downloaded after explicit confirmation.");
+      this.reportManualCompletion("Large file downloaded after explicit confirmation.");
     } catch (error) {
       this.showError(error);
       throw error;
@@ -529,7 +529,7 @@ export default class S3VaultSyncPlugin
       await this.runExclusiveSyncService((service) =>
         service.restoreRevision(entryId, revisionId),
       );
-      this.setStatus("Idle", "Historical Revision restored.");
+      this.reportManualCompletion("Historical Revision restored.");
     } catch (error) {
       this.showError(error);
       throw error;
@@ -550,7 +550,7 @@ export default class S3VaultSyncPlugin
       await this.runExclusiveSyncService((service) =>
         service.restoreDeleted(entryId, revisionId),
       );
-      this.setStatus("Idle", "Deleted file restored as a new Revision.");
+      this.reportManualCompletion("Deleted file restored as a new Revision.");
     } catch (error) {
       this.showError(error);
       throw error;
@@ -1081,10 +1081,28 @@ export default class S3VaultSyncPlugin
       await this.runExclusiveSyncService((service) =>
         service.resolveConflict(entryId, resolution),
       );
-      this.setStatus("Idle", "Conflict resolved and shared with every device.");
+      this.reportManualCompletion("Conflict resolution saved to S3.");
     } catch (error) {
       this.showError(error);
       throw error;
+    }
+  }
+
+  private reportManualCompletion(detail: string): void {
+    // A queued/running sync owns its status; one manual success cannot declare the whole Vault settled.
+    if (this.syncRequests.isRunning) return;
+    if (this.pendingLocalIssues.length || this.getConflicts().length ||
+      this.pendingDeferredDownloads.some(entry => entry.reason === "unsupported-path") ||
+      this.pendingBulkDeletion || this.data.pendingCollisionRename) {
+      this.setStatus("Action required", `${detail} Other items still need attention. Open sync status to review them.`);
+    } else {
+      const deferred = this.pendingDeferredDownloads.length
+        ? ` Deferred downloads: ${this.pendingDeferredDownloads.length}.`
+        : "";
+      this.setStatus(
+        this.data.settings.paused ? "Paused" : "Idle",
+        `${detail}${deferred}${this.data.settings.paused ? " Automatic sync remains paused." : ""}`,
+      );
     }
   }
 
