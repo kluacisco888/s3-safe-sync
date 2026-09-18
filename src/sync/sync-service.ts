@@ -891,8 +891,8 @@ export class SyncService {
     const snapshot = await this.options.remote.readSnapshot(head.value);
     const entry = snapshot.entries[entryId];
     const revision = entry?.kind === "live" ? entry.history?.find(value => value.revisionId === revisionId) : undefined;
-    if (!revision) throw new Error("This historical version is no longer available. Refresh version history.");
-    if (this.exceedsAutomaticFileLimit(entry!.path, revision.size)) throw new Error("This preview exceeds this device's transfer limit.");
+    if (entry?.kind !== "live" || !revision) throw new Error("This historical version is no longer available. Refresh version history.");
+    if (this.exceedsAutomaticFileLimit(entry.path, revision.size)) throw new Error("This preview exceeds this device's transfer limit.");
     return this.readDeletedRevisionCopy(entryId, revision, head.serverDate);
   }
 

@@ -751,6 +751,14 @@ describe("SyncService", () => {
       expect(await cache.load()).toBeUndefined();
     });
 
+    it.each(["missing-entry", "missing-revision"])("rejects an unavailable backup (%s) with a readable error", async missing => {
+      const {service, remote} = await setup();
+      const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      const entry = Object.values(snapshot.entries).find(value => value.path === "article.md")!;
+      await expect(service.readHistoricalRevision(missing === "missing-entry" ? "missing" : entry.entryId, "missing"))
+        .rejects.toThrow("This historical version is no longer available");
+    });
+
     it("refuses expired or corrupted backup previews and restores", async () => {
       const {service, remote, local, objects} = await setup();
       const review = await service.reviewLocalContent("article.md");
