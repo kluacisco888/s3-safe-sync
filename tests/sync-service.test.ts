@@ -614,6 +614,173 @@ describe("SyncService", () => {
     expect((await remote.readHead())?.value.generation).toBe(1);
   });
 
+  describe("reviewing local content without a trusted base", () => {
+    const setup = async () => {
+      const objects = new MemoryObjectStore();
+      const remote = await RemoteStore.open({objects, prefix: "test", vaultKey: new Uint8Array(32)});
+      const source = new MemoryVault();
+      await source.write("article.md", new TextEncoder().encode("remote article"));
+      await source.write("unreviewed.md", new TextEncoder().encode("remote other"));
+      const sourceCache = new MemorySyncCache();
+      const sourceService = new SyncService({cache: sourceCache, local: source, remote, replicaId: "source"});
+      await sourceService.initializeNew("vault");
+      const local = new MemoryVault();
+      await local.write("article.md", new TextEncoder().encode("local article"));
+      await local.write("unreviewed.md", new TextEncoder().encode("local other"));
+      const cache = new MemorySyncCache();
+      const service = new SyncService({cache, local, remote, replicaId: "new-device"});
+      return {objects, remote, local, cache, service, source, sourceService, sourceCache};
+    };
+
+    it("preserves a verified local copy before accepting remote and leaves other mismatches blocked", async () => {
+      const {service, remote, local} = await setup();
+      expect((await service.synchronize()).localIssues).toHaveLength(2);
+      const review = await service.reviewLocalContent("article.md");
+      expect(review.localPreview).toBe("local article");
+      expect(review.remoteVersions[0]?.preview).toBe("remote article");
+      const copyPath = await service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken);
+      expect(copyPath).toMatch(/^article \(local copy .+\)\.md$/);
+      expect(local.readText(copyPath!)).toBe("local article");
+      expect(local.readText("article.md")).toBe("remote article");
+      const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      const copy = Object.values(snapshot.entries).find(entry => entry.path === copyPath);
+      if (copy?.kind !== "live") throw new Error("Local copy was not published");
+      expect(new TextDecoder().decode(await remote.readBlob(copy.revision.blobId))).toBe("local article");
+      const next = await service.synchronize();
+      expect(next.localIssues).toEqual([{kind: "bootstrap-mismatch", path: "unreviewed.md"}]);
+      expect(local.readText("unreviewed.md")).toBe("local other");
+      const otherReview = await service.reviewLocalContent("unreviewed.md");
+      await service.preserveLocalCopyAndAcceptRemote("unreviewed.md", otherReview.reviewToken);
+      expect((await service.synchronize()).status).toBe("complete");
+      expect((await service.synchronize()).uploaded).toBe(0);
+    });
+
+    it.each(["local", "remote"])("rejects the decision if %s content changed after preview", async side => {
+      const {service, remote, local, source, sourceService} = await setup();
+      const review = await service.reviewLocalContent("article.md");
+      if (side === "local") await local.write("article.md", new TextEncoder().encode("new draft"));
+      else {
+        await source.write("article.md", new TextEncoder().encode("new remote"));
+        await sourceService.synchronize();
+      }
+      const before = (await remote.readHead())!.value.commitId;
+      await expect(service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken))
+        .rejects.toThrow("changed. Review");
+      expect((await remote.readHead())!.value.commitId).toBe(before);
+      expect((await local.list()).length).toBe(2);
+      expect(local.readText("article.md")).toBe(side === "local" ? "new draft" : "local article");
+    });
+
+    it("keeps the original local bytes when uploaded preservation content is corrupt", async () => {
+      const {service, remote, local, objects} = await setup();
+      const review = await service.reviewLocalContent("article.md");
+      objects.corruptNextBlobPut = true;
+      const before = (await remote.readHead())!.value.commitId;
+      await expect(service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken)).rejects.toThrow();
+      expect(local.readText("article.md")).toBe("local article");
+      expect((await remote.readHead())!.value.commitId).toBe(before);
+      expect((await local.list()).length).toBe(3); // The independent local copy is also retained.
+    });
+
+    it("stops if the original is edited during upload without overwriting the draft", async () => {
+      const {service, local, objects} = await setup();
+      const review = await service.reviewLocalContent("article.md");
+      objects.onPut = async key => {
+        if (!key.includes("/blobs/")) return;
+        objects.onPut = undefined;
+        await local.write("article.md", new TextEncoder().encode("typing during upload"));
+      };
+      await expect(service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken)).rejects.toThrow("changed");
+      expect(local.readText("article.md")).toBe("typing during upload");
+    });
+
+    it("does not accept an unrelated remote update into an existing file's base", async () => {
+      const {service, local, cache, sourceCache, source, sourceService} = await setup();
+      cache.state = structuredClone(sourceCache.state);
+      await local.write("unreviewed.md", new TextEncoder().encode("remote other"));
+      await source.write("unreviewed.md", new TextEncoder().encode("remote updated while reviewing"));
+      await sourceService.synchronize();
+      const priorBase = cache.state!.snapshot.entries;
+      const review = await service.reviewLocalContent("article.md");
+      await service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken);
+      const other = Object.values(priorBase).find(entry => entry.path === "unreviewed.md")!;
+      expect(cache.state!.snapshot.entries[other.entryId]).toEqual(other);
+      await service.synchronize();
+      expect(local.readText("unreviewed.md")).toBe("remote updated while reviewing");
+    });
+
+    it("reports mobile limits without reading oversized local or remote content", async () => {
+      const {remote, local} = await setup();
+      const service = new SyncService({remote, local, cache: new MemorySyncCache(), replicaId: "phone", maxAutomaticFileBytes: 5});
+      const reads = local.readCount;
+      const review = await service.reviewLocalContent("article.md");
+      expect(review.blockedReason).toContain("device's transfer limit");
+      expect(local.readCount).toBe(reads);
+      await expect(service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken)).rejects.toThrow("device's transfer limit");
+    });
+
+    it("keeps the original draft after a concurrent remote commit wins the Head race", async () => {
+      const {service, remote, local, objects, source, sourceService} = await setup();
+      const review = await service.reviewLocalContent("article.md");
+      objects.onPut = async key => {
+        if (!key.includes("/blobs/")) return;
+        objects.onPut = undefined;
+        await source.write("article.md", new TextEncoder().encode("another device edited during backup"));
+        await sourceService.synchronize();
+      };
+      await expect(service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken)).rejects.toThrow("Head changed");
+      expect(local.readText("article.md")).toBe("local article");
+      const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      const original = Object.values(snapshot.entries).find(entry => entry.path === "article.md");
+      if (original?.kind !== "live") throw new Error("Expected remote file");
+      expect(new TextDecoder().decode(await remote.readBlob(original.revision.blobId)))
+        .toBe("another device edited during backup");
+    });
+
+    it("preserves a local copy without resurrecting the deleted remote Entry", async () => {
+      const {service, remote, local, source, sourceService} = await setup();
+      await source.delete("article.md");
+      const deletion = await sourceService.synchronize();
+      await sourceService.synchronize(deletion.bulkDeletion!.entryIds);
+      const review = await service.reviewLocalContent("article.md");
+      expect(review.remoteKind).toBe("deleted");
+      const copyPath = await service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken);
+      expect(local.readText("article.md")).toBeUndefined();
+      expect(local.readText(copyPath!)).toBe("local article");
+      const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      expect(Object.values(snapshot.entries).find(entry => entry.path === "article.md")?.kind).toBe("deleted");
+      expect(Object.values(snapshot.entries).find(entry => entry.path === copyPath)?.kind).toBe("live");
+    });
+
+    it("preserves additional edits made while an existing conflict is waiting", async () => {
+      const {service, remote, local, cache, sourceCache, source, sourceService} = await setup();
+      cache.state = structuredClone(sourceCache.state);
+      await source.write("article.md", new TextEncoder().encode("concurrent remote edit"));
+      await sourceService.synchronize();
+      await service.synchronize();
+      const before = Object.values(cache.state!.snapshot.entries).find(entry => entry.path === "article.md");
+      if (before?.kind !== "conflicted") throw new Error("Expected edit/edit conflict");
+      await local.write("article.md", new TextEncoder().encode("extra local edits during conflict"));
+      expect((await service.synchronize()).localIssues).toContainEqual({kind: "resolution-mismatch", path: "article.md"});
+      const review = await service.reviewLocalContent("article.md");
+      expect(review.remoteKind).toBe("conflicted");
+      const copyPath = await service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken);
+      expect(local.readText(copyPath!)).toBe("extra local edits during conflict");
+      const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      expect(snapshot.entries[before.entryId]).toEqual(before);
+      expect((await service.synchronize()).localIssues.some(issue => issue.kind === "resolution-mismatch")).toBe(false);
+    });
+
+    it("can receive a reviewed remote file when the local file was removed", async () => {
+      const {service, local} = await setup();
+      await local.delete("article.md");
+      const review = await service.reviewLocalContent("article.md");
+      expect(review.localExists).toBe(false);
+      expect(await service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken)).toBeUndefined();
+      expect(local.readText("article.md")).toBe("remote article");
+    });
+  });
+
   it("does not bind a cache-loss mismatch to an oversized remote Entry", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);

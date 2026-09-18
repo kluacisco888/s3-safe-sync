@@ -2,6 +2,7 @@ import {
   Notice,
   Platform,
   Plugin,
+  TFile,
   type TAbstractFile,
 } from "obsidian";
 
@@ -28,6 +29,7 @@ import {
   type CachedSyncState,
   type DeferredDownloadEntry,
   type LocalSyncIssue,
+  type LocalContentReview,
   type PossibleRenameResolution,
   type SyncCachePort,
   type SyncProgress,
@@ -338,6 +340,34 @@ export default class S3VaultSyncPlugin
       // A separate delete/add decision may still need the existing bulk-delete confirmation.
       if (!this.pendingBulkDeletion) this.approvedRenameResolution = undefined;
     }
+  }
+
+  reviewLocalContent(path: string): Promise<LocalContentReview> {
+    return this.runExclusiveSyncService(service => service.reviewLocalContent(path));
+  }
+
+  async preserveLocalCopyAndAcceptRemote(path: string, reviewToken: string): Promise<string | undefined> {
+    try {
+      const copyPath = await this.runExclusiveSyncService(service =>
+        service.preserveLocalCopyAndAcceptRemote(path, reviewToken),
+      );
+      this.pendingLocalIssues = this.pendingLocalIssues.filter(issue => !("path" in issue && issue.path === path));
+      if (copyPath) new Notice(`Local version preserved: ${copyPath}`);
+      await this.requestSync();
+      return copyPath;
+    } catch (error) {
+      this.showError(error);
+      throw error;
+    }
+  }
+
+  async openLocalFile(path: string): Promise<void> {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) {
+      new Notice("This file is not present on this device. Use the device that holds the file.");
+      return;
+    }
+    await this.app.workspace.getLeaf(false).openFile(file);
   }
 
   async keepConflictDeleted(entryId: string): Promise<void> {

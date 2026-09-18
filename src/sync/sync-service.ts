@@ -163,6 +163,17 @@ export type PossibleRenameResolution = {
   | { kind: "separate" }
 );
 
+export interface LocalContentReview {
+  path: string;
+  reviewToken: string;
+  localExists: boolean;
+  localSize: number;
+  localPreview?: string;
+  remoteKind: VaultEntry["kind"];
+  remoteVersions: Array<{ size: number; createdAt: string; preview?: string }>;
+  blockedReason?: string;
+}
+
 // A second rename can arrive after Head publication but before cache rebuilding.
 // In that window the accepted snapshot still proves identity even if files is empty.
 const applicableRenames = (
@@ -521,6 +532,151 @@ export class SyncService {
         vaultId: snapshot.vaultId,
       }),
     );
+  }
+
+  async reviewLocalContent(path: string): Promise<LocalContentReview> {
+    const { review } = await this.loadLocalContentReview(path);
+    return review;
+  }
+
+  private async loadLocalContentReview(path: string) {
+    const head = await this.options.remote.readHead();
+    if (!head) throw new Error("Remote Store is not initialized");
+    const snapshot = await this.options.remote.readSnapshot(head.value);
+    const matches = Object.values(snapshot.entries).filter(entry => entry.path === path);
+    if (matches.length !== 1) throw new Error("Remote path changed or is ambiguous. Sync and review its current path.");
+    const entry = matches[0]!;
+    const file = await this.options.local.stat(path);
+    const revisions = entry.kind === "live" ? [entry.revision]
+      : entry.kind === "conflicted" ? entry.candidates : [];
+    const materialized = entry.kind === "live" ? entry.revision
+      : entry.kind === "conflicted" ? entry.candidates.find(r => r.contentHash === entry.materializedContentHash)
+      : undefined;
+    if (entry.kind === "conflicted" && entry.materializedContentHash && !materialized) {
+      throw new RemoteStateError("Conflict has no authenticated materialized candidate");
+    }
+    const blockedReason = (file && this.exceedsAutomaticFileLimit(path, file.size)) ||
+      revisions.some(revision => this.exceedsAutomaticFileLimit(path, revision.size))
+      ? "This review exceeds this device's transfer limit. Resolve it on a desktop, or connect to Wi-Fi for attachments below the mobile limit."
+      : this.options.local.supportsPath?.(path) === false
+        ? "This path is unsupported on this device. Rename it on a compatible desktop first."
+        : undefined;
+    const previewLimit = 256 * 1024;
+    const textPreview = (body: Uint8Array): string | undefined => {
+      if (body.byteLength > previewLimit) return undefined;
+      try {
+        const text = new TextDecoder("utf-8", {fatal: true}).decode(body);
+        const binary = [...text].some(character => {
+          const code = character.charCodeAt(0);
+          return code < 32 && code !== 9 && code !== 10 && code !== 13;
+        });
+        return binary ? undefined : text;
+      } catch { return undefined; }
+    };
+    let localPreview: string | undefined;
+    let localHash: string | null = null;
+    if (file && !blockedReason) {
+      if (file.size <= previewLimit || !this.options.local.hashContent) {
+        const body = await this.options.local.read(path);
+        if (body.byteLength !== file.size) throw new LocalStateChangedError(path);
+        localHash = await sha256(body);
+        localPreview = textPreview(body);
+      } else {
+        const hashed = await this.options.local.hashContent(path, {yieldToHost: this.options.yieldDuringHashing});
+        if (hashed.size !== file.size) throw new LocalStateChangedError(path);
+        localHash = hashed.contentHash;
+      }
+    }
+    const remoteVersions: LocalContentReview["remoteVersions"] = [];
+    for (const [index, revision] of revisions.entries()) {
+      let preview: string | undefined;
+      if (!blockedReason && index < 3 && revision.size <= previewLimit) {
+        const body = await this.options.remote.readBlob(revision.blobId);
+        if (!body || body.byteLength !== revision.size || await sha256(body) !== revision.contentHash) {
+          throw new RemoteStateError("Remote review content failed verification");
+        }
+        preview = textPreview(body);
+      }
+      remoteVersions.push({size: revision.size, createdAt: revision.createdAt, preview});
+    }
+    const review: LocalContentReview = {
+      path, localExists: !!file, localSize: file?.size ?? 0, localPreview,
+      remoteKind: entry.kind, remoteVersions, blockedReason,
+      reviewToken: await sha256(new TextEncoder().encode(JSON.stringify({
+        vault: snapshot.vaultId, commit: head.value.commitId, entryId: entry.entryId, path,
+        localHash, size: file?.size ?? null,
+      }))),
+    };
+    return {head, snapshot, entry, file, localHash, materialized, review};
+  }
+
+  async preserveLocalCopyAndAcceptRemote(path: string, reviewToken: string): Promise<string | undefined> {
+    const {head, snapshot, entry, file, localHash, materialized, review} = await this.loadLocalContentReview(path);
+    if (review.blockedReason) throw new Error(review.blockedReason);
+    if (review.reviewToken !== reviewToken) throw new Error("Local or remote content changed. Review the versions again.");
+    await this.assertLocalContent(path, localHash);
+    await this.assertRemoteEntriesBeforePublication(snapshot, new Set([entry.entryId]), []);
+    let remoteBody: Uint8Array | undefined;
+    if (materialized) {
+      remoteBody = await this.options.remote.readBlob(materialized.blobId);
+      if (!remoteBody || remoteBody.byteLength !== materialized.size || await sha256(remoteBody) !== materialized.contentHash) {
+        throw new RemoteStateError("Remote content failed verification");
+      }
+    }
+    let copy: LiveEntry | undefined;
+    if (file && localHash) {
+      const localBody = await this.options.local.read(path);
+      if (localBody.byteLength !== file.size || await sha256(localBody) !== localHash) throw new LocalStateChangedError(path);
+      const dot = path.lastIndexOf(".");
+      const extension = dot > path.lastIndexOf("/") ? path.slice(dot) : "";
+      const stem = extension ? path.slice(0, dot) : path;
+      const copyPath = `${stem} (local copy ${crypto.randomUUID()})${extension}`;
+      this.assertRemotePathAvailable(snapshot, "new-local-copy", copyPath);
+      await this.assertLocalContent(copyPath, null);
+      // Save the independent local copy first; failed uploads never remove this copy.
+      await this.options.local.write(copyPath, localBody, null);
+      const revision: RevisionRef = {blobId: crypto.randomUUID(), revisionId: crypto.randomUUID(),
+        contentHash: localHash, size: localBody.byteLength, createdAt: head.serverDate};
+      await this.options.remote.writeBlob(revision.blobId, localBody);
+      await this.assertRemoteRevision(revision);
+      copy = {entryId: crypto.randomUUID(), path: copyPath, kind: "live", revision};
+    }
+    await this.assertLocalContent(path, localHash);
+    const commitId = crypto.randomUUID();
+    await this.options.remote.advance({
+      expectedHeadEtag: head.etag,
+      head: {...head.value, commitId, generation: head.value.generation + 1},
+      commit: {commitId, createdAt: head.serverDate, vaultId: snapshot.vaultId, protocolVersion: 1,
+        parentIds: [head.value.commitId], replicaId: this.options.replicaId,
+        changes: copy ? [{kind: "set-entry", entry: copy}] : []},
+    });
+    // Only materialize the reviewed remote state after the local copy is accepted by S3.
+    await this.assertLocalContent(path, localHash);
+    if (remoteBody) await this.options.local.write(path, remoteBody, localHash);
+    else if (file) await this.options.local.delete(path, localHash);
+
+    // Accept only the explicitly reviewed Entries. Other mismatches keep their old bases.
+    const current = await this.options.cache.load();
+    const next: CachedSyncState = current ? structuredClone(current) : {
+      files: {}, snapshot: {vaultId: snapshot.vaultId, protocolVersion: 1, commitId, entries: {}},
+      unmaterializedEntryIds: [],
+    };
+    for (const accepted of [entry, ...(copy ? [copy] : [])]) {
+      next.snapshot.entries[accepted.entryId] = accepted;
+      for (const [cachedPath, cachedFile] of Object.entries(next.files)) {
+        if (cachedFile.entryId === accepted.entryId) delete next.files[cachedPath];
+      }
+      const expectedHash = accepted.kind === "live" ? accepted.revision.contentHash
+        : accepted.kind === "conflicted" ? accepted.materializedContentHash : undefined;
+      const info = await this.options.local.stat(accepted.path);
+      if (info && expectedHash) {
+        await this.assertLocalContent(accepted.path, expectedHash);
+        next.files[accepted.path] = {...info, entryId: accepted.entryId, contentHash: expectedHash};
+      }
+      next.unmaterializedEntryIds = next.unmaterializedEntryIds?.filter(id => id !== accepted.entryId);
+    }
+    await this.options.cache.save(next);
+    return copy?.path;
   }
 
   async resolveConflict(

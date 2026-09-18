@@ -97,6 +97,8 @@ The plugin asks for confirmation before propagating more than 100 deletions or m
 
 Folder moves recorded during synchronization retain their Entry identities even if a later move makes the intermediate paths disappear from the local cache. Ambiguous missing/new paths appear as a collapsed summary with **Review and resolve**: confirm one-to-one moves to keep file history, or explicitly treat them as separate deletions and additions. Each decision is rechecked against fresh file hashes and the remote Commit; a changed plan requires a new review, and bulk deletion still requires its separate confirmation.
 
+When a new or reinstalled device has different local content at an existing remote path, use **Review versions**. The preservation action creates a uniquely named local-copy file, uploads and verifies it, then accepts the reviewed remote state at the original path. Other unreviewed files keep their previous synchronization bases. This also handles edits made while a conflict or deferred download was pending; existing remote conflicts and deletion records remain intact. The decision expires if either side changes. Large files and unsupported paths show the device restriction instead of bypassing it. Every local issue offers specific resolution guidance and affected paths can be opened or copied.
+
 ## Scope and limits
 
 The plugin synchronizes ordinary Vault files. It excludes Obsidian configuration, dot-prefixed and underscore-prefixed path segments, version-control directories, `node_modules`, and temporary Office files.

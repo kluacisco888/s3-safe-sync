@@ -6,6 +6,7 @@ import {
 } from "../src/storage/aws-s3-object-store";
 import { probeObjectStore } from "../src/storage/object-store-probe";
 import { HeadChangedError, RemoteStore } from "../src/storage/remote-store";
+import { SyncService, type CachedSyncState, type LocalVaultPort } from "../src/sync/sync-service";
 
 const accessKeyId = process.env.S3_VAULT_SYNC_TEST_ACCESS_KEY_ID;
 const secretAccessKey = process.env.S3_VAULT_SYNC_TEST_SECRET_ACCESS_KEY;
@@ -140,4 +141,40 @@ liveDescribe("AwsS3ObjectStore live integration", () => {
     expect(downloaded?.body[0]).toBe(1);
     expect(downloaded?.body.at(-1)).toBe(255);
   }, 20_000);
+
+  it("preserves both versions after a first-connect content mismatch", async () => {
+    const remote = await RemoteStore.open({objects: multipartObjects,
+      prefix: `${testPrefix}/content-review`, vaultKey: crypto.getRandomValues(new Uint8Array(32))});
+    const makeDevice = (initial: string) => {
+      let clock = 1;
+      const files = new Map([["article.md", {body: new TextEncoder().encode(initial), modifiedAt: clock}]]);
+      let state: CachedSyncState | undefined;
+      const local: LocalVaultPort = {
+        list: async () => [...files].map(([path, file]) => ({path, size: file.body.byteLength, modifiedAt: file.modifiedAt})),
+        stat: async path => { const file = files.get(path); return file ? {path, size: file.body.byteLength, modifiedAt: file.modifiedAt} : undefined; },
+        read: async path => { const file = files.get(path); if (!file) throw new Error("Missing test file"); return file.body.slice(); },
+        write: async (path, body, expected) => {
+          if (expected === null && files.has(path)) throw new Error("Test copy path occupied");
+          files.set(path, {body: body.slice(), modifiedAt: ++clock});
+        },
+        delete: async path => { files.delete(path); },
+        move: async () => { throw new Error("No move expected in this test"); },
+      };
+      const cache = {load: async () => state, save: async (next: CachedSyncState) => {state = next;}};
+      return {local, service: new SyncService({local, cache, remote, replicaId: initial})};
+    };
+    const first = makeDevice("remote test version");
+    await first.service.initializeNew("review-test-vault");
+    const second = makeDevice("local unsynced test version");
+    expect((await second.service.synchronize()).localIssues).toContainEqual({kind: "bootstrap-mismatch", path: "article.md"});
+    const review = await second.service.reviewLocalContent("article.md");
+    const copyPath = await second.service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken);
+    expect(new TextDecoder().decode(await second.local.read("article.md"))).toBe("remote test version");
+    expect(new TextDecoder().decode(await second.local.read(copyPath!))).toBe("local unsynced test version");
+    const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+    const copy = Object.values(snapshot.entries).find(entry => entry.path === copyPath);
+    if (copy?.kind !== "live") throw new Error("Verified local copy missing remotely");
+    expect(new TextDecoder().decode(await remote.readBlob(copy.revision.blobId))).toBe("local unsynced test version");
+    expect((await second.service.synchronize()).status).toBe("complete");
+  }, 60_000);
 });
