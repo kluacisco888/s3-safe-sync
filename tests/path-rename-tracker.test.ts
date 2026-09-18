@@ -3,6 +3,16 @@ import { describe, expect, it } from "vitest";
 import { PathRenameTracker } from "../src/sync/path-rename-tracker";
 
 describe("PathRenameTracker", () => {
+  it("replaces only the reviewed identity's intent and can recover back to its source", () => {
+    const tracker = new PathRenameTracker({"a.md": {entryId: "a", toPath: "intermediate.md"},
+      "other.md": {entryId: "other", toPath: "other-new.md"}});
+    tracker.setReviewedRename("a", "a.md", "chosen.md");
+    expect(tracker.serialize()).toEqual({"a.md": {entryId: "a", toPath: "chosen.md"},
+      "other.md": {entryId: "other", toPath: "other-new.md"}});
+    tracker.setReviewedRename("a", "a.md", "a.md");
+    expect(tracker.serialize()).toEqual({"other.md": {entryId: "other", toPath: "other-new.md"}});
+  });
+
   it("records both sides and stable source mappings for a folder rename", () => {
     const tracker = new PathRenameTracker();
 

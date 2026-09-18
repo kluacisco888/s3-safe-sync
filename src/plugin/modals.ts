@@ -22,8 +22,13 @@ import {
 import { copyText } from "./clipboard";
 import { actionButton } from "./modal-actions";
 import { LocalContentReviewModal } from "./content-review-modal";
+import { PathCollisionModal } from "./path-collision-modal";
+import type { PathCollisionReview, PathCollisionResolution } from "../sync/path-collision-review";
 
 export interface StatusModalController {
+  reviewPathCollision(paths: string[]): Promise<PathCollisionReview>;
+  resolvePathCollision(request: PathCollisionResolution): Promise<string>;
+  confirmInterruptedCollisionRename(paths: string[], reviewToken: string, side: "source" | "target"): Promise<void>;
   openSettings(): void;
   readConflictCandidate(entryId: string, revisionId: string): Promise<Uint8Array>;
   reviewLocalContent(path: string): Promise<LocalContentReview>;
@@ -73,7 +78,7 @@ const localIssueHelp = (issue: LocalSyncIssue): string => {
     case "bootstrap-mismatch": return "This device has no accepted common version for this path, which can happen on first connection, after reinstalling, or after losing local sync records. Compare and resolve shows the differences and lets you use local content, use S3 content, or keep both when both files exist. The unchosen version is preserved in 30-day history or a separate synced file. Clearing the cache cannot establish which version you intended.";
     case "resolution-mismatch": return "This file changed after a conflict was recorded. Compare and resolve shows the differences and can preserve these additional edits as a separate file before receiving the remote state. Remaining conflict candidates stay in the Conflict Center.";
     case "deferred-local-edit": return "The local file was edited while a newer remote version was deferred. Compare and resolve shows the differences and can preserve both when they fit this device's limit. Otherwise resolve on desktop; switching to Wi-Fi can help attachments below the mobile size limit.";
-    case "path-collision": return "These paths collide by case, Unicode normalization, or file ownership. Open the affected files on the device that holds them, give unrelated files distinct names, then Sync now. If the paths differ only by letter case, rename through a temporary distinct name. Do not delete either version to clear the warning.";
+    case "path-collision": return "These paths collide by case, Unicode normalization, or file ownership. A single displayed path can be an occupied rename target or multiple S3 records, not an invalid filename. Use Review path collision to inspect the related paths and safely rename a selected local file or S3 record without discarding either version.";
     case "unsupported-path": return "This filename cannot be created on this device. Copy the path and rename the file on a compatible desktop, then sync both devices. The original remains on the remote; changing the cache cannot fix a filesystem filename restriction.";
     case "unsynced-local": return "This local file exceeds this device's automatic limit and has not been uploaded. Open it to inspect it. Connect to Wi-Fi if it is an attachment below the mobile limit, or copy it to a desktop and sync there. Split or reduce large files before syncing on mobile.";
     case "import-candidate": return "This local file has no remote identity. Upload as new file sends it to S3 after checking that its path is still available. If it was moved from another folder, first check whether the old remote path is the same note; importing does not reconnect its old identity.";
@@ -526,6 +531,9 @@ export class StatusModal extends Modal {
       if (issue.kind === "path-collision") {
         item.createEl("strong", { text: "Path collision" });
         item.createEl("div", { text: issue.paths.join(" · "), cls: "s3-vault-sync-selectable-path" });
+        item.createEl("button", {text: "Review path collision", cls: "mod-cta"}).addEventListener("click", () => {
+          new PathCollisionModal(this.app, issue.paths, this.controller, () => this.onOpen()).open();
+        });
         this.renderIssueTools(item, issue);
         continue;
       }

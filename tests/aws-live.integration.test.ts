@@ -7,6 +7,7 @@ import {
 import { probeObjectStore } from "../src/storage/object-store-probe";
 import { HeadChangedError, RemoteStore } from "../src/storage/remote-store";
 import { SyncService, type CachedSyncState, type LocalVaultPort } from "../src/sync/sync-service";
+import { sha256Content } from "../src/sync/content-hash";
 
 const accessKeyId = process.env.S3_VAULT_SYNC_TEST_ACCESS_KEY_ID;
 const secretAccessKey = process.env.S3_VAULT_SYNC_TEST_SECRET_ACCESS_KEY;
@@ -141,6 +142,35 @@ liveDescribe("AwsS3ObjectStore live integration", () => {
     expect(downloaded?.body[0]).toBe(1);
     expect(downloaded?.body.at(-1)).toBe(255);
   }, 20_000);
+
+  it("repairs a live S3 path collision without changing encrypted contents or history", async () => {
+    const remote = await RemoteStore.open({objects: multipartObjects,
+      prefix: `${testPrefix}/path-review`, vaultKey: crypto.getRandomValues(new Uint8Array(32))});
+    const alpha = new TextEncoder().encode("alpha test note");
+    const beta = new TextEncoder().encode("beta test note");
+    await remote.writeBlob("alpha", alpha);
+    await remote.writeBlob("beta", beta);
+    const revisionA = {blobId: "alpha", revisionId: "revision-a", contentHash: await sha256Content(alpha), size: alpha.byteLength, createdAt: "2026-09-18T00:00:00Z"};
+    const revisionB = {blobId: "beta", revisionId: "revision-b", contentHash: await sha256Content(beta), size: beta.byteLength, createdAt: "2026-09-18T00:00:00Z"};
+    const a = {entryId: "a", kind: "live" as const, path: "note.md", revision: revisionA};
+    const b = {entryId: "b", kind: "live" as const, path: "note.md", revision: revisionB,
+      history: [{...revisionB, revisionId: "older-b", expiresAt: "2026-10-18T00:00:00Z"}]};
+    await remote.initialize({head: {commitId: "initial", generation: 1, protocolVersion: 1, vaultId: "collision-test"},
+      commit: {commitId: "initial", createdAt: "2026-09-18T00:00:00Z", parentIds: [], protocolVersion: 1, replicaId: "test",
+        vaultId: "collision-test", changes: [{kind: "set-entry", entry: a}, {kind: "set-entry", entry: b}]}});
+    const unexpected = async (): Promise<never> => {throw new Error("A remote-only rename must not mutate local files or cache");};
+    const local: LocalVaultPort = {list: async () => [], stat: async () => undefined, read: unexpected, write: unexpected, move: unexpected, delete: unexpected};
+    const service = new SyncService({remote, local, cache: {load: async () => undefined, save: unexpected}, replicaId: "reviewer"});
+    const review = await service.reviewPathCollision(["note.md"], new Map());
+    expect(review.remoteFiles).toHaveLength(2);
+    await service.resolvePathCollision({paths: review.paths, reviewToken: review.reviewToken, side: "remote", path: "note.md",
+      entryId: "b", newName: "beta-kept.md"}, new Map(), {prepare: unexpected, recover: unexpected});
+    const repaired = await remote.readSnapshot((await remote.readHead())!.value);
+    expect(repaired.entries.a).toEqual(a);
+    expect(repaired.entries.b).toEqual({...b, path: "beta-kept.md"});
+    expect(await remote.readBlob("alpha")).toEqual(alpha);
+    expect(await remote.readBlob("beta")).toEqual(beta);
+  }, 60_000);
 
   it.each(["both", "local", "remote"] as const)("preserves both versions after a first-connect content mismatch (%s)", async choice => {
     const remote = await RemoteStore.open({objects: multipartObjects,

@@ -39,6 +39,9 @@ import {
 } from "./sync/sync-service";
 import { DirtyPathTracker } from "./sync/dirty-path-tracker";
 import { LocalStateChangedError } from "./sync/errors";
+import type { PathCollisionReview, PathCollisionResolution } from "./sync/path-collision-review";
+import { CollisionRenameJournal, type PendingCollisionRename } from "./sync/collision-rename-journal";
+import { isSafeTargetPath } from "./plugin/safe-vault-write";
 import {
   isFullHashVerificationDue,
   normalizeFullHashVerificationIntervalDays,
@@ -90,6 +93,7 @@ interface PersistedPluginData {
   fullHashVerificationRequired?: boolean;
   lastFullHashVerificationAt?: number;
   pendingPathRenames?: PersistedPathRenames;
+  pendingCollisionRename?: PendingCollisionRename;
   pendingInitialization?: {
     bucket: string;
     region: string;
@@ -368,6 +372,85 @@ export default class S3VaultSyncPlugin
     return this.runExclusiveSyncService(service => service.reviewLocalContent(path));
   }
 
+  reviewPathCollision(paths: string[]): Promise<PathCollisionReview> {
+    return this.runExclusiveSyncService(async service => {
+      const pending = this.data.pendingCollisionRename;
+      const review = await service.reviewPathCollision(pending ? [...new Set([...paths, pending.from, pending.to])] : paths,
+        this.pathRenames.toPathMap(this.pathRenames.capture()));
+      return pending ? {...review, interruptedRename: pending,
+        reviewToken: JSON.stringify({base: review.reviewToken, pending})} : review;
+    }, true);
+  }
+
+  async resolvePathCollision(request: PathCollisionResolution): Promise<string> {
+    try {
+      const newPath = await this.runExclusiveSyncService(service => {
+        const expectedRenames = JSON.stringify(this.pathRenames.serialize());
+        return service.resolvePathCollision(request, this.pathRenames.toPathMap(this.pathRenames.capture()),
+          this.collisionRenameJournal(expectedRenames));
+      });
+      await this.requestSync();
+      return newPath;
+    } catch (error) { this.showError(error); throw error; }
+  }
+
+  async confirmInterruptedCollisionRename(paths: string[], reviewToken: string, side: "source" | "target"): Promise<void> {
+    await this.runExclusiveSyncService(async service => {
+      const pending = this.data.pendingCollisionRename;
+      if (!pending) throw new Error("The interrupted rename has already changed. Refresh sync status.");
+      const review = await service.reviewPathCollision(paths, this.pathRenames.toPathMap(this.pathRenames.capture()));
+      if (JSON.stringify({base: review.reviewToken, pending}) !== reviewToken) throw new Error("Recovery files changed. Reload the collision review.");
+      const path = side === "source" ? pending.from : pending.to;
+      const file = review.localFiles.find(file => file.path === path);
+      if (!file?.contentHash) throw new Error("The selected recovery file cannot be verified on this device.");
+      await this.collisionRenameJournal().recover({side, hash: file.contentHash});
+    }, true);
+    await this.requestSync();
+  }
+
+  private collisionRenameJournal(expectedRenames?: string): CollisionRenameJournal {
+    return new CollisionRenameJournal(new ObsidianVaultPort(this.app.vault, () => this.session.assertActive()), {
+      read: () => this.data.pendingCollisionRename,
+      prepare: async intent => {
+        this.session.assertActive();
+        if (expectedRenames !== undefined && JSON.stringify(this.pathRenames.serialize()) !== expectedRenames) {
+          throw new Error("Local rename records changed. Reload the collision review.");
+        }
+        const identitySourcePath = intent.entryId
+          ? [...this.pathRenames.capture()].find(([, rename]) => rename.entryId === intent.entryId)?.[0] ??
+            Object.values(this.data.cache?.files ?? {}).find(file => file.entryId === intent.entryId)?.path
+          : undefined;
+        if (intent.entryId && !identitySourcePath) throw new Error("The file identity changed. Reload the collision review.");
+        this.data.pendingCollisionRename = {...intent, identitySourcePath};
+        await this.savePluginData();
+      },
+      finish: async (intent, moved) => {
+        this.session.assertActive();
+        if (intent.entryId && intent.identitySourcePath) {
+          const dirty = this.pathRenames.setReviewedRename(intent.entryId, intent.identitySourcePath, moved ? intent.to : intent.from);
+          for (const path of dirty) this.dirtyPaths.mark(path);
+        }
+        this.data.pendingPathRenames = this.pathRenames.serialize();
+        this.dirtyPaths.mark(intent.from); this.dirtyPaths.mark(intent.to);
+        this.data.pendingCollisionRename = undefined;
+        try { await this.savePluginData(); }
+        catch (error) { this.data.pendingCollisionRename = intent; throw error; }
+      },
+    });
+  }
+
+  private async recoverCollisionRename(allowReview = false): Promise<void> {
+    const pending = this.data.pendingCollisionRename;
+    if (!pending) return;
+    if (!isSafeTargetPath(pending.from) || !isSafeTargetPath(pending.to)) throw new Error("An interrupted rename contains an unsafe path.");
+    if (await this.collisionRenameJournal().recover() === "needs-review") {
+      if (!this.pendingLocalIssues.some(issue => issue.kind === "path-collision" && issue.paths.includes(pending.to))) {
+        this.pendingLocalIssues.push({kind: "path-collision", paths: [pending.from, pending.to]});
+      }
+      if (!allowReview) throw new Error("An interrupted rename needs confirmation. Open sync status and choose Review path collision.");
+    }
+  }
+
   openVersionHistory(path: string): void {
     const entry = this.getLiveEntry(path);
     if (!entry?.history?.length) throw new Error("No recoverable versions are available for this file. Sync to refresh its history.");
@@ -491,6 +574,8 @@ export default class S3VaultSyncPlugin
   }
 
   private async initializeOrUnlockExclusive(password: string): Promise<void> {
+    await this.recoverCollisionRename(true);
+    const needsRenameReview = this.data.pendingCollisionRename !== undefined;
     const assertTarget = this.captureTargetGuard();
     const { bucket, region } = this.data.settings;
     try {
@@ -505,7 +590,7 @@ export default class S3VaultSyncPlugin
         .filter(probe => probe.bucket === bucket && probe.region === region && probe.prefix === prefix &&
           isProbeObjectKey(probe.key, prefix))
         .map(probe => probe.key));
-      for (const key of ownedProbeKeys) await objects.delete(key);
+      if (!needsRenameReview) for (const key of ownedProbeKeys) await objects.delete(key);
       const bootstrap = new BootstrapStore(objects, prefix);
       const existing = await bootstrap.read();
       const isNewRemote = existing === undefined;
@@ -523,6 +608,7 @@ export default class S3VaultSyncPlugin
         vaultId = existing.vaultId;
         vaultKey = await VaultCrypto.unwrapKey(password, existing.envelope);
       } else {
+        if (needsRenameReview) throw new Error("Resolve the interrupted rename before initializing a new Remote Store.");
         const existingKeys = await objects.list(prefix ? `${prefix}/` : "");
         if (existingKeys.some(key => !ownedProbeKeys.has(key))) {
           throw new Error("The selected S3 prefix is not empty");
@@ -587,6 +673,7 @@ export default class S3VaultSyncPlugin
         throw new Error("The selected prefix belongs to a different Vault");
       }
       if (!currentHead) {
+        if (needsRenameReview) throw new RepairModeError("The existing Head must be recovered before path repair can continue");
         const pending = this.data.pendingInitialization;
         const canResume = pending?.phase === "uploading" &&
           pending.vaultId === vaultId && pending.prefix === prefix &&
@@ -618,12 +705,16 @@ export default class S3VaultSyncPlugin
       this.session.assertActive();
       this.credentials.saveVaultKey(vaultKey);
       this.data.settings.vaultId = vaultId;
-      this.data.pendingInitialization = undefined;
-      this.data.pendingProbes = (this.data.pendingProbes ?? []).filter(probe =>
-        !(probe.bucket === bucket && probe.region === region && probe.prefix === prefix && ownedProbeKeys.has(probe.key)));
+      if (!needsRenameReview) {
+        this.data.pendingInitialization = undefined;
+        this.data.pendingProbes = (this.data.pendingProbes ?? []).filter(probe =>
+          !(probe.bucket === bucket && probe.region === region && probe.prefix === prefix && ownedProbeKeys.has(probe.key)));
+      }
       await this.savePluginData();
-      this.setStatus("Idle", "Encrypted Remote Store is ready.");
-      new Notice("S3 Vault Sync is ready");
+      this.setStatus(needsRenameReview ? "Action required" : "Idle", needsRenameReview
+        ? "Unlocked. Open sync status to review the interrupted rename."
+        : "Encrypted Remote Store is ready.");
+      new Notice(needsRenameReview ? "Vault unlocked. Review the interrupted rename to resume sync." : "S3 Vault Sync is ready");
     } catch (error) {
       this.showError(error);
       throw error;
@@ -726,8 +817,10 @@ export default class S3VaultSyncPlugin
 
   private runExclusiveSyncService<T>(
     operation: (service: SyncService) => Promise<T>,
+    allowCollisionReview = false,
   ): Promise<T> {
     return this.syncRequests.runExclusive(() => this.session.run(async () => {
+      await this.recoverCollisionRename(allowCollisionReview);
       const vaultKey = this.credentials.loadVaultKey();
       if (!vaultKey) {
         throw new Error("Unlock the encrypted Vault first");
@@ -754,6 +847,7 @@ export default class S3VaultSyncPlugin
         stored?.fullHashVerificationRequired ?? false,
       lastFullHashVerificationAt: stored?.lastFullHashVerificationAt,
       pendingPathRenames: stored?.pendingPathRenames ?? {},
+      pendingCollisionRename: stored?.pendingCollisionRename,
       pendingInitialization: stored?.pendingInitialization,
       pendingProbes: stored?.pendingProbes ?? [],
       settings,
@@ -792,6 +886,8 @@ export default class S3VaultSyncPlugin
     if (this.headRetryTimer !== undefined) {
       this.clearHeadRetryTimer();
     }
+    try { await this.recoverCollisionRename(); }
+    catch (error) { this.showError(error); return; }
     const dirtySnapshot = this.dirtyPaths.capture();
     const pathRenameSnapshot = this.pathRenames.capture();
     const fullHashVerification =

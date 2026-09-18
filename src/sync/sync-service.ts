@@ -20,6 +20,8 @@ import { LocalStateChangedError } from "./errors";
 import type { PersistedPathRename } from "./path-rename-tracker";
 import { sha256Content as sha256 } from "./content-hash";
 import { canonicalVaultPath } from "./canonical-path";
+import { PathCollisionReviewer, type PathCollisionReview, type PathCollisionResolution } from "./path-collision-review";
+import type { CollisionRenameJournal } from "./collision-rename-journal";
 
 export interface LocalFileInfo {
   modifiedAt: number;
@@ -55,6 +57,7 @@ export interface LocalVaultPort {
   ): Promise<void>;
   read(path: string): Promise<Uint8Array>;
   stat(path: string): Promise<LocalFileInfo | undefined>;
+  pathExists?(path: string): Promise<boolean>;
   supportsPath?(path: string): boolean;
   write(
     path: string,
@@ -534,6 +537,15 @@ export class SyncService {
   async reviewLocalContent(path: string): Promise<LocalContentReview> {
     const { review } = await this.loadLocalContentReview(path);
     return review;
+  }
+
+  reviewPathCollision(paths: string[], renames: ReadonlyMap<string, PersistedPathRename>): Promise<PathCollisionReview> {
+    return new PathCollisionReviewer(this.options).review(paths, renames);
+  }
+
+  resolvePathCollision(request: PathCollisionResolution, renames: ReadonlyMap<string, PersistedPathRename>,
+    journal: Pick<CollisionRenameJournal, "prepare" | "recover">): Promise<string> {
+    return new PathCollisionReviewer(this.options).resolve(request, renames, journal);
   }
 
   private async loadLocalContentReview(path: string) {
@@ -1158,6 +1170,12 @@ export class SyncService {
       missingCachedByFingerprint.set(fingerprint, candidates);
     }
     const entryIdByPath = new Map<string, string>();
+    const liveOwnersByCanonicalPath = new Map<string, string[]>();
+    for (const entry of Object.values(remote.entries)) {
+      if (entry.kind !== "live") continue;
+      const key = canonicalVaultPath(entry.path);
+      liveOwnersByCanonicalPath.set(key, [...(liveOwnersByCanonicalPath.get(key) ?? []), entry.entryId]);
+    }
     const newFilesByFingerprint = new Map<string, LocalFileInfo[]>();
     for (const file of scanned) {
       if (
@@ -1198,7 +1216,9 @@ export class SyncService {
       if (
         renameCandidates?.length === 1 &&
         renameCandidates[0] &&
-        newClaimants?.length === 1
+        newClaimants?.length === 1 &&
+        // Equal bytes are not evidence that an already-owned path changed identity.
+        !(liveOwnersByCanonicalPath.get(canonicalVaultPath(file.path)) ?? []).some(id => id !== renameCandidates[0]!.entryId)
       ) {
         entryIdByPath.set(file.path, renameCandidates[0].entryId);
       }
