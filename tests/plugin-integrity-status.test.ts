@@ -206,3 +206,23 @@ it("keeps automatic rechecks bounded but clears an oversized issue after an expl
   expect(plugin.getStatusText()).toMatch(/^Idle:/);
   expect(files.get("existing.md")).toBe("current");
 });
+
+it.each(["preview", "restore"])("clears the exact historical integrity issue after a successful %s retry", async action => {
+  const {plugin, corrupt, files} = await fixture();
+  await plugin.syncNow();
+  const damaged = corrupt("/old-blob");
+  await expect(plugin.readHistoricalRevision("existing", "old")).rejects.toThrow("cannot be authenticated");
+  damaged.restore();
+  vi.spyOn(ObsidianVaultPort.prototype, "write").mockImplementation(async (path, body) => {
+    files.set(path, new TextDecoder().decode(body));
+  });
+  if (action === "preview") {
+    expect(new TextDecoder().decode(await plugin.readHistoricalRevision("existing", "old"))).toBe("history");
+  } else {
+    await plugin.restoreRevision("existing", "old");
+    expect(files.get("existing.md")).toBe("history");
+  }
+  expect(host.stored.pendingIntegrityChecks).toEqual([]);
+  expect(plugin.getStatusText()).not.toContain("Repair Mode");
+  expect(plugin.getStatusText()).toMatch(/^Action required:/); // Unrelated import still awaits confirmation.
+});

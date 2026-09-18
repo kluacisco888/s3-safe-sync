@@ -617,6 +617,7 @@ export class SyncService {
         if (!body || body.byteLength !== revision.size || await sha256(body) !== revision.contentHash) {
           throw new RemoteStateError("Remote review content failed verification", undefined, {kind: "blob", blobId: revision.blobId});
         }
+        await this.options.onIntegrityVerified?.({kind: "blob", blobId: revision.blobId});
         preview = textPreview(body);
       }
       remoteVersions.push({size: revision.size, createdAt: revision.createdAt, preview});
@@ -774,6 +775,7 @@ export class SyncService {
     if (!body || body.byteLength !== revision.size || await sha256(body) !== revision.contentHash) {
       throw new RemoteStateError("Conflict preview failed content verification", undefined, {kind: "blob", blobId: revision.blobId});
     }
+    await this.options.onIntegrityVerified?.({kind: "blob", blobId: revision.blobId});
     return body;
   }
 
@@ -952,6 +954,7 @@ export class SyncService {
     ) {
       throw new Error(`Historical Revision ${revisionId} is damaged`);
     }
+    await this.options.onIntegrityVerified?.({kind: "blob", blobId: historical.blobId});
     if (
       historical.expiresAt !== undefined &&
       Date.parse(historical.expiresAt) <= Date.parse(versionedHead.serverDate)
@@ -1133,6 +1136,7 @@ export class SyncService {
     ) {
       throw new Error(`Recovery Copy for ${entryId} is damaged`);
     }
+    await this.options.onIntegrityVerified?.({kind: "blob", blobId: revision.blobId});
     if (
       revision.expiresAt !== undefined &&
       Date.parse(revision.expiresAt) <= Date.parse(serverDate)

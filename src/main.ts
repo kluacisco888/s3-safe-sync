@@ -844,7 +844,12 @@ export default class S3VaultSyncPlugin
         vaultKey,
       });
       try {
-        return await operation(this.createSyncService(remote));
+        const pendingBefore = this.currentIntegrityChecks().length;
+        const result = await operation(this.createSyncService(remote));
+        if (this.integrityTarget() === integrityTarget && this.currentIntegrityChecks().length < pendingBefore) {
+          this.reportManualCompletion("Previously reported remote content has been verified.");
+        }
+        return result;
       } catch (error) {
         await this.rememberIntegrityFailure(error, integrityTarget);
         throw error;
