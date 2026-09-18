@@ -63,6 +63,7 @@ export interface ObservedFile {
 }
 
 export interface ReplicaObservation {
+  bootstrapPending?: boolean;
   basedOnCommitId?: string;
   deferredEntryIds?: string[];
   files: ObservedFile[];
@@ -645,7 +646,7 @@ export class SyncEngine {
       }
       const knownPath = remoteByPath.has(file.path);
       if (!knownPath) {
-        if (base) {
+        if (base && !local.bootstrapPending) {
           remoteChanges.push({
             entryId: this.createId(),
             file,

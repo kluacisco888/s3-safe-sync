@@ -69,6 +69,7 @@ export interface CachedFileState extends LocalFileInfo {
 }
 
 export interface CachedSyncState {
+  bootstrapPending?: boolean;
   files: Record<string, CachedFileState>;
   snapshot: VaultSnapshot;
   unmaterializedEntryIds?: string[];
@@ -454,7 +455,7 @@ export class SyncService {
       plaintext,
       expectedContentHash,
     );
-    await this.options.cache.save(await this.buildCache(snapshot));
+    await this.acceptReviewedEntries(snapshot, [entry]);
   }
 
   async importCandidate(path: string): Promise<void> {
@@ -524,14 +525,7 @@ export class SyncService {
         vaultId: snapshot.vaultId,
       },
     });
-    await this.options.cache.save(
-      await this.buildCache({
-        commitId,
-        entries: { ...snapshot.entries, [entryId]: entry },
-        protocolVersion: 1,
-        vaultId: snapshot.vaultId,
-      }),
-    );
+    await this.acceptReviewedEntries({...snapshot, commitId}, [entry]);
   }
 
   async reviewLocalContent(path: string): Promise<LocalContentReview> {
@@ -543,7 +537,9 @@ export class SyncService {
     const head = await this.options.remote.readHead();
     if (!head) throw new Error("Remote Store is not initialized");
     const snapshot = await this.options.remote.readSnapshot(head.value);
-    const matches = Object.values(snapshot.entries).filter(entry => entry.path === path);
+    const atPath = Object.values(snapshot.entries).filter(entry => entry.path === path);
+    const currentOwners = atPath.filter(entry => entry.kind !== "deleted");
+    const matches = currentOwners.length ? currentOwners : atPath;
     if (matches.length !== 1) throw new Error("Remote path changed or is ambiguous. Sync and review its current path.");
     const entry = matches[0]!;
     const file = await this.options.local.stat(path);
@@ -627,10 +623,26 @@ export class SyncService {
     if (file && localHash) {
       const localBody = await this.options.local.read(path);
       if (localBody.byteLength !== file.size || await sha256(localBody) !== localHash) throw new LocalStateChangedError(path);
-      const dot = path.lastIndexOf(".");
-      const extension = dot > path.lastIndexOf("/") ? path.slice(dot) : "";
-      const stem = extension ? path.slice(0, dot) : path;
-      const copyPath = `${stem} (local copy ${crypto.randomUUID()})${extension}`;
+      const separator = path.lastIndexOf("/") + 1;
+      const filename = path.slice(separator);
+      const dot = filename.lastIndexOf(".");
+      let extension = dot > 0 ? filename.slice(dot) : "";
+      const stem = extension ? filename.slice(0, dot) : filename;
+      const suffix = ` (local copy ${crypto.randomUUID()})`;
+      const encoder = new TextEncoder();
+      // 255 UTF-8 bytes also fits the desktop character limits. Do not split a code point.
+      // An unusually long extension cannot be retained together with the unique suffix.
+      if (encoder.encode(suffix + extension).byteLength > 251) extension = "";
+      const available = 255 - encoder.encode(suffix + extension).byteLength;
+      let shortened = "";
+      let used = 0;
+      for (const character of stem) {
+        const size = encoder.encode(character).byteLength;
+        if (used + size > available) break;
+        shortened += character;
+        used += size;
+      }
+      const copyPath = `${path.slice(0, separator)}${shortened || "file"}${suffix}${extension}`;
       this.assertRemotePathAvailable(snapshot, "new-local-copy", copyPath);
       await this.assertLocalContent(copyPath, null);
       // Save the independent local copy first; failed uploads never remove this copy.
@@ -655,13 +667,19 @@ export class SyncService {
     if (remoteBody) await this.options.local.write(path, remoteBody, localHash);
     else if (file) await this.options.local.delete(path, localHash);
 
-    // Accept only the explicitly reviewed Entries. Other mismatches keep their old bases.
+    await this.acceptReviewedEntries({...snapshot, commitId}, [entry, ...(copy ? [copy] : [])]);
+    return copy?.path;
+  }
+
+  // A manual action accepts only its reviewed Entries, never the rest of a new device's files.
+  private async acceptReviewedEntries(snapshot: VaultSnapshot, entries: VaultEntry[]): Promise<void> {
     const current = await this.options.cache.load();
     const next: CachedSyncState = current ? structuredClone(current) : {
-      files: {}, snapshot: {vaultId: snapshot.vaultId, protocolVersion: 1, commitId, entries: {}},
+      bootstrapPending: true,
+      files: {}, snapshot: {vaultId: snapshot.vaultId, protocolVersion: 1, commitId: snapshot.commitId, entries: {}},
       unmaterializedEntryIds: [],
     };
-    for (const accepted of [entry, ...(copy ? [copy] : [])]) {
+    for (const accepted of entries) {
       next.snapshot.entries[accepted.entryId] = accepted;
       for (const [cachedPath, cachedFile] of Object.entries(next.files)) {
         if (cachedFile.entryId === accepted.entryId) delete next.files[cachedPath];
@@ -676,7 +694,6 @@ export class SyncService {
       next.unmaterializedEntryIds = next.unmaterializedEntryIds?.filter(id => id !== accepted.entryId);
     }
     await this.options.cache.save(next);
-    return copy?.path;
   }
 
   async readConflictCandidate(entryId: string, revisionId: string): Promise<Uint8Array> {
@@ -823,14 +840,7 @@ export class SyncService {
         expectedMaterializedContentHash,
       );
     }
-    await this.options.cache.save(
-      await this.buildCache({
-        commitId,
-        entries: { ...snapshot.entries, [entryId]: resolvedEntry },
-        protocolVersion: 1,
-        vaultId: snapshot.vaultId,
-      }),
-    );
+    await this.acceptReviewedEntries({...snapshot, commitId}, [resolvedEntry]);
   }
 
   async restoreRevision(entryId: string, revisionId: string): Promise<void> {
@@ -911,14 +921,7 @@ export class SyncService {
       plaintext,
       entry.revision.contentHash,
     );
-    await this.options.cache.save(
-      await this.buildCache({
-        commitId,
-        entries: { ...snapshot.entries, [entryId]: restoredEntry },
-        protocolVersion: 1,
-        vaultId: snapshot.vaultId,
-      }),
-    );
+    await this.acceptReviewedEntries({...snapshot, commitId}, [restoredEntry]);
   }
 
   async readDeletedRecovery(
@@ -1023,14 +1026,7 @@ export class SyncService {
     });
     await this.assertLocalContent(deleted.path, null);
     await this.options.local.write(deleted.path, plaintext, null);
-    await this.options.cache.save(
-      await this.buildCache({
-        commitId,
-        entries: { ...snapshot.entries, [entryId]: restoredEntry },
-        protocolVersion: 1,
-        vaultId: snapshot.vaultId,
-      }),
-    );
+    await this.acceptReviewedEntries({...snapshot, commitId}, [restoredEntry]);
   }
 
   private async readRecoveryCopy(
@@ -1243,6 +1239,7 @@ export class SyncService {
       }
     }
     const observation: ReplicaObservation = {
+      bootstrapPending: cached?.bootstrapPending,
       basedOnCommitId: cached?.snapshot.commitId,
       deferredEntryIds: [...deferredEntryIds],
       files: scanned.map((file) => ({
@@ -1974,7 +1971,11 @@ export class SyncService {
           : [];
       }),
     );
+    const knownPaths = new Set(Object.values(snapshot.entries).map(entry => entry.path));
+    const bootstrapPending = (!current || current.bootstrapPending === true) &&
+      scan.localPaths.some(path => !knownPaths.has(path));
     return {
+      ...(bootstrapPending ? {bootstrapPending: true} : {}),
       files,
       snapshot,
       unmaterializedEntryIds: [...pendingUnmaterializedEntryIds].filter(

@@ -632,6 +632,127 @@ describe("SyncService", () => {
       return {objects, remote, local, cache, service, source, sourceService, sourceCache};
     };
 
+    it("keeps unrelated Import Candidates unapproved through reviews, imports and restart", async () => {
+      const {service, remote, local, cache} = await setup();
+      await local.write("private-unreviewed.md", new TextEncoder().encode("needs explicit import"));
+      const review = await service.reviewLocalContent("article.md");
+      await service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken);
+      cache.state = structuredClone(cache.state);
+      const restarted = new SyncService({remote, local, cache, replicaId: "restarted"});
+      await local.move("private-unreviewed.md", "renamed-unreviewed.md");
+      let result = await restarted.synchronize();
+      expect(result.localIssues).toContainEqual({kind: "import-candidate", path: "renamed-unreviewed.md"});
+      let snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      expect(Object.values(snapshot.entries).some(entry => entry.path === "renamed-unreviewed.md")).toBe(false);
+      await restarted.importCandidate("renamed-unreviewed.md");
+      result = await restarted.synchronize();
+      expect(result.localIssues).toEqual([{kind: "bootstrap-mismatch", path: "unreviewed.md"}]);
+      expect(local.readText("unreviewed.md")).toBe("local other");
+      const other = await restarted.reviewLocalContent("unreviewed.md");
+      await restarted.preserveLocalCopyAndAcceptRemote("unreviewed.md", other.reviewToken);
+      expect((await restarted.synchronize()).status).toBe("complete");
+      await local.write("created-after-bootstrap.md", new TextEncoder().encode("ordinary new file"));
+      expect((await restarted.synchronize()).status).toBe("complete");
+      snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      expect(Object.values(snapshot.entries).some(entry => entry.path === "created-after-bootstrap.md")).toBe(true);
+    });
+
+    it("does not accept other local files when Import is the first manual bootstrap action", async () => {
+      const {service, local} = await setup();
+      await local.write("first-import.md", new TextEncoder().encode("approved"));
+      await local.write("second-import.md", new TextEncoder().encode("not approved"));
+      await service.importCandidate("first-import.md");
+      const result = await service.synchronize();
+      expect(result.localIssues).toContainEqual({kind: "import-candidate", path: "second-import.md"});
+      expect(result.localIssues).toContainEqual({kind: "bootstrap-mismatch", path: "article.md"});
+      expect(result.uploaded).toBe(0);
+    });
+
+    it("does not upload an unreviewed local-only file after the only content mismatch is resolved", async () => {
+      const {service, local, remote, cache} = await setup();
+      await local.write("unreviewed.md", new TextEncoder().encode("remote other"));
+      await local.write("private-unreviewed.md", new TextEncoder().encode("never approved"));
+      const review = await service.reviewLocalContent("article.md");
+      await service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken);
+      cache.state = structuredClone(cache.state);
+      const restarted = new SyncService({remote, local, cache, replicaId: "restarted"});
+      const result = await restarted.synchronize();
+      expect(result.localIssues).toEqual([{kind: "import-candidate", path: "private-unreviewed.md"}]);
+      expect(result.uploaded).toBe(0);
+      const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      expect(Object.values(snapshot.entries).some(entry => entry.path === "private-unreviewed.md")).toBe(false);
+    });
+
+    it("retains bootstrap confirmation for a local-only file discovered during final cache rebuilding", async () => {
+      const {service, local, cache} = await setup();
+      await local.write("article.md", new TextEncoder().encode("remote article"));
+      await local.write("unreviewed.md", new TextEncoder().encode("remote other"));
+      const list = local.list.bind(local);
+      let lists = 0;
+      local.list = async () => {
+        if (++lists === 2) await local.write("late-local-file.md", new TextEncoder().encode("unreviewed"));
+        return list();
+      };
+      expect((await service.synchronize()).status).toBe("complete");
+      expect(cache.state?.bootstrapPending).toBe(true);
+      expect((await service.synchronize()).localIssues).toEqual([{kind: "import-candidate", path: "late-local-file.md"}]);
+    });
+
+    it("reviews the current owner of a reused path without removing its historical tombstone", async () => {
+      const {remote, source, sourceService, sourceCache} = await setup();
+      const deletedId = sourceCache.state!.files["article.md"]!.entryId;
+      await source.delete("article.md");
+      const deletion = await sourceService.synchronize();
+      await sourceService.synchronize(deletion.bulkDeletion!.entryIds);
+      const ownerId = sourceCache.state!.files["unreviewed.md"]!.entryId;
+      await source.move("unreviewed.md", "article.md");
+      await sourceService.synchronize([], {pathRenames: new Map([
+        ["unreviewed.md", {entryId: ownerId, toPath: "article.md"}],
+      ])});
+      const local = new MemoryVault();
+      await local.write("article.md", new TextEncoder().encode("new device draft"));
+      const service = new SyncService({remote, local, cache: new MemorySyncCache(), replicaId: "new-device"});
+      expect((await service.synchronize()).localIssues).toContainEqual({kind: "bootstrap-mismatch", path: "article.md"});
+      const review = await service.reviewLocalContent("article.md");
+      expect(review.remoteVersions[0]?.preview).toBe("remote other");
+      const copyPath = await service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken);
+      expect(local.readText(copyPath!)).toBe("new device draft");
+      expect(local.readText("article.md")).toBe("remote other");
+      const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      expect(snapshot.entries[deletedId]!.kind).toBe("deleted");
+      expect(snapshot.entries[ownerId]!).toMatchObject({kind: "live", path: "article.md"});
+      expect((await service.synchronize()).status).toBe("complete");
+    });
+
+    it.each([
+      "a".repeat(240) + ".md",
+      "文".repeat(75) + ".md",
+      "😀".repeat(60) + ".md",
+      "a." + "b".repeat(250),
+      "c".repeat(255),
+    ])("preserves a platform-safe local copy of a long filename (%#)", async name => {
+      const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "test", vaultKey: new Uint8Array(32)});
+      const source = new MemoryVault();
+      const path = `folder/${name}`;
+      await source.write(path, new TextEncoder().encode("remote long-name content"));
+      await new SyncService({remote, local: source, cache: new MemorySyncCache(), replicaId: "source"}).initializeNew("vault");
+      const local = new MemoryVault();
+      const write = local.write.bind(local);
+      local.write = async (filePath, body) => {
+        if (new TextEncoder().encode(filePath.split("/").at(-1)).byteLength > 255) throw new Error("ENAMETOOLONG");
+        return write(filePath, body);
+      };
+      await local.write(path, new TextEncoder().encode("local long-name content"));
+      const service = new SyncService({remote, local, cache: new MemorySyncCache(), replicaId: "new"});
+      const review = await service.reviewLocalContent(path);
+      const copyPath = await service.preserveLocalCopyAndAcceptRemote(path, review.reviewToken);
+      expect(copyPath).toMatch(/^folder\//);
+      expect(new TextEncoder().encode(copyPath!.split("/").at(-1)).byteLength).toBeLessThanOrEqual(255);
+      if (name.endsWith(".md")) expect(copyPath).toMatch(/\.md$/);
+      expect(local.readText(copyPath!)).toBe("local long-name content");
+      expect(local.readText(path)).toBe("remote long-name content");
+    });
+
     it("preserves a verified local copy before accepting remote and leaves other mismatches blocked", async () => {
       const {service, remote, local} = await setup();
       expect((await service.synchronize()).localIssues).toHaveLength(2);

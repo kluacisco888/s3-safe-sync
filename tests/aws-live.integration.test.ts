@@ -158,7 +158,12 @@ liveDescribe("AwsS3ObjectStore live integration", () => {
           files.set(path, {body: body.slice(), modifiedAt: ++clock});
         },
         delete: async path => { files.delete(path); },
-        move: async () => { throw new Error("No move expected in this test"); },
+        move: async (fromPath, toPath) => {
+          const file = files.get(fromPath);
+          if (!file || files.has(toPath)) throw new Error("Invalid test move");
+          files.set(toPath, {...file, modifiedAt: ++clock});
+          files.delete(fromPath);
+        },
       };
       const cache = {load: async () => state, save: async (next: CachedSyncState) => {state = next;}};
       return {local, service: new SyncService({local, cache, remote, replicaId: initial})};
@@ -166,6 +171,7 @@ liveDescribe("AwsS3ObjectStore live integration", () => {
     const first = makeDevice("remote test version");
     await first.service.initializeNew("review-test-vault");
     const second = makeDevice("local unsynced test version");
+    await second.local.write("private-unreviewed.md", new TextEncoder().encode("explicit import required"));
     expect((await second.service.synchronize()).localIssues).toContainEqual({kind: "bootstrap-mismatch", path: "article.md"});
     const review = await second.service.reviewLocalContent("article.md");
     const copyPath = await second.service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken);
@@ -175,6 +181,32 @@ liveDescribe("AwsS3ObjectStore live integration", () => {
     const copy = Object.values(snapshot.entries).find(entry => entry.path === copyPath);
     if (copy?.kind !== "live") throw new Error("Verified local copy missing remotely");
     expect(new TextDecoder().decode(await remote.readBlob(copy.revision.blobId))).toBe("local unsynced test version");
+    expect((await second.service.synchronize()).localIssues).toEqual([{kind: "import-candidate", path: "private-unreviewed.md"}]);
+    expect(Object.values((await remote.readSnapshot((await remote.readHead())!.value)).entries)
+      .some(entry => entry.path === "private-unreviewed.md")).toBe(false);
+    await second.service.importCandidate("private-unreviewed.md");
     expect((await second.service.synchronize()).status).toBe("complete");
+
+    // Reuse a deleted path with a different Entry, then review it on a fresh device.
+    await first.local.delete("article.md");
+    const deletion = await first.service.synchronize();
+    if (deletion.bulkDeletion) await first.service.synchronize(deletion.bulkDeletion.entryIds);
+    await first.local.move("private-unreviewed.md", "article.md");
+    expect((await first.service.synchronize()).status).toBe("complete");
+    const third = makeDevice("third device draft");
+    const reused = await third.service.reviewLocalContent("article.md");
+    expect(reused.remoteVersions[0]?.preview).toBe("explicit import required");
+    const thirdCopy = await third.service.preserveLocalCopyAndAcceptRemote("article.md", reused.reviewToken);
+    expect(new TextDecoder().decode(await third.local.read(thirdCopy!))).toBe("third device draft");
+
+    // The encrypted remote uses random object IDs; the local copy still needs a bounded filename.
+    const longPath = "a".repeat(240) + ".md";
+    await first.local.write(longPath, new TextEncoder().encode("remote long filename"));
+    expect((await first.service.synchronize()).status).toBe("complete");
+    await third.local.write(longPath, new TextEncoder().encode("local long filename"));
+    const longReview = await third.service.reviewLocalContent(longPath);
+    const longCopy = await third.service.preserveLocalCopyAndAcceptRemote(longPath, longReview.reviewToken);
+    expect(new TextEncoder().encode(longCopy).byteLength).toBeLessThanOrEqual(255);
+    expect(new TextDecoder().decode(await third.local.read(longCopy!))).toBe("local long filename");
   }, 60_000);
 });
