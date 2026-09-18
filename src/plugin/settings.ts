@@ -46,6 +46,7 @@ export interface SyncStatusDisplay {
 }
 
 export interface SettingsController {
+  openStatus(): void;
   getProgressLabel(): string | undefined;
   getSettings(): S3VaultSyncSettings;
   getStatusText(): string;
@@ -100,7 +101,8 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
     containerEl.empty();
     const statusSetting = new Setting(containerEl)
       .setName("Status")
-      .setDesc(this.controller.getStatusText());
+      .setDesc(this.controller.getStatusText())
+      .addButton(button => button.setButtonText("Open sync status").onClick(() => this.controller.openStatus()));
 
     this.textSetting("Device name", settings.deviceName, async (value) => {
       settings.deviceName = value.trim() || "My device";
@@ -185,13 +187,16 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
           .setButtonText("Save credentials")
           .setDisabled(true)
           .onClick(async () => {
-            await this.controller.saveAwsCredentials({
-              accessKeyId,
-              secretAccessKey,
-            });
-            accessKeyId = "";
-            secretAccessKey = "";
-            this.display();
+            button.setDisabled(true);
+            try {
+              await this.controller.saveAwsCredentials({accessKeyId, secretAccessKey});
+              accessKeyId = "";
+              secretAccessKey = "";
+              this.display();
+            } catch (error) {
+              accessKeySetting.setDesc(error instanceof Error ? error.message : "Saving failed. Retry or open sync status.");
+              updateCredentialButton();
+            }
           });
       });
 
@@ -236,10 +241,14 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
             renderStatus();
             try {
               await this.controller.initializeOrUnlock(password);
-            } finally {
-              initializationRunning = false;
               password = "";
               this.display();
+            } catch (error) {
+              encryptionSetting.setDesc(error instanceof Error ? error.message : "Unlock failed. Retry or open sync status.");
+              button.setButtonText(vaultUnlocked ? "Unlock again" : "Initialize or unlock");
+              button.setDisabled(!password);
+            } finally {
+              initializationRunning = false;
             }
           });
       });
@@ -295,6 +304,8 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
           renderStatus();
           try {
             await this.controller.syncNow();
+          } catch (error) {
+            statusSetting.setDesc(error instanceof Error ? error.message : "Sync failed. Open sync status.");
           } finally {
             manualSyncRunning = false;
             this.display();
@@ -315,6 +326,8 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
           renderStatus();
           try {
             await this.controller.verifyAllFiles();
+          } catch (error) {
+            statusSetting.setDesc(error instanceof Error ? error.message : "Check failed. Open sync status.");
           } finally {
             fullVerificationRunning = false;
             this.display();
@@ -341,13 +354,14 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
         );
       }
       syncButton?.setDisabled(
-        manualSyncRunning || fullVerificationRunning,
+        manualSyncRunning || fullVerificationRunning || settings.paused,
       );
       fullVerificationButton?.setDisabled(
-        manualSyncRunning || fullVerificationRunning,
+        manualSyncRunning || fullVerificationRunning || settings.paused,
       );
     };
     this.stopStatusUpdates = this.controller.onStatusChange(renderStatus);
+    renderStatus();
   }
 
   hide(): void {

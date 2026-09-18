@@ -760,6 +760,14 @@ describe("SyncService", () => {
       await service.synchronize();
       const before = Object.values(cache.state!.snapshot.entries).find(entry => entry.path === "article.md");
       if (before?.kind !== "conflicted") throw new Error("Expected edit/edit conflict");
+      const previewHead = (await remote.readHead())!.value.commitId;
+      const previews = await Promise.all(before.candidates.map(async revision =>
+        new TextDecoder().decode(await service.readConflictCandidate(before.entryId, revision.revisionId)),
+      ));
+      expect(previews).toContain("local article");
+      expect(previews).toContain("concurrent remote edit");
+      expect((await remote.readHead())!.value.commitId).toBe(previewHead);
+      await expect(service.readConflictCandidate(before.entryId, "missing-candidate")).rejects.toThrow("no longer");
       await local.write("article.md", new TextEncoder().encode("extra local edits during conflict"));
       expect((await service.synchronize()).localIssues).toContainEqual({kind: "resolution-mismatch", path: "article.md"});
       const review = await service.reviewLocalContent("article.md");

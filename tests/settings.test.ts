@@ -106,6 +106,7 @@ describe("S3VaultSyncSettingsTab mobile credentials", () => {
   it("gives each secret a separate revealable field and clearly reports a persisted unlock", async () => {
     const saveAwsCredentials = vi.fn(async () => {});
     const controller: SettingsController = {
+      openStatus: () => {},
       getProgressLabel: () => undefined,
       getSettings: () => ({ ...DEFAULT_SETTINGS, vaultId: "vault-id" }),
       getStatusText: () => "Idle: Ready to sync.",
@@ -158,5 +159,31 @@ describe("S3VaultSyncSettingsTab mobile credentials", () => {
       accessKeyId: "AKIAEXAMPLE",
       secretAccessKey: "secret-example",
     });
+  });
+
+  it("keeps a failed unlock retryable and provides a status entry point", async () => {
+    const openStatus = vi.fn();
+    const initializeOrUnlock = vi.fn().mockRejectedValueOnce(new Error("Connection closed")).mockResolvedValueOnce(undefined);
+    const controller: SettingsController = {
+      openStatus, initializeOrUnlock, getProgressLabel: () => undefined,
+      getSettings: () => ({...DEFAULT_SETTINGS}), getStatusText: () => "Not configured",
+      hasAwsCredentials: () => true, isVaultUnlocked: () => false, onStatusChange: () => () => {},
+      saveAwsCredentials: async () => {}, saveSettings: async () => {}, syncNow: async () => {},
+      togglePause: async () => {}, verifyAllFiles: async () => {},
+    };
+    const tab = new S3VaultSyncSettingsTab({} as App, controller as never);
+    tab.display();
+    await findSetting("Status").buttons[0]!.click();
+    expect(openStatus).toHaveBeenCalledOnce();
+    const password = findSetting("Vault password").texts[0]!;
+    password.trigger("typed-password");
+    const encryption = findSetting("Vault encryption");
+    const button = encryption.buttons[0]!;
+    await button.click();
+    expect(encryption.description).toBe("Connection closed");
+    expect(password.value).toBe("typed-password");
+    expect(button.disabled).toBe(false);
+    await button.click();
+    expect(initializeOrUnlock).toHaveBeenNthCalledWith(2, "typed-password");
   });
 });

@@ -679,6 +679,22 @@ export class SyncService {
     return copy?.path;
   }
 
+  async readConflictCandidate(entryId: string, revisionId: string): Promise<Uint8Array> {
+    const head = await this.options.remote.readHead();
+    if (!head) throw new Error("Remote Store is not initialized");
+    const snapshot = await this.options.remote.readSnapshot(head.value);
+    const entry = snapshot.entries[entryId];
+    if (entry?.kind !== "conflicted") throw new Error("This conflict has changed. Refresh sync status.");
+    const revision = entry.candidates.find(candidate => candidate.revisionId === revisionId);
+    if (!revision) throw new Error("This version is no longer a conflict candidate. Refresh sync status.");
+    if (revision.size > 1024 * 1024) throw new Error("This version exceeds the text preview limit.");
+    const body = await this.options.remote.readBlob(revision.blobId);
+    if (!body || body.byteLength !== revision.size || await sha256(body) !== revision.contentHash) {
+      throw new RemoteStateError("Conflict preview failed content verification");
+    }
+    return body;
+  }
+
   async resolveConflict(
     entryId: string,
     resolution: ConflictResolution,

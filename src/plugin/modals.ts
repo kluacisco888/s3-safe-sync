@@ -21,6 +21,8 @@ import {
 import { copyText } from "./clipboard";
 
 export interface StatusModalController {
+  openSettings(): void;
+  readConflictCandidate(entryId: string, revisionId: string): Promise<Uint8Array>;
   reviewLocalContent(path: string): Promise<LocalContentReview>;
   preserveLocalCopyAndAcceptRemote(path: string, reviewToken: string): Promise<string | undefined>;
   openLocalFile(path: string): Promise<void>;
@@ -46,6 +48,39 @@ export interface StatusModalController {
   togglePause(): Promise<void>;
 }
 
+const actionButton = (
+  container: HTMLElement,
+  text: string,
+  action: () => Promise<void>,
+): HTMLButtonElement => {
+  const button = container.createEl("button", {text});
+  let errorMessage: HTMLElement | undefined;
+  button.addEventListener("click", () => {
+    if (button.disabled) return;
+    button.disabled = true;
+    errorMessage?.setText("");
+    void action().catch((error: unknown) => {
+      errorMessage ??= container.createEl("p", {cls: "s3-vault-sync-error"});
+      errorMessage.setText(`${error instanceof Error ? error.message : "Operation failed"} Correct the cause and retry, or sync again to refresh the available actions.`);
+    }).finally(() => { button.disabled = false; });
+  });
+  return button;
+};
+
+const statusHelp = (status: string): string => {
+  if (status.includes("Repair Mode")) return "Pause sync on all devices and preserve local copies. Check the bucket, prefix, and permissions in Settings. If the remote Head is missing or damaged, inspect S3 Versioning and recover a verified Head together with its referenced objects, then retry. Do not initialize over the existing prefix.";
+  if (status.startsWith("Not configured")) return "Open settings, complete AWS region, bucket and prefix, save both AWS credentials, then unlock with the shared Vault password. An empty password field after a successful unlock is normal; the Vault Key is saved on this device.";
+  if (status.startsWith("Paused")) return "Use Resume to restart automatic synchronization. Local edits remain on this device while paused.";
+  if (/expired/i.test(status)) return "This version is outside the plugin's recovery window. Check your independent backup or retained S3 versions. Retrying cannot extend an expired recovery deadline.";
+  if (/password|envelope/i.test(status)) return "Open settings and use the same Vault password as the original device. This is separate from the AWS Secret Access Key. Verify the region, bucket and prefix belong to the intended Vault. If the Key Envelope is damaged, recover it from a verified S3 version; do not initialize over existing data.";
+  if (/Remotely Save|prefix.*not empty|bound.*different/i.test(status)) return "Open settings and check the selected bucket and prefixes. For migration, finish the old sync on all devices, compare the source files and disable Remotely Save. The new sync prefix must be empty and distinct from the old one. Preserve the old prefix while correcting the setup.";
+  if (/403|AccessDenied|Signature|credentials|credential/i.test(status)) return "Open settings and verify the AWS region, bucket, prefix, and saved credentials. Check that the AWS key can list the prefix and read/write its objects. After correcting the configuration, retry. Do not post your AK or SK when sharing an error.";
+  if (/timeout|network|connection|HTTP.*5\d\d|status 5\d\d/i.test(status)) return "Check the network and any proxy or VPN, then retry. Interrupted synchronization will recheck the remote state. Keep local files and configuration while diagnosing the connection.";
+  if (status.includes("Another device published")) return "Another device completed a sync first. Automatic retry is already scheduled. You can use Sync now to retry sooner or Pause to stop retrying.";
+  if (status.includes("local file changed")) return "The file changed during synchronization. Wait briefly after editing; synchronization will retry. This protects your latest saved text.";
+  return "Review the affected items below. Use Open settings for configuration issues, Copy status to share the error text, or Sync now after addressing the cause. File conflicts require an explicit choice; remote repair and operating-system filename restrictions may require action outside the plugin.";
+};
+
 class LocalContentReviewModal extends Modal {
   constructor(
     app: App,
@@ -62,6 +97,11 @@ class LocalContentReviewModal extends Modal {
     const status = body.createEl("p", {text: "Reading and verifying both versions…"});
     const actions = this.contentEl.createDiv({cls: "s3-vault-sync-toolbar"});
     actions.createEl("button", {text: "Close"}).addEventListener("click", () => this.close());
+    actions.createEl("button", {text: "Open settings"}).addEventListener("click", () => {this.controller.openSettings(); this.close();});
+    actionButton(actions, "Open local file", async () => {await this.controller.openLocalFile(this.path); this.close();});
+    actionButton(actions, "Copy path", async () => {
+      if (!await copyText(this.path)) throw new Error("Clipboard unavailable; select the displayed path to copy it.");
+    });
     void this.controller.reviewLocalContent(this.path).then(review => {
       status.setText(review.blockedReason ??
         (review.localExists
@@ -139,6 +179,7 @@ class RenameReviewModal extends Modal {
     app: App,
     private readonly issue: PossibleRenameIssue,
     private readonly resolve: (resolution: PossibleRenameResolution) => Promise<void>,
+    private readonly refresh: () => Promise<void>,
   ) { super(app); }
 
   onOpen(): void {
@@ -201,6 +242,7 @@ class RenameReviewModal extends Modal {
         message.setText(error instanceof Error ? error.message : "Could not resolve the rename.");
         updateButton();
         separate.disabled = false;
+        actionButton(actions, "Refresh plan", async () => { await this.refresh(); this.close(); });
       }
     };
     confirmMoves.addEventListener("click", () => { void run({
@@ -233,11 +275,10 @@ class RiskConfirmationModal extends Modal {
     actions.createEl("button", { text: "Cancel" }).addEventListener("click", () => {
       this.close();
     });
-    actions
-      .createEl("button", { cls: "mod-warning", text: "Try anyway" })
-      .addEventListener("click", () => {
-        void this.confirm().then(() => this.close());
-      });
+    actionButton(actions, "Try anyway", async () => {
+      await this.confirm();
+      this.close();
+    }).addClass("mod-warning");
   }
 
   onClose(): void {
@@ -248,16 +289,22 @@ class RiskConfirmationModal extends Modal {
 class DeletedFilePreviewModal extends Modal {
   constructor(
     app: App,
-    private readonly entry: DeletedEntry,
+    private readonly entry: {path: string},
     private readonly revision: RevisionRef,
     private readonly loadContent: () => Promise<Uint8Array>,
+    private readonly title = "Deleted file preview",
   ) {
     super(app);
   }
 
   onOpen(): void {
     this.contentEl.empty();
-    this.contentEl.createEl("h2", { text: "Deleted file preview" });
+    this.contentEl.createEl("h2", { text: this.title });
+    const actions = this.contentEl.createDiv({cls: "s3-vault-sync-toolbar"});
+    actions.createEl("button", {text: "Back"}).addEventListener("click", () => this.close());
+    actionButton(actions, "Copy path", async () => {
+      if (!await copyText(this.entry.path)) throw new Error("Clipboard unavailable; select the path below to copy it.");
+    });
     this.contentEl.createDiv({
       cls: "s3-vault-sync-selectable-path",
       text: this.entry.path,
@@ -294,6 +341,7 @@ class DeletedFilePreviewModal extends Modal {
           cls: "s3-vault-sync-error",
           text: error instanceof Error ? error.message : "Preview failed.",
         });
+        preview.createEl("button", {text: "Retry preview"}).addEventListener("click", () => this.onOpen());
       });
   }
 
@@ -317,20 +365,23 @@ export class StatusModal extends Modal {
     this.contentEl.empty();
     this.contentEl.createEl("h2", { text: "S3 Vault Sync" });
     const status = this.contentEl.createEl("p", { text: this.controller.getStatusText() });
-    this.renderActions();
-    this.renderBulkDeletion();
-    this.renderConflicts();
-    const localIssues = this.contentEl.createDiv();
-    this.renderLocalIssues(localIssues);
-    this.renderDeferredDownloads();
-    this.renderDeletedRecoveries();
+    const controls = this.contentEl.createDiv();
+    const details = this.contentEl.createDiv();
+    const render = (): void => {
+      controls.empty();
+      details.empty();
+      this.renderActions(controls);
+      this.renderBulkDeletion(details);
+      this.renderConflicts(details);
+      this.renderLocalIssues(details);
+      this.renderDeferredDownloads(details);
+      this.renderDeletedRecoveries(details);
+    };
+    render();
     this.stopStatusUpdates = this.controller.onStatusChange(display => {
       status.setText(display.text);
       this.pauseButton?.setText(this.controller.isPaused() ? "Resume" : "Pause");
-      if (/^(Idle|Action required):/.test(display.text)) {
-        localIssues.empty();
-        this.renderLocalIssues(localIssues);
-      }
+      if (/^(Idle|Action required|Error|Not configured|Paused):/.test(display.text)) render();
     });
   }
 
@@ -341,94 +392,84 @@ export class StatusModal extends Modal {
     this.contentEl.empty();
   }
 
-  private renderActions(): void {
-    const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+  private renderActions(container: HTMLElement): void {
+    const actions = container.createDiv({ cls: "modal-button-container" });
     actions.addClass("s3-vault-sync-toolbar");
-    actions.createEl("button", { text: "Sync now" }).addEventListener("click", () => {
-      void this.controller.syncNow().then(() => this.onOpen());
-    });
-    this.pauseButton = actions.createEl("button", {
-      text: this.controller.isPaused() ? "Resume" : "Pause",
-    });
-    this.pauseButton.addEventListener("click", () => {
-      void this.controller.togglePause().then(() => this.onOpen());
+    actionButton(actions, "Sync now", async () => { await this.controller.syncNow(); this.onOpen(); })
+      .disabled = this.controller.isPaused();
+    this.pauseButton = actionButton(actions, this.controller.isPaused() ? "Resume" : "Pause",
+      async () => { await this.controller.togglePause(); this.onOpen(); });
+    actions.createEl("button", {text: "Open settings"}).addEventListener("click", () => {this.controller.openSettings(); this.close();});
+    actions.createEl("button", {text: "Troubleshooting"}).addEventListener("click", () =>
+      showGuidance(this.app, "Sync troubleshooting", statusHelp(this.controller.getStatusText())));
+    actionButton(actions, "Copy status", async () => {
+      if (!await copyText(this.controller.getStatusText())) throw new Error("Clipboard unavailable; select the displayed status to copy it.");
     });
     if (this.controller.getStatusText().includes("Repair Mode")) {
       actions.createEl("button", {text: "Recovery guidance"}).addEventListener("click", () => {
         showGuidance(this.app, "Remote recovery required",
-          "The remote state could not be authenticated. Pause sync on all devices and preserve local copies. Check the configured bucket/prefix and AWS permissions. For a missing or damaged Head, inspect S3 Versioning and restore a verified Head with its referenced objects, then retry. Do not initialize a new Vault over the existing prefix.");
+          statusHelp(this.controller.getStatusText()));
       });
     }
     if (this.controller.getPendingBulkDeletion()) {
-      actions
-        .createEl("button", {
-          cls: "mod-warning",
-          text: "Confirm bulk deletion",
-        })
-        .addEventListener("click", () => {
-          void this.controller.confirmBulkDeletion().then(() => this.onOpen());
-        });
+      actionButton(actions, "Confirm bulk deletion", async () => { await this.controller.confirmBulkDeletion(); this.onOpen(); })
+        .addClass("mod-warning");
     }
   }
 
-  private renderBulkDeletion(): void {
+  private renderBulkDeletion(container: HTMLElement): void {
     const bulk = this.controller.getPendingBulkDeletion();
     if (bulk) {
-      this.contentEl.createEl("p", {
+      container.createEl("p", {
         cls: "s3-vault-sync-error",
         text: `Delete ${bulk.count} of ${bulk.totalLiveEntries} entries?`,
       });
     }
   }
 
-  private renderConflicts(): void {
+  private renderConflicts(container: HTMLElement): void {
     const conflicts = this.controller.getConflicts();
     if (conflicts.length === 0) {
       return;
     }
-    this.contentEl.createEl("h3", { text: "Conflict Center" });
+    container.createEl("h3", { text: "Conflict Center" });
     for (const conflict of conflicts) {
-      const item = this.contentEl.createDiv({ cls: "s3-vault-sync-conflict" });
+      const item = container.createDiv({ cls: "s3-vault-sync-conflict" });
       item.createEl("strong", { text: conflict.path });
       item.createEl("div", {
         cls: "s3-vault-sync-muted",
         text: conflict.reason,
       });
       for (const candidate of conflict.candidates) {
-        item
-          .createEl("button", { text: `Restore ${candidate.createdAt}` })
-          .addEventListener("click", () => {
-            void this.controller
-              .resolveConflict(conflict.entryId, candidate.revisionId)
-              .then(() => this.onOpen());
-          });
+        const row = item.createDiv({cls: "s3-vault-sync-toolbar"});
+        row.createSpan({text: `${candidate.createdAt} · ${candidate.size} bytes`});
+        row.createEl("button", {text: "Preview version"}).addEventListener("click", () => {
+          new DeletedFilePreviewModal(this.app, conflict, candidate,
+            () => this.controller.readConflictCandidate(conflict.entryId, candidate.revisionId), "Conflict version preview").open();
+        });
+        actionButton(row, "Use this version", async () => {
+          await this.controller.resolveConflict(conflict.entryId, candidate.revisionId); this.onOpen();
+        });
       }
       if (
         conflict.reason === "delete-edit" ||
         conflict.reason === "edit-delete"
       ) {
-        item.createEl("button", { text: "Keep deleted" }).addEventListener(
-          "click",
-          () => {
-            void this.controller
-              .keepConflictDeleted(conflict.entryId)
-              .then(() => this.onOpen());
-          },
-        );
+        actionButton(item, "Keep deleted", async () => {await this.controller.keepConflictDeleted(conflict.entryId); this.onOpen();});
       }
     }
   }
 
-  private renderDeferredDownloads(): void {
+  private renderDeferredDownloads(container: HTMLElement): void {
     const deferred = this.controller.getDeferredDownloads();
     if (deferred.length === 0) {
       return;
     }
-    this.contentEl.createEl("h3", {
+    container.createEl("h3", {
       text: `${deferred.length} files unavailable on this device`,
     });
     for (const entry of deferred) {
-      const item = this.contentEl.createDiv({ cls: "s3-vault-sync-history" });
+      const item = container.createDiv({ cls: "s3-vault-sync-history" });
       item.createSpan({
         text:
           entry.reason === "unsupported-path"
@@ -453,15 +494,15 @@ export class StatusModal extends Modal {
     }
   }
 
-  private renderDeletedRecoveries(): void {
+  private renderDeletedRecoveries(container: HTMLElement): void {
     const deleted = this.controller.getDeletedRecoveries();
     if (deleted.length === 0) {
       return;
     }
-    this.contentEl.createEl("h3", { text: "Deleted files (30-day recovery)" });
+    container.createEl("h3", { text: "Deleted files (30-day recovery)" });
     for (const entry of deleted) {
       const recovery = entry.recovery;
-      const item = this.contentEl.createDiv({ cls: "s3-vault-sync-deleted-row" });
+      const item = container.createDiv({ cls: "s3-vault-sync-deleted-row" });
       const previewTarget = item.createDiv({
         cls: "s3-vault-sync-deleted-preview",
       });
@@ -513,14 +554,7 @@ export class StatusModal extends Modal {
         },
       );
       if (recovery) {
-        actions.createEl("button", { text: "Restore" }).addEventListener(
-          "click",
-          () => {
-            void this.controller
-              .restoreDeleted(entry.entryId)
-              .then(() => this.onOpen());
-          },
-        );
+        actionButton(actions, "Restore", async () => {await this.controller.restoreDeleted(entry.entryId); this.onOpen();});
       }
       if ((entry.history?.length ?? 0) > 0) {
         actions
@@ -540,8 +574,10 @@ export class StatusModal extends Modal {
     const paths = "path" in issue ? [issue.path] : issue.kind === "path-collision" ? issue.paths : [];
     for (const path of paths) {
       const actions = item.createDiv({cls: "s3-vault-sync-toolbar"});
-      actions.createEl("button", {text: paths.length > 1 ? `Open ${path}` : "Open local file"})
-        .addEventListener("click", () => { void this.controller.openLocalFile(path).catch(error => new Notice(String(error))); });
+      actionButton(actions, paths.length > 1 ? `Open ${path}` : "Open local file", async () => {
+        await this.controller.openLocalFile(path);
+        this.close();
+      });
       actions.createEl("button", {text: "Copy path"}).addEventListener("click", () => {
         void copyText(path).then(copied => new Notice(copied ? "Path copied" : "Select the path text to copy it."));
       });
@@ -583,7 +619,7 @@ export class StatusModal extends Modal {
           new RenameReviewModal(this.app, issue, async resolution => {
             await this.controller.resolvePossibleRename(resolution);
             this.onOpen();
-          }).open();
+          }, async () => { await this.controller.syncNow(); this.onOpen(); }).open();
         });
         this.renderIssueTools(item, issue);
         continue;
@@ -604,9 +640,7 @@ export class StatusModal extends Modal {
                   : "Local file exceeds the automatic mobile limit.",
       });
       if (issue.kind === "import-candidate") {
-        item.createEl("button", { text: "Import" }).addEventListener("click", () => {
-          void this.controller.importCandidate(issue.path).then(() => this.onOpen());
-        });
+        actionButton(item, "Import", async () => {await this.controller.importCandidate(issue.path); this.onOpen();});
       }
       if (issue.kind === "bootstrap-mismatch" || issue.kind === "resolution-mismatch" || issue.kind === "deferred-local-edit") {
         item.createEl("button", {text: "Review versions", cls: "mod-cta"}).addEventListener("click", () => {
@@ -647,11 +681,7 @@ class DeletedVersionHistoryModal extends Modal {
             ),
         ).open();
       });
-      row.createEl("button", { text: "Restore" }).addEventListener("click", () => {
-        void this.controller
-          .restoreDeleted(this.entry.entryId, revision.revisionId)
-          .then(() => this.close());
-      });
+      actionButton(row, "Restore", async () => {await this.controller.restoreDeleted(this.entry.entryId, revision.revisionId); this.close();});
     }
   }
 
@@ -680,11 +710,7 @@ export class VersionHistoryModal extends Modal {
     for (const revision of history) {
       const row = this.contentEl.createDiv({ cls: "s3-vault-sync-history" });
       row.createSpan({ text: `${revision.createdAt} · ${revision.size} bytes` });
-      row.createEl("button", { text: "Restore" }).addEventListener("click", () => {
-        void this.controller
-          .restoreRevision(this.entry.entryId, revision.revisionId)
-          .then(() => this.close());
-      });
+      actionButton(row, "Restore", async () => {await this.controller.restoreRevision(this.entry.entryId, revision.revisionId); this.close();});
     }
   }
 

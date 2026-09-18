@@ -4,6 +4,7 @@ import type { App, PluginManifest } from "obsidian";
 const host = vi.hoisted((): {
   data: unknown;
   notices: string[];
+  noticeActions: Array<{text: string; click: (event: {stopPropagation(): void}) => void}>;
   requestUrl: ReturnType<typeof vi.fn>;
   beforeSave?: () => Promise<void>;
   beforeLoad?: () => Promise<void>;
@@ -11,6 +12,7 @@ const host = vi.hoisted((): {
 } => ({
   data: undefined,
   notices: [],
+  noticeActions: [],
   requestUrl: vi.fn(),
   registrationCount: 0,
 }));
@@ -19,7 +21,15 @@ vi.mock("obsidian", () => ({
   App: class {},
   FileSystemAdapter: class {},
   Modal: class {},
-  Notice: class { constructor(message: string) { host.notices.push(message); } },
+  Notice: class {
+    constructor(message: string) { host.notices.push(message); }
+    hide() {}
+    messageEl = {createEl: (_tag: string, options: {text: string}) => ({
+      addEventListener: (_name: string, click: (event: {stopPropagation(): void}) => void) => {
+        host.noticeActions.push({text: options.text, click});
+      },
+    })};
+  },
   Platform: { isDesktop: false, isDesktopApp: false, isMobile: false },
   Plugin: class {
     constructor(public app: unknown, public manifest: unknown) {}
@@ -56,6 +66,7 @@ const setup = async (initialized = true) => {
   vi.stubGlobal("window", globalThis);
   vi.stubGlobal("document", { visibilityState: "visible" });
   host.notices = [];
+  host.noticeActions = [];
   host.beforeSave = undefined;
   host.beforeLoad = undefined;
   host.registrationCount = 0;
@@ -411,5 +422,16 @@ describe("plugin synchronization lifecycle", () => {
     expect(plugin.isPaused()).toBe(true);
     expect(plugin.getStatusText()).toMatch(failure === "network" ? /^Error:/u : /^Action required:/u);
     expect(host.notices).toHaveLength(1);
+    const openStatus = vi.spyOn(plugin, "openStatus").mockImplementation(() => {});
+    expect(host.noticeActions[0]?.text).toBe("Open sync status");
+    host.noticeActions[0]?.click({stopPropagation() {}});
+    expect(openStatus).toHaveBeenCalledOnce();
+  });
+
+  it("propagates a manual download failure so its confirmation cannot close as a success", async () => {
+    const {plugin, hooks} = await setup();
+    hooks.headFailure = "network";
+    await expect(plugin.downloadDeferred("entry-1")).rejects.toThrow("503");
+    expect(plugin.getStatusText()).toMatch(/^Error:/);
   });
 });

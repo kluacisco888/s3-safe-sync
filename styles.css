@@ -10,10 +10,16 @@
 }
 
 .s3-vault-sync-status-bar {
+  cursor: pointer;
   max-width: min(36rem, 45vw);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.s3-vault-sync-notice-action {
+  display: block;
+  margin-top: var(--size-4-2);
 }
 
 .s3-vault-sync-muted {

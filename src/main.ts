@@ -3,6 +3,7 @@ import {
   Platform,
   Plugin,
   TFile,
+  type App,
   type TAbstractFile,
 } from "obsidian";
 
@@ -163,10 +164,10 @@ export default class S3VaultSyncPlugin
     this.credentials = new CredentialStore(this.app.secretStorage);
     this.addSettingTab(new S3VaultSyncSettingsTab(this.app, this));
     this.addRibbonIcon("refresh-cw", "Open S3 Vault Sync", () => {
-      new StatusModal(this.app, this).open();
+      this.openStatus();
     });
     this.addCommand({
-      callback: () => new StatusModal(this.app, this).open(),
+      callback: () => this.openStatus(),
       id: "open-status",
       name: "Open sync status",
     });
@@ -209,6 +210,12 @@ export default class S3VaultSyncPlugin
     if (Platform.isDesktop) {
       this.statusElement = this.addStatusBarItem();
       this.statusElement.addClass("s3-vault-sync-status-bar");
+      this.statusElement.setAttr("role", "button");
+      this.statusElement.setAttr("tabindex", "0");
+      this.registerDomEvent(this.statusElement, "click", () => this.openStatus());
+      this.registerDomEvent(this.statusElement, "keydown", event => {
+        if (event.key === "Enter" || event.key === " ") { event.preventDefault(); this.openStatus(); }
+      });
     }
     this.refreshConfiguredStatus();
     this.app.workspace.onLayoutReady(() => {
@@ -253,6 +260,20 @@ export default class S3VaultSyncPlugin
 
   getSettings(): S3VaultSyncSettings {
     return this.data.settings;
+  }
+
+  openStatus(): void {
+    new StatusModal(this.app, this).open();
+  }
+
+  openSettings(): void {
+    const host = this.app as App & {setting: {open(): void; openTabById(id: string): void}};
+    host.setting.open();
+    host.setting.openTabById(this.manifest.id);
+  }
+
+  readConflictCandidate(entryId: string, revisionId: string): Promise<Uint8Array> {
+    return this.runExclusiveSyncService(service => service.readConflictCandidate(entryId, revisionId));
   }
 
   getStatusText(): string {
@@ -364,8 +385,7 @@ export default class S3VaultSyncPlugin
   async openLocalFile(path: string): Promise<void> {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) {
-      new Notice("This file is not present on this device. Use the device that holds the file.");
-      return;
+      throw new Error("This file is not present on this device. Copy the path and use the device that holds it.");
     }
     await this.app.workspace.getLeaf(false).openFile(file);
   }
@@ -385,6 +405,7 @@ export default class S3VaultSyncPlugin
       this.setStatus("Idle", "Import Candidate added to the shared Vault.");
     } catch (error) {
       this.showError(error);
+      throw error;
     }
   }
 
@@ -399,6 +420,7 @@ export default class S3VaultSyncPlugin
       this.setStatus("Idle", "Large file downloaded after explicit confirmation.");
     } catch (error) {
       this.showError(error);
+      throw error;
     }
   }
 
@@ -417,6 +439,7 @@ export default class S3VaultSyncPlugin
       this.setStatus("Idle", "Historical Revision restored.");
     } catch (error) {
       this.showError(error);
+      throw error;
     }
   }
 
@@ -437,6 +460,7 @@ export default class S3VaultSyncPlugin
       this.setStatus("Idle", "Deleted file restored as a new Revision.");
     } catch (error) {
       this.showError(error);
+      throw error;
     }
   }
 
@@ -954,6 +978,7 @@ export default class S3VaultSyncPlugin
       this.setStatus("Idle", "Conflict resolved and shared with every device.");
     } catch (error) {
       this.showError(error);
+      throw error;
     }
   }
 
@@ -1100,6 +1125,11 @@ export default class S3VaultSyncPlugin
         ? `Repair Mode: ${message}`
         : message,
     );
-    new Notice(`S3 Vault Sync: ${message}`);
+    const notice = new Notice(`S3 Vault Sync: ${message}`, 12_000);
+    notice.messageEl.createEl("button", {text: "Open sync status", cls: "s3-vault-sync-notice-action"}).addEventListener("click", event => {
+      event.stopPropagation();
+      this.openStatus();
+      notice.hide();
+    });
   }
 }

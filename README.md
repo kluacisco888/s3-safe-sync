@@ -99,6 +99,8 @@ Folder moves recorded during synchronization retain their Entry identities even 
 
 When a new or reinstalled device has different local content at an existing remote path, use **Review versions**. The preservation action creates a uniquely named local-copy file, uploads and verifies it, then accepts the reviewed remote state at the original path. Other unreviewed files keep their previous synchronization bases. This also handles edits made while a conflict or deferred download was pending; existing remote conflicts and deletion records remain intact. The decision expires if either side changes. Large files and unsupported paths show the device restriction instead of bypassing it. Every local issue offers specific resolution guidance and affected paths can be opened or copied.
 
+Error notices, the desktop status bar, and the settings page link to sync status. Its actions and issue lists update after background checks; bulk-delete confirmation and recovery guidance do not require reopening the window. Status includes settings, troubleshooting, and copy-status actions. Conflict candidates have authenticated text previews before selection. Failed restore, import, or transfer actions retain an error and can be retried; failed unlocks keep the typed password only in the current input so it can be corrected or retried. Repair Mode and filesystem restrictions provide guidance for the necessary external action, not an automatic overwrite or reset.
+
 ## Scope and limits
 
 The plugin synchronizes ordinary Vault files. It excludes Obsidian configuration, dot-prefixed and underscore-prefixed path segments, version-control directories, `node_modules`, and temporary Office files.
