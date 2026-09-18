@@ -615,10 +615,11 @@ describe("SyncService", () => {
   });
 
   describe("reviewing local content without a trusted base", () => {
-    const setup = async () => {
+    const setup = async (reverseOrder = false) => {
       const objects = new MemoryObjectStore();
       const remote = await RemoteStore.open({objects, prefix: "test", vaultKey: new Uint8Array(32)});
       const source = new MemoryVault();
+      if (reverseOrder) await source.write("unreviewed.md", new TextEncoder().encode("remote other"));
       await source.write("article.md", new TextEncoder().encode("remote article"));
       await source.write("unreviewed.md", new TextEncoder().encode("remote other"));
       const sourceCache = new MemorySyncCache();
@@ -698,8 +699,8 @@ describe("SyncService", () => {
       expect((await service.synchronize()).localIssues).toEqual([{kind: "import-candidate", path: "late-local-file.md"}]);
     });
 
-    it("reviews the current owner of a reused path without removing its historical tombstone", async () => {
-      const {remote, source, sourceService, sourceCache} = await setup();
+    it.each(["forward", "reverse", "reverse-old-content"])("reviews the current owner of a reused path without removing its historical tombstone (%s)", async order => {
+      const {remote, source, sourceService, sourceCache} = await setup(order.startsWith("reverse"));
       const deletedId = sourceCache.state!.files["article.md"]!.entryId;
       await source.delete("article.md");
       const deletion = await sourceService.synchronize();
@@ -710,13 +711,14 @@ describe("SyncService", () => {
         ["unreviewed.md", {entryId: ownerId, toPath: "article.md"}],
       ])});
       const local = new MemoryVault();
-      await local.write("article.md", new TextEncoder().encode("new device draft"));
+      const draft = order === "reverse-old-content" ? "remote article" : "new device draft";
+      await local.write("article.md", new TextEncoder().encode(draft));
       const service = new SyncService({remote, local, cache: new MemorySyncCache(), replicaId: "new-device"});
       expect((await service.synchronize()).localIssues).toContainEqual({kind: "bootstrap-mismatch", path: "article.md"});
       const review = await service.reviewLocalContent("article.md");
       expect(review.remoteVersions[0]?.preview).toBe("remote other");
       const copyPath = await service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken);
-      expect(local.readText(copyPath!)).toBe("new device draft");
+      expect(local.readText(copyPath!)).toBe(draft);
       expect(local.readText("article.md")).toBe("remote other");
       const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
       expect(snapshot.entries[deletedId]!.kind).toBe("deleted");

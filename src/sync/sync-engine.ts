@@ -309,9 +309,14 @@ export class SyncEngine {
     const localActions: LocalAction[] = [];
     const remoteChanges: RemoteChange[] = [];
     const remoteEntries = Object.values(remote.entries);
-    const remoteByPath = new Map(
-      remoteEntries.map((entry) => [entry.path, entry] as const),
-    );
+    const remoteByPath = new Map<string, VaultEntry>();
+    for (const entry of remoteEntries) {
+      const owner = remoteByPath.get(entry.path);
+      // A historical tombstone must not shadow the current owner after a path is reused.
+      if (!owner || owner.kind === "deleted" || entry.kind !== "deleted") {
+        remoteByPath.set(entry.path, entry);
+      }
+    }
     const localByEntryId = new Map(
       local.files.flatMap((file) =>
         file.entryId ? ([[file.entryId, file]] as const) : [],
