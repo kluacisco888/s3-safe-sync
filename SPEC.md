@@ -59,6 +59,7 @@ Sync Commits form an immutable parent-linked history. The accepted Head identifi
 11. A deferred Entry retains the last accepted local Revision as its reconciliation base. Raising a device limit downloads an unchanged stale copy, while edits made during deferral become action-required and later reconcile as a Conflict.
 12. A rename concurrent with an edit combines the renamed path and edited content when those changes are independent. Deletion wins over a rename that did not change content; rename plus content changes enters the Conflict Center.
 13. Host-observed renames retain the expected Entry ID until the serialized synchronization accepts the new path. Reusing the old path for a new file cannot transfer the renamed Entry's history to that file.
+14. If a chained host rename outlives its intermediate file-cache path, its persisted Entry ID may be rebound to the accepted live snapshot path only when no other cached path already owns that identity. Duplicate sources, identities, or targets stop. Unobserved ambiguous moves require a reviewed one-to-one mapping or an explicit separate delete/add decision, bound to the Vault, accepted base, remote Commit, and all scanned paths and content hashes; bulk deletion approval remains separate.
 
 ## Encryption
 

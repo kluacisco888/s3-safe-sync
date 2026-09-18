@@ -28,6 +28,7 @@ import {
   type CachedSyncState,
   type DeferredDownloadEntry,
   type LocalSyncIssue,
+  type PossibleRenameResolution,
   type SyncCachePort,
   type SyncProgress,
   type VerifiedLocalFile,
@@ -129,6 +130,7 @@ export default class S3VaultSyncPlugin
     | undefined;
   private approvedBulkDeletionEntryIds: string[] | undefined;
   private pendingLocalIssues: LocalSyncIssue[] = [];
+  private approvedRenameResolution: PossibleRenameResolution | undefined;
   private pendingDeferredDownloads: DeferredDownloadEntry[] = [];
   private readonly pluginDataWriter = new SerializedDataWriter(
     () => this.data,
@@ -319,6 +321,22 @@ export default class S3VaultSyncPlugin
       });
     } finally {
       this.approvedBulkDeletionEntryIds = undefined;
+      this.approvedRenameResolution = undefined;
+    }
+  }
+
+  async resolvePossibleRename(resolution: PossibleRenameResolution): Promise<void> {
+    if (this.syncRequests.isRunning) {
+      throw new Error("Synchronization is running. Wait for it to finish, then review again.");
+    }
+    if (this.isPaused()) throw new Error("Resume synchronization before resolving a rename.");
+    this.approvedRenameResolution = resolution;
+    try {
+      await this.requestSync({ fullHashVerification: true });
+      if (this.status === "Error") throw new Error(this.statusDetail);
+    } finally {
+      // A separate delete/add decision may still need the existing bulk-delete confirmation.
+      if (!this.pendingBulkDeletion) this.approvedRenameResolution = undefined;
     }
   }
 
@@ -775,6 +793,7 @@ export default class S3VaultSyncPlugin
               fullHashVerification:
                 fullHashVerification && attempt === 1,
               pathRenames: this.pathRenames.toPathMap(pathRenameSnapshot),
+              renameResolution: this.approvedRenameResolution,
               retryHashMemo,
             },
           );
@@ -789,6 +808,7 @@ export default class S3VaultSyncPlugin
       this.pendingLocalIssues = result.localIssues;
       this.pendingDeferredDownloads = result.deferredDownloadEntries;
       if (result.cacheUpdated) {
+        this.approvedRenameResolution = undefined;
         const unverifiedLocalPaths = new Set(
           result.localIssues.flatMap((issue) =>
             issue.kind === "unsynced-local" ? [issue.path] : [],
@@ -835,6 +855,7 @@ export default class S3VaultSyncPlugin
         );
       }
     } catch (error) {
+      this.approvedRenameResolution = undefined;
       if (error instanceof SyncStoppedError) return;
       if (error instanceof HeadChangedError) {
         this.scheduleHeadRetry(fullHashVerification);

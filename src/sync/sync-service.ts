@@ -120,6 +120,7 @@ export interface SyncScanOptions {
 export interface SynchronizeOptions extends SyncScanOptions {
   assertLocalObservationCurrent?: () => void;
   pathRenames?: ReadonlyMap<string, PersistedPathRename>;
+  renameResolution?: PossibleRenameResolution;
 }
 
 export interface VerifiedLocalFile extends LocalFileInfo {
@@ -143,10 +144,56 @@ export type LocalSyncIssue =
   | { kind: "deferred-local-edit"; path: string }
   | { kind: "import-candidate"; path: string }
   | { kind: "path-collision"; paths: string[] }
-  | { kind: "possible-rename"; newPaths: string[]; oldPaths: string[] }
+  | PossibleRenameIssue
   | { kind: "resolution-mismatch"; path: string }
   | { kind: "unsupported-path"; path: string }
   | { kind: "unsynced-local"; path: string };
+
+export interface PossibleRenameIssue {
+  kind: "possible-rename";
+  newPaths: string[];
+  oldPaths: string[];
+  reviewToken: string;
+}
+
+export type PossibleRenameResolution = {
+  reviewToken: string;
+} & (
+  | { kind: "moves"; pairs: Array<{ fromPath: string; toPath: string }> }
+  | { kind: "separate" }
+);
+
+// A second rename can arrive after Head publication but before cache rebuilding.
+// In that window the accepted snapshot still proves identity even if files is empty.
+const applicableRenames = (
+  cache: CachedSyncState | undefined,
+  pending: ReadonlyMap<string, PersistedPathRename> = new Map(),
+): Map<string, PersistedPathRename> => {
+  const result = new Map<string, PersistedPathRename>();
+  const cachedIds = new Set(Object.values(cache?.files ?? {}).map(file => file.entryId));
+  const usedIds = new Set<string>();
+  const usedTargets = new Set<string>();
+  for (const [fromPath, rename] of pending) {
+    const file = cache?.files[fromPath];
+    const entry = cache?.snapshot.entries[rename.entryId];
+    let source: string;
+    if (file?.entryId === rename.entryId) {
+      source = fromPath;
+    } else if (!file && !cachedIds.has(rename.entryId) && entry?.kind === "live" &&
+        entry.path !== rename.toPath) {
+      source = entry.path;
+    } else {
+      continue;
+    }
+    if (usedIds.has(rename.entryId) || usedTargets.has(rename.toPath) || result.has(source)) {
+      throw new Error("Ambiguous saved rename identities; review the affected paths.");
+    }
+    usedIds.add(rename.entryId);
+    usedTargets.add(rename.toPath);
+    result.set(source, rename);
+  }
+  return result;
+};
 
 export interface RestoreCandidateResolution {
   kind: "restore-candidate";
@@ -868,12 +915,7 @@ export class SyncService {
     const scannedByPath = new Map(
       scanned.map((file) => [file.path, file] as const),
     );
-    const applicablePathRenames = new Map(
-      [...(syncOptions.pathRenames ?? [])].filter(
-        ([fromPath, rename]) =>
-          cached?.files[fromPath]?.entryId === rename.entryId,
-      ),
-    );
+    const applicablePathRenames = applicableRenames(cached, syncOptions.pathRenames);
     const renamedSourcePaths = new Set(applicablePathRenames.keys());
     const renameSourcesByTarget = new Map<string, string[]>();
     for (const [fromPath, rename] of applicablePathRenames) {
@@ -912,7 +954,7 @@ export class SyncService {
       const renameSources = renameSourcesByTarget.get(file.path);
       const renamedFile =
         renameSources?.length === 1 && renameSources[0]
-          ? cached?.files[renameSources[0]]
+          ? applicablePathRenames.get(renameSources[0])
           : undefined;
       if (renamedFile) {
         entryIdByPath.set(file.path, renamedFile.entryId);
@@ -1045,11 +1087,49 @@ export class SyncService {
     );
     const locallyMutatedPaths = new Set<string>();
     const reconciliationBase = this.buildReconciliationBase(cached);
-    const plan = this.engine.reconcile({
+    let plan = this.engine.reconcile({
       base: reconciliationBase,
       local: observation,
       remote,
     });
+    const possibleRename = plan.conflicts.find(conflict => conflict.kind === "possible-rename");
+    const renameIssue: PossibleRenameIssue | undefined = possibleRename ? {
+      kind: "possible-rename",
+      newPaths: possibleRename.newFiles.map(file => file.path),
+      oldPaths: possibleRename.deletedEntries.map(entry => entry.path),
+      reviewToken: await sha256(new TextEncoder().encode(JSON.stringify({
+        vaultId: remote.vaultId,
+        head: remote.commitId,
+        base: reconciliationBase?.commitId,
+        old: possibleRename.deletedEntries.map(entry => [entry.entryId, entry.path]).sort(),
+        files: observation.files.map(file => [file.path, file.contentHash, file.size, file.entryId ?? null])
+          .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+      }))),
+    } : undefined;
+    const resolution = syncOptions.renameResolution;
+    if (resolution) {
+      if (!renameIssue || resolution.reviewToken !== renameIssue.reviewToken || !possibleRename) {
+        throw new Error("Files or remote state changed since the rename review. Sync again and review the new plan.");
+      }
+      if (resolution.kind === "moves") {
+        const sources = new Map(possibleRename.deletedEntries.map(entry => [entry.path, entry.entryId]));
+        const targets = new Set(renameIssue.newPaths);
+        const assignments = new Map<string, string>();
+        for (const pair of resolution.pairs) {
+          const entryId = sources.get(pair.fromPath);
+          if (!entryId || !targets.delete(pair.toPath)) throw new Error("Rename mapping is not one-to-one.");
+          sources.delete(pair.fromPath);
+          assignments.set(pair.toPath, entryId);
+        }
+        if (sources.size || targets.size) throw new Error("Review every missing and new file before confirming a move.");
+        observation.files = observation.files.map(file => assignments.has(file.path)
+          ? { ...file, entryId: assignments.get(file.path)! } : file);
+      }
+      plan = this.engine.reconcile({
+        base: reconciliationBase, local: observation, remote,
+        allowIndependentCreatesAndDeletes: resolution.kind === "separate",
+      });
+    }
     const localIssues: LocalSyncIssue[] = [
       ...plan.conflicts.flatMap((conflict): LocalSyncIssue[] => {
         if (conflict.kind === "import-candidate") {
@@ -1062,13 +1142,7 @@ export class SyncService {
           return [{ kind: "resolution-mismatch", path: conflict.path }];
         }
         if (conflict.kind === "possible-rename") {
-          return [
-            {
-              kind: "possible-rename",
-              newPaths: conflict.newFiles.map((file) => file.path),
-              oldPaths: conflict.deletedEntries.map((entry) => entry.path),
-            },
-          ];
+          return renameIssue ? [renameIssue] : [];
         }
         if (conflict.kind === "path-collision") {
           return [{ kind: "path-collision", paths: conflict.paths }];
@@ -1947,10 +2021,7 @@ export class SyncService {
     let unsyncedLocalEntries = 0;
     const localFiles = await this.options.local.list();
     const renamedEntryIdsByTarget = new Map<string, string[]>();
-    for (const [fromPath, rename] of options.pathRenames ?? []) {
-      if (cached?.files[fromPath]?.entryId !== rename.entryId) {
-        continue;
-      }
+    for (const rename of applicableRenames(cached, options.pathRenames).values()) {
       const entryIds = renamedEntryIdsByTarget.get(rename.toPath) ?? [];
       entryIds.push(rename.entryId);
       renamedEntryIdsByTarget.set(rename.toPath, entryIds);

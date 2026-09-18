@@ -95,6 +95,8 @@ Uploads are read back, decrypted, and hash-verified before their Commit can beco
 
 The plugin asks for confirmation before propagating more than 100 deletions or more than 20 percent of the current Vault.
 
+Folder moves recorded during synchronization retain their Entry identities even if a later move makes the intermediate paths disappear from the local cache. Ambiguous missing/new paths appear as a collapsed summary with **Review and resolve**: confirm one-to-one moves to keep file history, or explicitly treat them as separate deletions and additions. Each decision is rechecked against fresh file hashes and the remote Commit; a changed plan requires a new review, and bulk deletion still requires its separate confirmation.
+
 ## Scope and limits
 
 The plugin synchronizes ordinary Vault files. It excludes Obsidian configuration, dot-prefixed and underscore-prefixed path segments, version-control directories, `node_modules`, and temporary Office files.

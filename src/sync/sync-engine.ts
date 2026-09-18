@@ -213,6 +213,7 @@ export interface BulkDeletionPlan {
 }
 
 export interface ReconcileInput {
+  allowIndependentCreatesAndDeletes?: boolean;
   base?: VaultSnapshot;
   local: ReplicaObservation;
   remote: VaultSnapshot;
@@ -221,7 +222,7 @@ export interface ReconcileInput {
 export class SyncEngine {
   constructor(private readonly createId: () => string = () => crypto.randomUUID()) {}
 
-  reconcile({ base, local, remote }: ReconcileInput): SyncPlan {
+  reconcile({ base, local, remote, allowIndependentCreatesAndDeletes = false }: ReconcileInput): SyncPlan {
     const pathsByCanonicalForm = new Map<string, string[]>();
     const localFilesByCanonicalPath = new Map<string, ObservedFile[]>();
     const boundLocalEntryIds = new Set<string>();
@@ -668,6 +669,7 @@ export class SyncEngine {
       (change) => change.kind === "upload-new",
     );
     if (
+      !allowIndependentCreatesAndDeletes &&
       possibleRenameDeletions.length > 0 &&
       possibleRenameCreations.length > 0
     ) {

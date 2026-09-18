@@ -4142,6 +4142,196 @@ describe("SyncService", () => {
     );
   });
 
+  it.each([2, 148])("recovers a chained folder rename of %i files after cache rebuilding loses the intermediate paths", async count => {
+    const objects = new MemoryObjectStore();
+    const remote = await RemoteStore.open({
+      objects, prefix: "chosen-prefix", vaultKey: new Uint8Array(32),
+    });
+    const local = new MemoryVault();
+    await local.write("original/table.csv", new TextEncoder().encode("a,b\n1,2"));
+    await local.write("original/article.md", new TextEncoder().encode("before"));
+    for (let index = 2; index < count; index += 1) {
+      await local.write(`original/${index}.csv`, new TextEncoder().encode("identical empty table"));
+    }
+    const cache = new MemorySyncCache();
+    const service = new SyncService({ cache, local, remote, replicaId: "desktop" });
+    await service.initializeNew("vault-1");
+    const entries = Object.values(cache.state!.snapshot.entries);
+    const renames = new Map(entries.map(entry => [
+      entry.path, { entryId: entry.entryId, toPath: entry.path.replace("original/", "middle/") },
+    ]));
+    for (const entry of entries) await local.move(entry.path, renames.get(entry.path)!.toPath);
+    // The second move arrives while the first Head is being published, before buildCache.
+    objects.onPut = async key => {
+      if (!key.endsWith("/head")) return;
+      objects.onPut = undefined;
+      for (const rename of renames.values()) {
+        const previous = rename.toPath;
+        rename.toPath = previous.replace("middle/", "final/");
+        await local.move(previous, rename.toPath);
+      }
+      await local.write("final/article.md", new TextEncoder().encode("edited during move"));
+    };
+    await service.synchronize([], { pathRenames: new Map([...renames].map(([key, value]) => [key, { ...value }])) });
+    expect(Object.keys(cache.state!.files)).toHaveLength(0);
+    expect(Object.values(cache.state!.snapshot.entries).every(entry => entry.path.startsWith("middle/"))).toBe(true);
+
+    const result = await service.synchronize([], { pathRenames: renames });
+
+    expect(result.status).toBe("complete");
+    expect(result.localIssues).toEqual([]);
+    const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+    expect(Object.keys(snapshot.entries).sort()).toEqual(entries.map(entry => entry.entryId).sort());
+    for (const entry of entries) {
+      expect(snapshot.entries[entry.entryId]).toMatchObject({kind: "live", path: entry.path.replace("original/", "final/")});
+    }
+    expect(local.readText("final/article.md")).toBe("edited during move");
+    expect((await service.synchronize()).uploaded).toBe(0);
+  });
+
+  it.each(["edit", "delete"])("preserves the local draft when a recovered rename meets a concurrent remote %s", async action => {
+    const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "test", vaultKey: new Uint8Array(32)});
+    const local = new MemoryVault();
+    await local.write("middle/article.md", new TextEncoder().encode("base"));
+    await local.write("other.md", new TextEncoder().encode("other"));
+    await local.write("third.md", new TextEncoder().encode("third"));
+    await local.write("fourth.md", new TextEncoder().encode("fourth"));
+    await local.write("fifth.md", new TextEncoder().encode("fifth"));
+    const cache = new MemorySyncCache();
+    const service = new SyncService({cache, local, remote, replicaId: "desktop"});
+    await service.initializeNew("vault");
+    const entryId = cache.state!.files["middle/article.md"]!.entryId;
+    const other = new MemoryVault();
+    const otherService = new SyncService({cache: new MemorySyncCache(), local: other, remote, replicaId: "phone"});
+    await otherService.synchronize();
+    if (action === "edit") await other.write("middle/article.md", new TextEncoder().encode("remote draft"));
+    else await other.delete("middle/article.md");
+    await otherService.synchronize();
+    await local.move("middle/article.md", "final/article.md");
+    await local.write("final/article.md", new TextEncoder().encode("local draft"));
+    delete cache.state!.files["middle/article.md"];
+
+    const result = await service.synchronize([], {pathRenames: new Map([
+      ["original/article.md", {entryId, toPath: "final/article.md"}],
+    ])});
+
+    expect(result.status).toBe("action-required");
+    expect(result.localIssues.some(issue => issue.kind === "possible-rename")).toBe(false);
+    const entry = (await remote.readSnapshot((await remote.readHead())!.value)).entries[entryId]!;
+    if (entry.kind !== "conflicted") throw new Error("Expected conflict preserving the renamed draft");
+    const contents = await Promise.all(entry.candidates.map(async revision =>
+      new TextDecoder().decode(await remote.readBlob(revision.blobId)),
+    ));
+    expect(contents).toContain("local draft");
+    if (action === "edit") expect(contents).toContain("remote draft");
+  });
+
+  it("keeps a recovered chained rename blocked when the accepted old path is reused", async () => {
+    const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "test", vaultKey: new Uint8Array(32)});
+    const local = new MemoryVault();
+    await local.write("middle/file.md", new TextEncoder().encode("original"));
+    const cache = new MemorySyncCache();
+    const service = new SyncService({cache, local, remote, replicaId: "desktop"});
+    await service.initializeNew("vault");
+    const file = cache.state!.files["middle/file.md"]!;
+    await local.move("middle/file.md", "final/file.md");
+    await local.write("middle/file.md", new TextEncoder().encode("new occupant"));
+    cache.state!.files = {};
+    const before = (await remote.readHead())!.value.commitId;
+    const result = await service.synchronize([], {pathRenames: new Map([
+      ["original/file.md", {entryId: file.entryId, toPath: "final/file.md"}],
+    ])});
+    expect(result.status).toBe("action-required");
+    expect(result.localIssues.some(issue => issue.kind === "path-collision")).toBe(true);
+    expect((await remote.readHead())!.value.commitId).toBe(before);
+    expect(local.readText("middle/file.md")).toBe("new occupant");
+    expect(local.readText("final/file.md")).toBe("original");
+  });
+
+  describe("possible rename review", () => {
+    const setupReview = async (count = 1) => {
+      const objects = new MemoryObjectStore();
+      const remote = await RemoteStore.open({objects, prefix: "test", vaultKey: new Uint8Array(32)});
+      const local = new MemoryVault();
+      for (let index = 0; index < count; index += 1) {
+        await local.write(`old/${index}.md`, new TextEncoder().encode(`original ${index}`));
+      }
+      const cache = new MemorySyncCache();
+      const service = new SyncService({cache, local, remote, replicaId: "desktop"});
+      await service.initializeNew("vault");
+      const original = structuredClone(cache.state!);
+      for (let index = 0; index < count; index += 1) {
+        await local.move(`old/${index}.md`, `new/${index}.md`);
+        await local.write(`new/${index}.md`, new TextEncoder().encode(`edited ${index}`));
+      }
+      const issue = (await service.synchronize()).localIssues.find(issue => issue.kind === "possible-rename");
+      if (!issue) throw new Error("Expected rename review");
+      return {objects, remote, local, cache, service, original, issue};
+    };
+
+    it("accepts a reviewed folder move with edits, retaining every Entry and old content", async () => {
+      const {service, issue, remote, original} = await setupReview(3);
+      const result = await service.synchronize([], {renameResolution: {
+        kind: "moves", reviewToken: issue.reviewToken,
+        pairs: issue.oldPaths.map(fromPath => ({fromPath, toPath: fromPath.replace("old/", "new/")})),
+      }});
+      expect(result.status).toBe("complete");
+      const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      expect(Object.keys(snapshot.entries).sort()).toEqual(Object.keys(original.snapshot.entries).sort());
+      for (const entry of Object.values(snapshot.entries)) {
+        expect(entry.kind).toBe("live");
+        expect(entry.path.startsWith("new/")).toBe(true);
+        expect(entry.history?.[0]?.contentHash).toBe(
+          original.files[entry.path.replace("new/", "old/")]!.contentHash,
+        );
+      }
+    });
+
+    it.each(["local-edit", "new-file", "remote-change", "wrong-token"])(
+      "rejects a stale review after %s without publishing or deleting files", async change => {
+        const {service, issue, local, remote} = await setupReview();
+        if (change === "local-edit") await local.write("new/0.md", new TextEncoder().encode("newer draft"));
+        if (change === "new-file") await local.write("new/extra.md", new TextEncoder().encode("extra draft"));
+        if (change === "remote-change") {
+          const head = (await remote.readHead())!;
+          const commitId = crypto.randomUUID();
+          await remote.advance({expectedHeadEtag: head.etag, head: {...head.value, commitId, generation: head.value.generation + 1},
+            commit: {commitId, changes: [], parentIds: [head.value.commitId], createdAt: head.serverDate,
+              protocolVersion: 1, replicaId: "other", vaultId: "vault"}});
+        }
+        const before = (await remote.readHead())!.value.commitId;
+        await expect(service.synchronize([], {renameResolution: {
+          kind: "separate", reviewToken: change === "wrong-token" ? "stale" : issue.reviewToken,
+        }})).rejects.toThrow("changed since the rename review");
+        expect((await remote.readHead())!.value.commitId).toBe(before);
+        expect(local.readText("new/0.md")).toBe(change === "local-edit" ? "newer draft" : "edited 0");
+      },
+    );
+
+    it("rejects a mapping that assigns two old Entries to the same new file", async () => {
+      const {service, issue} = await setupReview(2);
+      await expect(service.synchronize([], {renameResolution: {kind: "moves", reviewToken: issue.reviewToken,
+        pairs: issue.oldPaths.map(fromPath => ({fromPath, toPath: "new/0.md"})),
+      }})).rejects.toThrow("not one-to-one");
+    });
+
+    it("requires exact bulk-delete confirmation after separate delete/add review", async () => {
+      const {service, issue, remote, local} = await setupReview(2);
+      const before = (await remote.readHead())!.value.commitId;
+      const resolution = {kind: "separate" as const, reviewToken: issue.reviewToken};
+      const blocked = await service.synchronize([], {renameResolution: resolution});
+      expect(blocked.bulkDeletion?.count).toBe(2);
+      expect(blocked.cacheUpdated).toBe(false);
+      expect((await remote.readHead())!.value.commitId).toBe(before);
+      const result = await service.synchronize(blocked.bulkDeletion!.entryIds, {renameResolution: resolution});
+      expect(result.status).toBe("complete");
+      const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      expect(Object.values(snapshot.entries).filter(entry => entry.kind === "deleted")).toHaveLength(2);
+      expect(Object.values(snapshot.entries).filter(entry => entry.kind === "live")).toHaveLength(2);
+      expect(local.readText("new/0.md")).toBe("edited 0");
+    });
+  });
+
   it("does not assign one missing Entry identity to two identical new files", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
@@ -4172,6 +4362,7 @@ describe("SyncService", () => {
         kind: "possible-rename",
         newPaths: ["notes/new-1.md", "notes/new-2.md"],
         oldPaths: ["notes/old.md"],
+        reviewToken: expect.any(String),
       },
     ]);
     expect((await remote.readHead())?.value.generation).toBe(initialGeneration);

@@ -47,6 +47,24 @@
   border-radius: var(--radius-m);
 }
 
+.s3-vault-sync-conflict details[open],
+.s3-vault-sync-rename-review details[open] {
+  max-height: 45vh;
+  overflow: auto;
+}
+
+.s3-vault-sync-rename-review .setting-item {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--size-4-2);
+  overflow-wrap: anywhere;
+}
+
+.s3-vault-sync-rename-review select {
+  width: 100%;
+  min-width: 0;
+}
+
 .s3-vault-sync-history {
   display: flex;
   align-items: center;

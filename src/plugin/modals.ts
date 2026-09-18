@@ -1,4 +1,4 @@
-import { App, Modal, Notice } from "obsidian";
+import { App, Modal, Notice, Setting } from "obsidian";
 
 import type {
   BulkDeletionPlan,
@@ -10,6 +10,8 @@ import type {
 import type {
   DeferredDownloadEntry,
   LocalSyncIssue,
+  PossibleRenameIssue,
+  PossibleRenameResolution,
 } from "../sync/sync-service";
 import {
   decodeDeletedPreview,
@@ -18,6 +20,7 @@ import {
 import { copyText } from "./clipboard";
 
 export interface StatusModalController {
+  resolvePossibleRename(resolution: PossibleRenameResolution): Promise<void>;
   confirmBulkDeletion(): Promise<void>;
   downloadDeferred(entryId: string): Promise<void>;
   getConflicts(): ConflictedEntry[];
@@ -37,6 +40,93 @@ export interface StatusModalController {
   restoreDeleted(entryId: string, revisionId?: string): Promise<void>;
   syncNow(): Promise<void>;
   togglePause(): Promise<void>;
+}
+
+const commonFolder = (paths: string[]): string => {
+  const parts = paths[0]?.split("/").slice(0, -1) ?? [];
+  for (const path of paths.slice(1)) {
+    const other = path.split("/").slice(0, -1);
+    while (parts.some((part, index) => other[index] !== part)) parts.pop();
+  }
+  return parts.length ? `${parts.join("/")}/` : "";
+};
+
+class RenameReviewModal extends Modal {
+  constructor(
+    app: App,
+    private readonly issue: PossibleRenameIssue,
+    private readonly resolve: (resolution: PossibleRenameResolution) => Promise<void>,
+  ) { super(app); }
+
+  onOpen(): void {
+    this.contentEl.empty();
+    this.contentEl.addClass("s3-vault-sync-rename-review");
+    this.contentEl.createEl("h2", { text: "Review missing and new files" });
+    this.contentEl.createEl("p", { text:
+      "If these are the same files moved or renamed, select each matching new path and confirm the moves. " +
+      "Their existing history will be kept, and content changes will be reconciled normally.",
+    });
+    const oldFolder = commonFolder(this.issue.oldPaths);
+    const newFolder = commonFolder(this.issue.newPaths);
+    this.contentEl.createDiv({ cls: "s3-vault-sync-selectable-path", text:
+      `${oldFolder || "Vault root"} → ${newFolder || "Vault root"}`,
+    });
+    const pairs = new Map<string, string>();
+    const details = this.contentEl.createEl("details");
+    details.open = this.issue.oldPaths.length <= 5;
+    details.createEl("summary", { text: `Review ${this.issue.oldPaths.length} path mappings` });
+    let updateButton = (): void => {};
+    for (const fromPath of this.issue.oldPaths) {
+      const proposed = this.issue.oldPaths.length === 1 && this.issue.newPaths.length === 1
+        ? this.issue.newPaths[0]!
+        : `${newFolder}${fromPath.slice(oldFolder.length)}`;
+      const initial = this.issue.newPaths.includes(proposed) ? proposed : "";
+      pairs.set(fromPath, initial);
+      new Setting(details)
+        .setName(fromPath.slice(oldFolder.length))
+        .setDesc(fromPath)
+        .addDropdown(dropdown => {
+          dropdown.addOption("", "Choose the matching new path");
+          for (const toPath of this.issue.newPaths) dropdown.addOption(toPath, toPath.slice(newFolder.length));
+          dropdown.setValue(initial).onChange(value => { pairs.set(fromPath, value); updateButton(); });
+        });
+    }
+    const message = this.contentEl.createEl("p");
+    const actions = this.contentEl.createDiv({ cls: "s3-vault-sync-toolbar" });
+    const confirmMoves = actions.createEl("button", { text: "Confirm moves", cls: "mod-cta" });
+    updateButton = () => {
+      confirmMoves.disabled = pairs.size !== this.issue.newPaths.length ||
+        [...pairs.values()].some(value => !value) || new Set(pairs.values()).size !== pairs.size;
+    };
+    updateButton();
+    this.contentEl.createEl("p", { text:
+      "If the missing files were intentionally deleted and the new files are unrelated, use the separate-deletions option. " +
+      "This publishes deletion records for the missing files and uploads the new files. " +
+      "Deleted content retains its recovery window; large deletions still require a second confirmation.",
+    });
+    const separate = this.contentEl.createEl("button", {
+      cls: "mod-warning", text: "Confirm separate deletions and additions",
+    });
+    const run = async (resolution: PossibleRenameResolution): Promise<void> => {
+      confirmMoves.disabled = true;
+      separate.disabled = true;
+      message.setText("Rechecking files and remote state…");
+      try {
+        await this.resolve(resolution);
+        this.close();
+      } catch (error) {
+        message.setText(error instanceof Error ? error.message : "Could not resolve the rename.");
+        updateButton();
+        separate.disabled = false;
+      }
+    };
+    confirmMoves.addEventListener("click", () => { void run({
+      kind: "moves", reviewToken: this.issue.reviewToken,
+      pairs: [...pairs].map(([fromPath, toPath]) => ({ fromPath, toPath })),
+    }); });
+    separate.addEventListener("click", () => { void run({ kind: "separate", reviewToken: this.issue.reviewToken }); });
+    actions.createEl("button", { text: "Cancel" }).addEventListener("click", () => this.close());
+  }
 }
 
 export interface VersionHistoryController {
@@ -147,12 +237,17 @@ export class StatusModal extends Modal {
     this.renderActions();
     this.renderBulkDeletion();
     this.renderConflicts();
-    this.renderLocalIssues();
+    const localIssues = this.contentEl.createDiv();
+    this.renderLocalIssues(localIssues);
     this.renderDeferredDownloads();
     this.renderDeletedRecoveries();
     this.stopStatusUpdates = this.controller.onStatusChange(display => {
       status.setText(display.text);
       this.pauseButton?.setText(this.controller.isPaused() ? "Resume" : "Pause");
+      if (/^(Idle|Action required):/.test(display.text)) {
+        localIssues.empty();
+        this.renderLocalIssues(localIssues);
+      }
     });
   }
 
@@ -350,14 +445,14 @@ export class StatusModal extends Modal {
     }
   }
 
-  private renderLocalIssues(): void {
+  private renderLocalIssues(container: HTMLElement): void {
     const issues = this.controller.getLocalIssues();
     if (issues.length === 0) {
       return;
     }
-    this.contentEl.createEl("h3", { text: "This device needs attention" });
+    container.createEl("h3", { text: "This device needs attention" });
     for (const issue of issues) {
-      const item = this.contentEl.createDiv({ cls: "s3-vault-sync-conflict" });
+      const item = container.createDiv({ cls: "s3-vault-sync-conflict" });
       if (issue.kind === "path-collision") {
         item.createEl("strong", { text: "Path collision" });
         item.createEl("div", { text: issue.paths.join(" · ") });
@@ -365,8 +460,24 @@ export class StatusModal extends Modal {
       }
       if (issue.kind === "possible-rename") {
         item.createEl("strong", { text: "Possible offline rename" });
-        item.createEl("div", {
-          text: `Missing: ${issue.oldPaths.join(", ")} · New: ${issue.newPaths.join(", ")}`,
+        item.createEl("p", {
+          text: `${issue.oldPaths.length} missing paths · ${issue.newPaths.length} new paths. Sync is waiting for your review.`,
+        });
+        item.createDiv({ cls: "s3-vault-sync-selectable-path", text:
+          `${commonFolder(issue.oldPaths) || "Vault root"} → ${commonFolder(issue.newPaths) || "Vault root"}`,
+        });
+        const details = item.createEl("details");
+        details.createEl("summary", { text: "Show all paths" });
+        for (const [label, paths] of [["Missing", issue.oldPaths], ["New", issue.newPaths]] as const) {
+          details.createEl("strong", { text: label });
+          const list = details.createEl("ul", { cls: "s3-vault-sync-selectable-path" });
+          for (const path of paths) list.createEl("li", { text: path });
+        }
+        item.createEl("button", { text: "Review and resolve", cls: "mod-cta" }).addEventListener("click", () => {
+          new RenameReviewModal(this.app, issue, async resolution => {
+            await this.controller.resolvePossibleRename(resolution);
+            this.onOpen();
+          }).open();
         });
         continue;
       }
