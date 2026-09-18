@@ -226,3 +226,15 @@ it.each(["preview", "restore"])("clears the exact historical integrity issue aft
   expect(plugin.getStatusText()).not.toContain("Repair Mode");
   expect(plugin.getStatusText()).toMatch(/^Action required:/); // Unrelated import still awaits confirmation.
 });
+
+it("clears a matching Entry/hash recovery issue when content review authenticates that exact version", async () => {
+  const {plugin, corrupt} = await fixture();
+  await plugin.syncNow();
+  const damaged = corrupt("/current-blob");
+  await expect(plugin.restoreRevision("existing", "old")).rejects.toThrow("No authenticated remote recovery");
+  damaged.restore();
+  const review = await plugin.reviewLocalContent("existing.md");
+  expect(review.remoteVersions[0]!.preview).toBe("current");
+  expect(host.stored.pendingIntegrityChecks).toEqual([]);
+  expect(plugin.getStatusText()).not.toContain("Repair Mode");
+});

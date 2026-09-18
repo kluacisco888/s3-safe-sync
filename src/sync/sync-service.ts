@@ -464,7 +464,7 @@ export class SyncService {
     ) {
       throw new Error(`Deferred Revision ${entry.revision.revisionId} is damaged`);
     }
-    await this.options.onIntegrityVerified?.({kind: "blob", blobId: entry.revision.blobId});
+    await this.reportVerifiedContent(entry, entry.revision);
     await this.assertLocalContent(entry.path, expectedContentHash);
     await this.options.local.write(
       entry.path,
@@ -617,7 +617,7 @@ export class SyncService {
         if (!body || body.byteLength !== revision.size || await sha256(body) !== revision.contentHash) {
           throw new RemoteStateError("Remote review content failed verification", undefined, {kind: "blob", blobId: revision.blobId});
         }
-        await this.options.onIntegrityVerified?.({kind: "blob", blobId: revision.blobId});
+        await this.reportVerifiedContent(entry, revision);
         preview = textPreview(body);
       }
       remoteVersions.push({size: revision.size, createdAt: revision.createdAt, preview});
@@ -775,7 +775,7 @@ export class SyncService {
     if (!body || body.byteLength !== revision.size || await sha256(body) !== revision.contentHash) {
       throw new RemoteStateError("Conflict preview failed content verification", undefined, {kind: "blob", blobId: revision.blobId});
     }
-    await this.options.onIntegrityVerified?.({kind: "blob", blobId: revision.blobId});
+    await this.reportVerifiedContent(entry, revision);
     return body;
   }
 
@@ -918,7 +918,7 @@ export class SyncService {
     const revision = entry?.kind === "live" ? entry.history?.find(value => value.revisionId === revisionId) : undefined;
     if (entry?.kind !== "live" || !revision) throw new Error("This historical version is no longer available. Refresh version history.");
     if (this.exceedsAutomaticFileLimit(entry.path, revision.size)) throw new Error("This preview exceeds this device's transfer limit.");
-    return this.readDeletedRevisionCopy(entryId, revision, head.serverDate);
+    return this.readDeletedRevisionCopy(entry, revision, head.serverDate);
   }
 
   async restoreRevision(entryId: string, revisionId: string): Promise<void> {
@@ -954,7 +954,7 @@ export class SyncService {
     ) {
       throw new Error(`Historical Revision ${revisionId} is damaged`);
     }
-    await this.options.onIntegrityVerified?.({kind: "blob", blobId: historical.blobId});
+    await this.reportVerifiedContent(entry, historical);
     if (
       historical.expiresAt !== undefined &&
       Date.parse(historical.expiresAt) <= Date.parse(versionedHead.serverDate)
@@ -1025,7 +1025,7 @@ export class SyncService {
       throw new Error(`Deleted Revision ${revisionId ?? entryId} does not exist`);
     }
     return this.readDeletedRevisionCopy(
-      deleted.entryId,
+      deleted,
       revision,
       versionedHead.serverDate,
     );
@@ -1059,7 +1059,7 @@ export class SyncService {
       [],
     );
     const plaintext = await this.readDeletedRevisionCopy(
-      deleted.entryId,
+      deleted,
       selected,
       versionedHead.serverDate,
     );
@@ -1117,14 +1117,14 @@ export class SyncService {
       throw new Error(`Entry ${deleted.entryId} has no Recovery Copy`);
     }
     return this.readDeletedRevisionCopy(
-      deleted.entryId,
+      deleted,
       recovery,
       serverDate,
     );
   }
 
   private async readDeletedRevisionCopy(
-    entryId: string,
+    entry: VaultEntry,
     revision: RevisionRef,
     serverDate: string,
   ): Promise<Uint8Array> {
@@ -1134,14 +1134,14 @@ export class SyncService {
       plaintext.byteLength !== revision.size ||
       (await sha256(plaintext)) !== revision.contentHash
     ) {
-      throw new Error(`Recovery Copy for ${entryId} is damaged`);
+      throw new Error(`Recovery Copy for ${entry.entryId} is damaged`);
     }
-    await this.options.onIntegrityVerified?.({kind: "blob", blobId: revision.blobId});
+    await this.reportVerifiedContent(entry, revision);
     if (
       revision.expiresAt !== undefined &&
       Date.parse(revision.expiresAt) <= Date.parse(serverDate)
     ) {
-      throw new Error(`Recovery Copy for ${entryId} has expired`);
+      throw new Error(`Recovery Copy for ${entry.entryId} has expired`);
     }
     return plaintext;
   }
@@ -2215,6 +2215,14 @@ export class SyncService {
         // A failed uncommitted upload may no longer be referenced; it cannot affect this Head.
       }
     }
+  }
+
+  private async reportVerifiedContent(entry: VaultEntry, revision: RevisionRef): Promise<void> {
+    await this.options.onIntegrityVerified?.({kind: "blob", blobId: revision.blobId});
+    // Authenticating history alone does not repair an invalid materialized Conflict pointer.
+    if (entry.kind === "conflicted" && entry.materializedContentHash &&
+      !entry.candidates.some(candidate => candidate.contentHash === entry.materializedContentHash)) return;
+    await this.options.onIntegrityVerified?.({kind: "recovery", entryId: entry.entryId, contentHash: revision.contentHash});
   }
 
   private async assertRemoteRecoveryForLocalContent(
