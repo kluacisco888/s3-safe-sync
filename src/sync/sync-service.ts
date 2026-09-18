@@ -169,11 +169,14 @@ export interface LocalContentReview {
   reviewToken: string;
   localExists: boolean;
   localSize: number;
+  localModifiedAt?: number;
   localPreview?: string;
   remoteKind: VaultEntry["kind"];
   remoteVersions: Array<{ size: number; createdAt: string; preview?: string }>;
   blockedReason?: string;
 }
+
+export type LocalContentChoice = "local" | "remote" | "both";
 
 // A second rename can arrive after Head publication but before cache rebuilding.
 // In that window the accepted snapshot still proves identity even if files is empty.
@@ -561,7 +564,7 @@ export class SyncService {
     const textPreview = (body: Uint8Array): string | undefined => {
       if (body.byteLength > previewLimit) return undefined;
       try {
-        const text = new TextDecoder("utf-8", {fatal: true}).decode(body);
+        const text = new TextDecoder("utf-8", {fatal: true, ignoreBOM: true}).decode(body);
         const binary = [...text].some(character => {
           const code = character.charCodeAt(0);
           return code < 32 && code !== 9 && code !== 10 && code !== 13;
@@ -596,7 +599,7 @@ export class SyncService {
       remoteVersions.push({size: revision.size, createdAt: revision.createdAt, preview});
     }
     const review: LocalContentReview = {
-      path, localExists: !!file, localSize: file?.size ?? 0, localPreview,
+      path, localExists: !!file, localSize: file?.size ?? 0, localModifiedAt: file?.modifiedAt, localPreview,
       remoteKind: entry.kind, remoteVersions, blockedReason,
       reviewToken: await sha256(new TextEncoder().encode(JSON.stringify({
         vault: snapshot.vaultId, commit: head.value.commitId, entryId: entry.entryId, path,
@@ -604,6 +607,45 @@ export class SyncService {
       }))),
     };
     return {head, snapshot, entry, file, localHash, materialized, review};
+  }
+
+  async resolveLocalContent(path: string, reviewToken: string, choice: LocalContentChoice): Promise<string | undefined> {
+    if (choice === "both") return this.preserveLocalCopyAndAcceptRemote(path, reviewToken);
+    const {head, snapshot, entry, file, localHash, review} = await this.loadLocalContentReview(path);
+    if (review.blockedReason) throw new Error(review.blockedReason);
+    if (review.reviewToken !== reviewToken) throw new Error("Local or remote content changed. Review the versions again.");
+    if (entry.kind !== "live" || !file || !localHash) {
+      throw new Error("This choice requires both a local file and a live S3 version. Review the current state again.");
+    }
+    await this.assertLocalContent(path, localHash);
+    await this.assertRemoteEntriesBeforePublication(snapshot, new Set([entry.entryId]), []);
+    const remoteBody = await this.options.remote.readBlob(entry.revision.blobId);
+    if (!remoteBody || remoteBody.byteLength !== entry.revision.size || await sha256(remoteBody) !== entry.revision.contentHash) {
+      throw new RemoteStateError("Remote content failed verification");
+    }
+    const localBody = await this.options.local.read(path);
+    if (localBody.byteLength !== file.size || await sha256(localBody) !== localHash) throw new LocalStateChangedError(path);
+    const localRevision: RevisionRef = {blobId: crypto.randomUUID(), revisionId: crypto.randomUUID(),
+      contentHash: localHash, size: localBody.byteLength, createdAt: head.serverDate};
+    await this.options.remote.writeBlob(localRevision.blobId, localBody);
+    await this.assertRemoteRevision(localRevision);
+    const resolved: LiveEntry = {...entry,
+      revision: choice === "local" ? localRevision : entry.revision,
+      history: [keepForRecovery(choice === "local" ? entry.revision : localRevision, head.serverDate), ...(entry.history ?? [])]};
+    await this.assertLocalContent(path, localHash);
+    const commitId = crypto.randomUUID();
+    await this.options.remote.advance({
+      expectedHeadEtag: head.etag,
+      head: {...head.value, commitId, generation: head.value.generation + 1},
+      commit: {commitId, createdAt: head.serverDate, vaultId: snapshot.vaultId, protocolVersion: 1,
+        parentIds: [head.value.commitId], replicaId: this.options.replicaId,
+        changes: [{kind: "set-entry", entry: resolved}]},
+    });
+    // The backup must be authenticated and referenced by Head before replacing local bytes.
+    await this.assertLocalContent(path, localHash);
+    if (choice === "remote") await this.options.local.write(path, remoteBody, localHash);
+    await this.acceptReviewedEntries({...snapshot, commitId}, [resolved]);
+    return undefined;
   }
 
   async preserveLocalCopyAndAcceptRemote(path: string, reviewToken: string): Promise<string | undefined> {
@@ -841,6 +883,17 @@ export class SyncService {
       );
     }
     await this.acceptReviewedEntries({...snapshot, commitId}, [resolvedEntry]);
+  }
+
+  async readHistoricalRevision(entryId: string, revisionId: string): Promise<Uint8Array> {
+    const head = await this.options.remote.readHead();
+    if (!head) throw new Error("Remote Store is not initialized");
+    const snapshot = await this.options.remote.readSnapshot(head.value);
+    const entry = snapshot.entries[entryId];
+    const revision = entry?.kind === "live" ? entry.history?.find(value => value.revisionId === revisionId) : undefined;
+    if (entry?.kind !== "live" || !revision) throw new Error("This historical version is no longer available. Refresh version history.");
+    if (this.exceedsAutomaticFileLimit(entry.path, revision.size)) throw new Error("This preview exceeds this device's transfer limit.");
+    return this.readDeletedRevisionCopy(entryId, revision, head.serverDate);
   }
 
   async restoreRevision(entryId: string, revisionId: string): Promise<void> {

@@ -11,6 +11,7 @@ import type {
   DeferredDownloadEntry,
   LocalSyncIssue,
   LocalContentReview,
+  LocalContentChoice,
   PossibleRenameIssue,
   PossibleRenameResolution,
 } from "../sync/sync-service";
@@ -19,12 +20,15 @@ import {
   MAX_DELETED_PREVIEW_BYTES,
 } from "./deleted-preview";
 import { copyText } from "./clipboard";
+import { actionButton } from "./modal-actions";
+import { LocalContentReviewModal } from "./content-review-modal";
 
 export interface StatusModalController {
   openSettings(): void;
   readConflictCandidate(entryId: string, revisionId: string): Promise<Uint8Array>;
   reviewLocalContent(path: string): Promise<LocalContentReview>;
-  preserveLocalCopyAndAcceptRemote(path: string, reviewToken: string): Promise<string | undefined>;
+  resolveLocalContent(path: string, reviewToken: string, choice: LocalContentChoice): Promise<string | undefined>;
+  openVersionHistory(path: string): void;
   openLocalFile(path: string): Promise<void>;
   resolvePossibleRename(resolution: PossibleRenameResolution): Promise<void>;
   confirmBulkDeletion(): Promise<void>;
@@ -48,24 +52,6 @@ export interface StatusModalController {
   togglePause(): Promise<void>;
 }
 
-const actionButton = (
-  container: HTMLElement,
-  text: string,
-  action: () => Promise<void>,
-): HTMLButtonElement => {
-  const button = container.createEl("button", {text});
-  let errorMessage: HTMLElement | undefined;
-  button.addEventListener("click", () => {
-    if (button.disabled) return;
-    button.disabled = true;
-    errorMessage?.setText("");
-    void action().catch((error: unknown) => {
-      errorMessage ??= container.createEl("p", {cls: "s3-vault-sync-error"});
-      errorMessage.setText(`${error instanceof Error ? error.message : "Operation failed"} Correct the cause and retry, or sync again to refresh the available actions.`);
-    }).finally(() => { button.disabled = false; });
-  });
-  return button;
-};
 
 const statusHelp = (status: string): string => {
   if (status.includes("Repair Mode")) return "Pause sync on all devices and preserve local copies. Check the bucket, prefix, and permissions in Settings. If the remote Head is missing or damaged, inspect S3 Versioning and recover a verified Head together with its referenced objects, then retry. Do not initialize over the existing prefix.";
@@ -81,80 +67,24 @@ const statusHelp = (status: string): string => {
   return "Review the affected items below. Use Open settings for configuration issues, Copy status to share the error text, or Sync now after addressing the cause. File conflicts require an explicit choice; remote repair and operating-system filename restrictions may require action outside the plugin.";
 };
 
-class LocalContentReviewModal extends Modal {
-  constructor(
-    app: App,
-    private readonly path: string,
-    private readonly controller: StatusModalController,
-    private readonly refresh: () => void,
-  ) { super(app); }
-
-  onOpen(): void {
-    this.contentEl.empty();
-    this.contentEl.createEl("h2", {text: "Review local and remote versions"});
-    this.contentEl.createDiv({cls: "s3-vault-sync-selectable-path", text: this.path});
-    const body = this.contentEl.createDiv();
-    const status = body.createEl("p", {text: "Reading and verifying both versions…"});
-    const actions = this.contentEl.createDiv({cls: "s3-vault-sync-toolbar"});
-    actions.createEl("button", {text: "Close"}).addEventListener("click", () => this.close());
-    actions.createEl("button", {text: "Open settings"}).addEventListener("click", () => {this.controller.openSettings(); this.close();});
-    actionButton(actions, "Open local file", async () => {await this.controller.openLocalFile(this.path); this.close();});
-    actionButton(actions, "Copy path", async () => {
-      if (!await copyText(this.path)) throw new Error("Clipboard unavailable; select the displayed path to copy it.");
-    });
-    void this.controller.reviewLocalContent(this.path).then(review => {
-      status.setText(review.blockedReason ??
-        (review.localExists
-          ? "Your local version will be kept as a separate local-copy file and verified in S3 before this path receives the remote state. You can compare or merge the two files afterward."
-          : "There is no local file to preserve. This path will receive the reviewed remote state."));
-      body.createEl("h3", {text: `Local version · ${review.localSize} bytes`});
-      body.createEl("pre", {cls: "s3-vault-sync-preview-content", text: review.localPreview ??
-        (review.localExists ? "Text preview unavailable (binary file or preview size limit)." : "Local file is missing.")});
-      body.createEl("h3", {text: `Remote state: ${review.remoteKind}`});
-      if (review.remoteKind === "deleted") body.createEl("p", {text:
-        "The remote file is deleted. After your local copy is safely preserved, the original path will remain deleted."});
-      if (review.remoteKind === "conflicted") body.createEl("p", {text:
-        "Remote conflict candidates remain in the Conflict Center. Preserving your local copy does not discard or select a remote candidate."});
-      for (const [index, version] of review.remoteVersions.entries()) {
-        const detail = body.createEl("details");
-        detail.open = index === 0;
-        detail.createEl("summary", {text: `${version.createdAt} · ${version.size} bytes`});
-        detail.createEl("pre", {cls: "s3-vault-sync-preview-content", text: version.preview ?? "Text preview unavailable."});
-      }
-      if (review.blockedReason) return;
-      const confirm = actions.createEl("button", {cls: "mod-cta", text:
-        review.localExists ? "Preserve local copy and accept remote" : "Accept remote state"});
-      confirm.addEventListener("click", () => {
-        confirm.disabled = true;
-        status.setText("Preserving content and rechecking the reviewed versions…");
-        void this.controller.preserveLocalCopyAndAcceptRemote(this.path, review.reviewToken)
-          .then(copyPath => {
-            this.refresh();
-            this.close();
-            if (copyPath) new Notice(`Both versions preserved. Local copy: ${copyPath}`);
-          }).catch((error: unknown) => {
-            status.setText(error instanceof Error ? error.message : "Review failed. Reopen this review to retry.");
-            actions.createEl("button", {text: "Reload review"}).addEventListener("click", () => this.onOpen());
-          });
-      });
-    }).catch((error: unknown) => {
-      status.setText(error instanceof Error ? error.message : "Could not read the versions.");
-      actions.createEl("button", {text: "Retry review"}).addEventListener("click", () => this.onOpen());
-    });
-  }
-}
 
 const localIssueHelp = (issue: LocalSyncIssue): string => {
   switch (issue.kind) {
-    case "bootstrap-mismatch": return "This device has no accepted common version for this path. Use Review versions to preserve your local version as a new file, then receive the remote state. Do not clear the cache again; it cannot establish which version you intended.";
-    case "resolution-mismatch": return "This file changed after a conflict was recorded. Review versions preserves these additional edits as a separate file before receiving the remote state. Remaining conflict candidates stay in the Conflict Center.";
-    case "deferred-local-edit": return "The local file was edited while a newer remote version was deferred. Review versions can preserve both when they fit this device's limit. Otherwise resolve on desktop; switching to Wi-Fi can help attachments below the mobile size limit.";
+    case "bootstrap-mismatch": return "This device has no accepted common version for this path, which can happen on first connection, after reinstalling, or after losing local sync records. Compare and resolve shows the differences and lets you use local content, use S3 content, or keep both when both files exist. The unchosen version is preserved in 30-day history or a separate synced file. Clearing the cache cannot establish which version you intended.";
+    case "resolution-mismatch": return "This file changed after a conflict was recorded. Compare and resolve shows the differences and can preserve these additional edits as a separate file before receiving the remote state. Remaining conflict candidates stay in the Conflict Center.";
+    case "deferred-local-edit": return "The local file was edited while a newer remote version was deferred. Compare and resolve shows the differences and can preserve both when they fit this device's limit. Otherwise resolve on desktop; switching to Wi-Fi can help attachments below the mobile size limit.";
     case "path-collision": return "These paths collide by case, Unicode normalization, or file ownership. Open the affected files on the device that holds them, give unrelated files distinct names, then Sync now. If the paths differ only by letter case, rename through a temporary distinct name. Do not delete either version to clear the warning.";
     case "unsupported-path": return "This filename cannot be created on this device. Copy the path and rename the file on a compatible desktop, then sync both devices. The original remains on the remote; changing the cache cannot fix a filesystem filename restriction.";
     case "unsynced-local": return "This local file exceeds this device's automatic limit and has not been uploaded. Open it to inspect it. Connect to Wi-Fi if it is an attachment below the mobile limit, or copy it to a desktop and sync there. Split or reduce large files before syncing on mobile.";
-    case "import-candidate": return "This local file has no remote identity. Import explicitly uploads it as a new file after checking that its path is still available.";
+    case "import-candidate": return "This local file has no remote identity. Upload as new file sends it to S3 after checking that its path is still available. If it was moved from another folder, first check whether the old remote path is the same note; importing does not reconnect its old identity.";
     case "possible-rename": return "Review and resolve lets you confirm one-to-one moves or explicitly choose separate deletions and additions. Every decision is checked again before publishing.";
   }
+};
+
+const renderIssueGuidance = (container: HTMLElement, issue: LocalSyncIssue): void => {
+  const detail = container.createEl("details");
+  detail.createEl("summary", {text: "Why this needs attention"});
+  detail.createEl("p", {text: localIssueHelp(issue)});
 };
 
 const showGuidance = (app: App, title: string, text: string): void => {
@@ -255,6 +185,7 @@ class RenameReviewModal extends Modal {
 }
 
 export interface VersionHistoryController {
+  readHistoricalRevision(entryId: string, revisionId: string): Promise<Uint8Array>;
   restoreRevision(entryId: string, revisionId: string): Promise<void>;
 }
 
@@ -477,8 +408,7 @@ export class StatusModal extends Modal {
             : `${entry.path} · ${Math.ceil(entry.size / 1024 / 1024)} MB`,
       });
       if (entry.reason === "unsupported-path") {
-        item.createEl("button", {text: "How to resolve"}).addEventListener("click", () =>
-          showGuidance(this.app, "Unsupported filename", localIssueHelp({kind: "unsupported-path", path: entry.path})));
+        renderIssueGuidance(item, {kind: "unsupported-path", path: entry.path});
         continue;
       }
       item.createEl("button", { text: "Try anyway" }).addEventListener(
@@ -582,8 +512,7 @@ export class StatusModal extends Modal {
         void copyText(path).then(copied => new Notice(copied ? "Path copied" : "Select the path text to copy it."));
       });
     }
-    item.createEl("button", {text: "How to resolve"}).addEventListener("click", () =>
-      showGuidance(this.app, "Resolve this sync issue", localIssueHelp(issue)));
+    renderIssueGuidance(item, issue);
   }
 
   private renderLocalIssues(container: HTMLElement): void {
@@ -628,11 +557,11 @@ export class StatusModal extends Modal {
       item.createEl("div", {
         text:
           issue.kind === "import-candidate"
-              ? "Local file requires import confirmation."
+              ? "This local path is not known to S3. Upload it as a new file only if it is not an existing note moved from another path."
             : issue.kind === "deferred-local-edit"
               ? "This local edit is waiting for the deferred remote Revision before it can be reconciled safely."
             : issue.kind === "bootstrap-mismatch"
-              ? "Local content differs from the encrypted remote Revision after cache loss."
+              ? "Local and remote contents differ, and this device has no accepted common version for this file. Compare the versions before choosing how to continue."
               : issue.kind === "resolution-mismatch"
                 ? "This file changed while its Conflict was awaiting resolution."
                 : issue.kind === "unsupported-path"
@@ -640,10 +569,10 @@ export class StatusModal extends Modal {
                   : "Local file exceeds the automatic mobile limit.",
       });
       if (issue.kind === "import-candidate") {
-        actionButton(item, "Import", async () => {await this.controller.importCandidate(issue.path); this.onOpen();});
+        actionButton(item, "Upload as new file", async () => {await this.controller.importCandidate(issue.path); this.onOpen();});
       }
       if (issue.kind === "bootstrap-mismatch" || issue.kind === "resolution-mismatch" || issue.kind === "deferred-local-edit") {
-        item.createEl("button", {text: "Review versions", cls: "mod-cta"}).addEventListener("click", () => {
+        item.createEl("button", {text: "Compare and resolve", cls: "mod-cta"}).addEventListener("click", () => {
           new LocalContentReviewModal(this.app, issue.path, this.controller, () => this.onOpen()).open();
         });
       }
@@ -707,9 +636,14 @@ export class VersionHistoryModal extends Modal {
       this.contentEl.createEl("p", { text: "No recoverable revisions." });
       return;
     }
+    this.contentEl.createEl("p", {text: "Versions kept after replacement or a manual choice are recoverable for 30 days. Preview before restoring; restoring also preserves the current version."});
     for (const revision of history) {
       const row = this.contentEl.createDiv({ cls: "s3-vault-sync-history" });
-      row.createSpan({ text: `${revision.createdAt} · ${revision.size} bytes` });
+      row.createSpan({ text: `Version recorded: ${revision.createdAt} · ${revision.size} bytes${revision.expiresAt ? ` · recoverable until ${revision.expiresAt}` : ""}` });
+      row.createEl("button", {text: "Preview"}).addEventListener("click", () => {
+        new DeletedFilePreviewModal(this.app, this.entry, revision,
+          () => this.controller.readHistoricalRevision(this.entry.entryId, revision.revisionId), "Version history preview").open();
+      });
       actionButton(row, "Restore", async () => {await this.controller.restoreRevision(this.entry.entryId, revision.revisionId); this.close();});
     }
   }
