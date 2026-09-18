@@ -253,6 +253,65 @@ const collisionJournal = (local: LocalVaultPort, cache: MemorySyncCache, tracker
 };
 
 describe("SyncService", () => {
+  it("rechecks only referenced content, accepts an alternate recovery copy, and respects device limits", async () => {
+    const objects = new MemoryObjectStore();
+    const remote = await RemoteStore.open({objects, prefix: "integrity", vaultKey: new Uint8Array(32)});
+    const local = new MemoryVault();
+    const cache = new MemorySyncCache();
+    await local.write("note.md", new TextEncoder().encode("original"));
+    const service = new SyncService({cache, local, remote, replicaId: "test"});
+    await service.initializeNew("vault");
+    const head = (await remote.readHead())!;
+    const snapshot = await remote.readSnapshot(head.value);
+    const entry = Object.values(snapshot.entries)[0]!;
+    if (entry.kind !== "live") throw new Error("Expected live fixture");
+    const recovery = {kind: "recovery" as const, entryId: entry.entryId, contentHash: entry.revision.contentHash};
+    await objects.put(`integrity/v1/blobs/${entry.revision.blobId}`, new TextEncoder().encode("damaged"));
+    await expect(service.verifyRemoteIntegrity([recovery], "vault")).rejects.toThrow("No authenticated remote recovery");
+    await expect(service.verifyRemoteIntegrity([{kind: "blob", blobId: entry.revision.blobId}], "vault"))
+      .rejects.toMatchObject({integrityCheck: {kind: "blob", blobId: entry.revision.blobId}});
+    // Repair can supply another authenticated copy without deleting the old evidence.
+    await remote.writeBlob("alternate", new TextEncoder().encode("original"));
+    await remote.advance({expectedHeadEtag: head.etag, head: {...head.value, commitId: "alternate", generation: 2},
+      commit: {commitId: "alternate", protocolVersion: 1, vaultId: "vault", replicaId: "test", createdAt: head.serverDate,
+        parentIds: [head.value.commitId], changes: [{kind: "set-entry", entry: {...entry,
+          history: [{...entry.revision, blobId: "alternate", revisionId: "alternate"}]}}]}});
+    await expect(service.verifyRemoteIntegrity([recovery], "vault")).resolves.toBeUndefined();
+    await expect(service.verifyRemoteIntegrity([{kind: "recovery", entryId: entry.entryId, contentHash: "sha256:unavailable"}], "vault"))
+      .rejects.toThrow("No authenticated remote recovery");
+    const limited = new SyncService({cache, local, remote, replicaId: "phone", maxAutomaticFileBytes: 1});
+    const reads: string[] = [];
+    objects.onGet = key => {reads.push(key);};
+    for (const check of [recovery, {kind: "blob" as const, blobId: entry.revision.blobId}]) {
+      await expect(limited.verifyRemoteIntegrity([check], "vault")).rejects.toThrow("transfer limit");
+    }
+    expect(reads.some(key => key.includes("/blobs/"))).toBe(false);
+    // A rejected upload not referenced by accepted history must not leave an eternal blocker.
+    await objects.put("integrity/v1/blobs/orphan", new TextEncoder().encode("damaged orphan"));
+    await expect(service.verifyRemoteIntegrity([{kind: "blob", blobId: "orphan"}], "vault")).resolves.toBeUndefined();
+    expect(reads).not.toContain("integrity/v1/blobs/orphan");
+  });
+
+  it("does not clear a materialized-candidate failure just because metadata decrypts", async () => {
+    const objects = new MemoryObjectStore();
+    const remote = await RemoteStore.open({objects, prefix: "integrity", vaultKey: new Uint8Array(32)});
+    const local = new MemoryVault();
+    const cache = new MemorySyncCache();
+    const service = new SyncService({cache, local, remote, replicaId: "test"});
+    await local.write("note.md", new TextEncoder().encode("original"));
+    await service.initializeNew("vault");
+    const head = (await remote.readHead())!;
+    const entry = Object.values((await remote.readSnapshot(head.value)).entries)[0]!;
+    if (entry.kind !== "live") throw new Error("Expected live fixture");
+    await remote.advance({expectedHeadEtag: head.etag, head: {...head.value, commitId: "conflict", generation: 2},
+      commit: {commitId: "conflict", protocolVersion: 1, vaultId: "vault", replicaId: "test", createdAt: head.serverDate,
+        parentIds: [head.value.commitId], changes: [{kind: "set-entry", entry: {kind: "conflicted", entryId: entry.entryId,
+          path: entry.path, reason: "edit-edit", candidates: [], materializedContentHash: entry.revision.contentHash,
+          history: [entry.revision]}}]}});
+    await expect(service.verifyRemoteIntegrity([{kind: "recovery", entryId: entry.entryId, contentHash: entry.revision.contentHash}], "vault"))
+      .rejects.toThrow("no authenticated materialized candidate");
+  });
+
   it("rejects a cross-platform path collision before initializing Head", async () => {
     const objects = new MemoryObjectStore();
     const remote = await RemoteStore.open({

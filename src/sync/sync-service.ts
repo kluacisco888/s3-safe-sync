@@ -13,6 +13,7 @@ import {
 import {
   type CommitRecord,
   type HeadRecord,
+  type RemoteIntegrityCheck,
   RemoteStateError,
   RemoteStore,
 } from "../storage/remote-store";
@@ -22,6 +23,13 @@ import { sha256Content as sha256 } from "./content-hash";
 import { canonicalVaultPath } from "./canonical-path";
 import { PathCollisionReviewer, type PathCollisionReview, type PathCollisionResolution } from "./path-collision-review";
 import type { CollisionRenameJournal } from "./collision-rename-journal";
+
+const retainedRevisions = (entry: VaultEntry): RevisionRef[] => [
+  ...(entry.kind === "live" ? [entry.revision] : []),
+  ...(entry.kind === "conflicted" ? entry.candidates : []),
+  ...(entry.kind !== "live" && entry.recovery ? [entry.recovery] : []),
+  ...(entry.history ?? []),
+];
 
 export interface LocalFileInfo {
   modifiedAt: number;
@@ -88,6 +96,7 @@ export interface SyncServiceOptions {
   local: LocalVaultPort;
   maxAutomaticFileBytes?: number | ((path: string) => number | undefined);
   onProgress?: (progress: SyncProgress) => void;
+  onIntegrityVerified?: (check: RemoteIntegrityCheck) => Promise<void>;
   remote: RemoteStore;
   replicaId: string;
   yieldDuringHashing?: () => Promise<void>;
@@ -455,6 +464,7 @@ export class SyncService {
     ) {
       throw new Error(`Deferred Revision ${entry.revision.revisionId} is damaged`);
     }
+    await this.options.onIntegrityVerified?.({kind: "blob", blobId: entry.revision.blobId});
     await this.assertLocalContent(entry.path, expectedContentHash);
     await this.options.local.write(
       entry.path,
@@ -564,7 +574,8 @@ export class SyncService {
       : entry.kind === "conflicted" ? entry.candidates.find(r => r.contentHash === entry.materializedContentHash)
       : undefined;
     if (entry.kind === "conflicted" && entry.materializedContentHash && !materialized) {
-      throw new RemoteStateError("Conflict has no authenticated materialized candidate");
+      throw new RemoteStateError("Conflict has no authenticated materialized candidate", undefined,
+        {kind: "recovery", entryId: entry.entryId, contentHash: entry.materializedContentHash});
     }
     const blockedReason = (file && this.exceedsAutomaticFileLimit(path, file.size)) ||
       revisions.some(revision => this.exceedsAutomaticFileLimit(path, revision.size))
@@ -604,7 +615,7 @@ export class SyncService {
       if (!blockedReason && index < 3 && revision.size <= previewLimit) {
         const body = await this.options.remote.readBlob(revision.blobId);
         if (!body || body.byteLength !== revision.size || await sha256(body) !== revision.contentHash) {
-          throw new RemoteStateError("Remote review content failed verification");
+          throw new RemoteStateError("Remote review content failed verification", undefined, {kind: "blob", blobId: revision.blobId});
         }
         preview = textPreview(body);
       }
@@ -633,7 +644,7 @@ export class SyncService {
     await this.assertRemoteEntriesBeforePublication(snapshot, new Set([entry.entryId]), []);
     const remoteBody = await this.options.remote.readBlob(entry.revision.blobId);
     if (!remoteBody || remoteBody.byteLength !== entry.revision.size || await sha256(remoteBody) !== entry.revision.contentHash) {
-      throw new RemoteStateError("Remote content failed verification");
+      throw new RemoteStateError("Remote content failed verification", undefined, {kind: "blob", blobId: entry.revision.blobId});
     }
     const localBody = await this.options.local.read(path);
     if (localBody.byteLength !== file.size || await sha256(localBody) !== localHash) throw new LocalStateChangedError(path);
@@ -670,7 +681,7 @@ export class SyncService {
     if (materialized) {
       remoteBody = await this.options.remote.readBlob(materialized.blobId);
       if (!remoteBody || remoteBody.byteLength !== materialized.size || await sha256(remoteBody) !== materialized.contentHash) {
-        throw new RemoteStateError("Remote content failed verification");
+        throw new RemoteStateError("Remote content failed verification", undefined, {kind: "blob", blobId: materialized.blobId});
       }
     }
     let copy: LiveEntry | undefined;
@@ -761,7 +772,7 @@ export class SyncService {
     if (revision.size > 1024 * 1024) throw new Error("This version exceeds the text preview limit.");
     const body = await this.options.remote.readBlob(revision.blobId);
     if (!body || body.byteLength !== revision.size || await sha256(body) !== revision.contentHash) {
-      throw new RemoteStateError("Conflict preview failed content verification");
+      throw new RemoteStateError("Conflict preview failed content verification", undefined, {kind: "blob", blobId: revision.blobId});
     }
     return body;
   }
@@ -2169,6 +2180,39 @@ export class SyncService {
     }
   }
 
+  // Recheck only known failures; an ordinary no-op sync verifies existence, not content.
+  async verifyRemoteIntegrity(checks: readonly RemoteIntegrityCheck[], vaultId: string): Promise<void> {
+    const head = await this.options.remote.readHead();
+    if (!head || head.value.vaultId !== vaultId) {
+      throw new RemoteStateError("Remote Head is missing or belongs to a different Vault");
+    }
+    const snapshot = await this.options.remote.readSnapshot(head.value);
+    for (const check of checks) {
+      if (check.kind === "recovery") {
+        const entry = snapshot.entries[check.entryId];
+        if (entry?.kind === "conflicted" && entry.materializedContentHash &&
+          !entry.candidates.some(candidate => candidate.contentHash === entry.materializedContentHash)) {
+          throw new RemoteStateError("Conflict has no authenticated materialized candidate", undefined, check);
+        }
+        if (entry && retainedRevisions(entry).some(revision => revision.contentHash === check.contentHash &&
+          this.exceedsAutomaticFileLimit(entry.path, revision.size))) {
+          throw new Error(`Integrity recheck exceeds this device's transfer limit: ${entry.path}. Retry on Wi-Fi or a desktop.`);
+        }
+        await this.assertRemoteRecoveryForLocalContent(snapshot, check.entryId, check.contentHash);
+      } else if (check.kind === "blob") {
+        for (const entry of Object.values(snapshot.entries)) {
+          for (const revision of retainedRevisions(entry).filter(revision => revision.blobId === check.blobId)) {
+            if (this.exceedsAutomaticFileLimit(entry.path, revision.size)) {
+              throw new Error(`Integrity recheck exceeds this device's transfer limit: ${entry.path}. Retry on Wi-Fi or a desktop.`);
+            }
+            await this.assertRemoteRevision(revision);
+          }
+        }
+        // A failed uncommitted upload may no longer be referenced; it cannot affect this Head.
+      }
+    }
+  }
+
   private async assertRemoteRecoveryForLocalContent(
     snapshot: VaultSnapshot,
     entryId: string,
@@ -2181,15 +2225,11 @@ export class SyncService {
     if (!entry) {
       throw new Error(`Entry ${entryId} has no remote recovery for local content`);
     }
-    const revisions: RevisionRef[] = [
-      ...(entry.kind === "live" ? [entry.revision] : []),
-      ...(entry.kind === "conflicted" ? entry.candidates : []),
-      ...(entry.kind !== "live" && entry.recovery ? [entry.recovery] : []),
-      ...(entry.history ?? []),
-    ].filter((revision) => revision.contentHash === expectedContentHash);
+    const revisions = retainedRevisions(entry).filter((revision) => revision.contentHash === expectedContentHash);
     for (const revision of revisions) {
       try {
         await this.assertRemoteRevision(revision);
+        await this.options.onIntegrityVerified?.({kind: "recovery", entryId, contentHash: expectedContentHash});
         return;
       } catch (error) {
         if (!(error instanceof RemoteStateError)) {
@@ -2200,6 +2240,8 @@ export class SyncService {
     }
     throw new RemoteStateError(
       `No authenticated remote recovery exists for local content at ${entry.path} (Entry ${entryId})`,
+      undefined,
+      {kind: "recovery", entryId, contentHash: expectedContentHash},
     );
   }
 
@@ -2214,6 +2256,7 @@ export class SyncService {
       throw new RemoteStateError(
         `Remote Revision ${revision.revisionId} cannot be authenticated`,
         error,
+        {kind: "blob", blobId: revision.blobId},
       );
     }
     if (
@@ -2223,8 +2266,11 @@ export class SyncService {
     ) {
       throw new RemoteStateError(
         `Remote Revision ${revision.revisionId} failed content verification`,
+        undefined,
+        {kind: "blob", blobId: revision.blobId},
       );
     }
+    await this.options.onIntegrityVerified?.({kind: "blob", blobId: revision.blobId});
   }
 
   private async assertRecoveryBeforeDelete(

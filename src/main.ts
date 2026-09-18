@@ -70,6 +70,7 @@ import {
   HeadChangedError,
   RemoteStateError,
   RemoteStore,
+  type RemoteIntegrityCheck,
 } from "./storage/remote-store";
 
 type PluginStatus =
@@ -88,12 +89,19 @@ class RepairModeError extends Error {
   }
 }
 
+interface PendingIntegrityIssue {
+  target: string;
+  message: string;
+  check: RemoteIntegrityCheck;
+}
+
 interface PersistedPluginData {
   cache?: CachedSyncState;
   fullHashVerificationRequired?: boolean;
   lastFullHashVerificationAt?: number;
   pendingPathRenames?: PersistedPathRenames;
   pendingCollisionRename?: PendingCollisionRename;
+  pendingIntegrityChecks?: PendingIntegrityIssue[];
   pendingInitialization?: {
     bucket: string;
     region: string;
@@ -578,6 +586,7 @@ export default class S3VaultSyncPlugin
     const needsRenameReview = this.data.pendingCollisionRename !== undefined;
     const assertTarget = this.captureTargetGuard();
     const { bucket, region } = this.data.settings;
+    const integrityTarget = this.integrityTarget();
     try {
       if (!password) {
         throw new Error("Enter the Vault password first");
@@ -716,6 +725,7 @@ export default class S3VaultSyncPlugin
         : "Encrypted Remote Store is ready.");
       new Notice(needsRenameReview ? "Vault unlocked. Review the interrupted rename to resume sync." : "S3 Vault Sync is ready");
     } catch (error) {
+      await this.rememberIntegrityFailure(error, integrityTarget);
       this.showError(error);
       throw error;
     }
@@ -792,6 +802,7 @@ export default class S3VaultSyncPlugin
     remote: RemoteStore,
   ): SyncService {
     const assertTarget = this.captureTargetGuard();
+    const integrityTarget = this.integrityTarget();
     const cache: SyncCachePort = {
       load: () => Promise.resolve(this.data.cache),
       save: async (state) => {
@@ -810,6 +821,7 @@ export default class S3VaultSyncPlugin
       maxAutomaticFileBytes: mobileAutomaticFileLimit,
       remote,
       onProgress: (progress) => this.updateSyncProgress(progress),
+      onIntegrityVerified: check => this.clearVerifiedIntegrityIssue(integrityTarget, check),
       replicaId: this.data.settings.replicaId,
       yieldDuringHashing: this.yieldDuringHashing,
     });
@@ -820,6 +832,7 @@ export default class S3VaultSyncPlugin
     allowCollisionReview = false,
   ): Promise<T> {
     return this.syncRequests.runExclusive(() => this.session.run(async () => {
+      const integrityTarget = this.integrityTarget();
       await this.recoverCollisionRename(allowCollisionReview);
       const vaultKey = this.credentials.loadVaultKey();
       if (!vaultKey) {
@@ -830,7 +843,12 @@ export default class S3VaultSyncPlugin
         prefix: this.data.settings.prefix,
         vaultKey,
       });
-      return operation(this.createSyncService(remote));
+      try {
+        return await operation(this.createSyncService(remote));
+      } catch (error) {
+        await this.rememberIntegrityFailure(error, integrityTarget);
+        throw error;
+      }
     }));
   }
 
@@ -848,6 +866,7 @@ export default class S3VaultSyncPlugin
       lastFullHashVerificationAt: stored?.lastFullHashVerificationAt,
       pendingPathRenames: stored?.pendingPathRenames ?? {},
       pendingCollisionRename: stored?.pendingCollisionRename,
+      pendingIntegrityChecks: stored?.pendingIntegrityChecks ?? [],
       pendingInitialization: stored?.pendingInitialization,
       pendingProbes: stored?.pendingProbes ?? [],
       settings,
@@ -870,10 +889,43 @@ export default class S3VaultSyncPlugin
     };
   }
 
+  private integrityTarget(): string {
+    const {bucket, region, prefix, vaultId} = this.data.settings;
+    return JSON.stringify([bucket, region, normalizePrefix(prefix), vaultId]);
+  }
+
+  private currentIntegrityChecks(): PendingIntegrityIssue[] {
+    const target = this.integrityTarget();
+    return (this.data.pendingIntegrityChecks ?? []).filter(issue => issue.target === target);
+  }
+
+  private async clearVerifiedIntegrityIssue(target: string, check: RemoteIntegrityCheck): Promise<void> {
+    this.session.assertActive();
+    if (target !== this.integrityTarget()) throw new Error("Vault changed during integrity recheck. Retry synchronization.");
+    const previous = this.data.pendingIntegrityChecks ?? [];
+    const remaining = previous.filter(issue => issue.target !== target || JSON.stringify(issue.check) !== JSON.stringify(check));
+    if (remaining.length === previous.length) return;
+    this.data.pendingIntegrityChecks = remaining;
+    try { await this.savePluginData(); }
+    catch (error) { this.data.pendingIntegrityChecks = previous; throw error; }
+  }
+
+  private async rememberIntegrityFailure(error: unknown, target: string): Promise<void> {
+    if (this.session.signal.aborted || !(error instanceof RemoteStateError || error instanceof RepairModeError)) return;
+    const check: RemoteIntegrityCheck = error instanceof RemoteStateError ? error.integrityCheck : {kind: "metadata"};
+    const issues = this.data.pendingIntegrityChecks ?? [];
+    this.data.pendingIntegrityChecks = issues.filter(issue => issue.target !== target || JSON.stringify(issue.check) !== JSON.stringify(check));
+    this.data.pendingIntegrityChecks.push({target, check, message: error.message});
+    if (target === this.integrityTarget()) this.setStatus("Action required", `Repair Mode: ${error.message}`);
+    await this.savePluginData();
+  }
+
   private async performSync({
     allowBulkDeletion,
     fullHashVerification: requestedFullHashVerification,
   }: SyncRunOptions): Promise<void> {
+    const integrityTarget = this.integrityTarget();
+    const assertIntegrityTarget = this.captureTargetGuard();
     if (this.data.settings.paused) {
       this.setStatus("Paused", "Automatic sync is paused on this device.");
       return;
@@ -927,6 +979,13 @@ export default class S3VaultSyncPlugin
         throw new RepairModeError(
           "Remote Head is missing or belongs to a different Vault",
         );
+      }
+      const integrityChecks = this.currentIntegrityChecks();
+      for (const issue of integrityChecks) {
+        await this.createSyncService(remote).verifyRemoteIntegrity([issue.check], this.data.settings.vaultId);
+        this.session.assertActive();
+        assertIntegrityTarget();
+        await this.clearVerifiedIntegrityIssue(integrityTarget, issue.check);
       }
       const retryHashMemo = new Map<string, VerifiedLocalFile>();
       const result = await retryHeadChanges(
@@ -1027,6 +1086,7 @@ export default class S3VaultSyncPlugin
         );
         this.scheduleAfterLocalChange();
       } else {
+        await this.rememberIntegrityFailure(error, integrityTarget);
         this.showError(error);
       }
     } finally {
@@ -1207,6 +1267,13 @@ export default class S3VaultSyncPlugin
     detail: string,
     progressLabel?: string,
   ): void {
+    const integrityChecks = this.data ? this.currentIntegrityChecks() : [];
+    if (integrityChecks.length && status !== "Checking" && status !== "Syncing") {
+      const lastError = status === "Error" ? ` Last attempt: ${detail}` : "";
+      status = "Action required";
+      detail = `Repair Mode: ${integrityChecks[0]!.message} (${integrityChecks.length} pending integrity checks). Resolve the reported problem, then sync to recheck.` +
+        (this.data.settings.paused ? " Automatic sync remains paused." : "") + lastError;
+    }
     if (this.session.signal.aborted) return;
     if (status !== "Syncing") {
       this.syncProgressThrottle.reset();
