@@ -7,6 +7,7 @@ const { Element, opened } = vi.hoisted(() => {
     text = "";
     open = false;
     disabled = false;
+    value = "";
     events = new Map<string, () => void>();
     constructor(readonly tag: string) {}
     empty() { this.children = []; }
@@ -49,6 +50,9 @@ import { StatusModal, VersionHistoryModal, type StatusModalController } from "..
 import type { LocalSyncIssue } from "../src/sync/sync-service";
 
 const reviewActions = {
+  reviewPathCollision: async (paths: string[]) => ({paths, reviewToken: "collision-review", localFiles: [], remoteFiles: [], relatedPaths: [], pendingMoves: []}),
+  resolvePathCollision: async () => "renamed.md",
+  confirmInterruptedCollisionRename: async () => {},
   openSettings: () => {},
   openVersionHistory: () => {},
   readConflictCandidate: async () => new Uint8Array(),
@@ -60,6 +64,63 @@ const reviewActions = {
 };
 
 describe("StatusModal", () => {
+  it("offers a real review action for a collision that lists only one path", () => {
+    const modal = new StatusModal({} as App, issueController([{kind: "path-collision", paths: ["weekly.md"]}]));
+    modal.onOpen();
+    type FakeElement = InstanceType<typeof Element>;
+    const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
+    expect(all(modal.contentEl as unknown as FakeElement).some(node =>
+      node.tag === "button" && node.text === "Review path collision")).toBe(true);
+  });
+
+  it.each(["local", "remote"] as const)("reviews identities and dispatches only the selected %s rename", async side => {
+    const controller = issueController([{kind: "path-collision", paths: ["note.md"]}]);
+    controller.reviewPathCollision = async paths => ({paths, reviewToken: "collision", relatedPaths: ["old.md"], pendingMoves: [],
+      localFiles: [{path: "note.md", size: 5, entryId: "local-id", preview: "local", suggestedName: "local-copy.md"}],
+      remoteFiles: [{path: "note.md", size: 6, entryId: "remote-id", previousPath: "old.md", preview: "remote", suggestedName: "remote-copy.md"}]});
+    const rename = vi.fn().mockResolvedValue("chosen.md");
+    controller.resolvePathCollision = rename;
+    const modal = new StatusModal({} as App, controller);
+    modal.onOpen();
+    type FakeElement = InstanceType<typeof Element>;
+    const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
+    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Review path collision")!.events.get("click")!();
+    const review = opened.at(-1)!;
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Rename S3 record and sync")).toBe(true));
+    const nodes = all(review.contentEl);
+    expect(nodes.some(node => node.text === "local")).toBe(true);
+    expect(nodes.some(node => node.text === "remote")).toBe(true);
+    expect(nodes.some(node => node.text === "Previously accepted path: old.md")).toBe(true);
+    expect(rename).not.toHaveBeenCalled();
+    nodes.filter(node => node.tag === "input")[side === "local" ? 0 : 1]!.value = "chosen.md";
+    nodes.find(node => node.text === (side === "local" ? "Rename local file and sync" : "Rename S3 record and sync"))!.events.get("click")!();
+    expect(rename).toHaveBeenCalledWith({paths: ["note.md"], reviewToken: "collision", side, path: "note.md",
+      entryId: `${side}-id`, newName: "chosen.md"});
+    await vi.waitFor(() => expect(rename).toHaveResolved());
+  });
+
+  it("offers explicit identity recovery instead of more renames after an interrupted move", async () => {
+    const controller = issueController([{kind: "path-collision", paths: ["source.md", "target.md"]}]);
+    controller.reviewPathCollision = async paths => ({paths, reviewToken: "recovery", relatedPaths: [], pendingMoves: [], remoteFiles: [],
+      interruptedRename: {from: "source.md", to: "target.md", expectedHash: "old-hash"},
+      localFiles: [{path: "target.md", size: 5, contentHash: "new-hash", preview: "draft", suggestedName: "unused.md"}]});
+    const recover = vi.fn().mockResolvedValue(undefined);
+    controller.confirmInterruptedCollisionRename = recover;
+    const modal = new StatusModal({} as App, controller);
+    modal.onOpen();
+    type FakeElement = InstanceType<typeof Element>;
+    const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
+    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Review path collision")!.events.get("click")!();
+    const review = opened.at(-1)!;
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Confirm target is the renamed original")).toBe(true));
+    expect(all(review.contentEl).some(node => node.text === "Rename local file and sync")).toBe(false);
+    expect(all(review.contentEl).some(node => node.text === "Reload collision review")).toBe(true);
+    expect(recover).not.toHaveBeenCalled();
+    all(review.contentEl).find(node => node.text === "Confirm target is the renamed original")!.events.get("click")!();
+    expect(recover).toHaveBeenCalledWith(["source.md", "target.md"], "recovery", "target");
+    await vi.waitFor(() => expect(recover).toHaveResolved());
+  });
+
   it("offers an authenticated backup preview, expiry and an explicit restore action", async () => {
     const revision = {revisionId: "backup", blobId: "blob", contentHash: "hash", size: 14,
       createdAt: "2026-09-18T10:00:00Z", expiresAt: "2026-10-18T10:00:00Z"};

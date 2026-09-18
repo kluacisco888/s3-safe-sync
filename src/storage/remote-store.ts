@@ -61,10 +61,16 @@ export class HeadChangedError extends Error {
   }
 }
 
+export type RemoteIntegrityCheck =
+  | { kind: "metadata" }
+  | { kind: "blob"; blobId: string }
+  | { kind: "recovery"; entryId: string; contentHash: string };
+
 export class RemoteStateError extends Error {
   readonly code = "REMOTE_STATE_INVALID" as const;
 
-  constructor(message: string, readonly cause?: unknown) {
+  constructor(message: string, readonly cause?: unknown,
+    readonly integrityCheck: RemoteIntegrityCheck = {kind: "metadata"}) {
     super(message);
     this.name = "RemoteStateError";
   }
@@ -346,6 +352,7 @@ export class RemoteStore {
       throw new RemoteStateError(
         `Remote Blob ${blobId} cannot be authenticated`,
         error,
+        {kind: "blob", blobId},
       );
     }
   }

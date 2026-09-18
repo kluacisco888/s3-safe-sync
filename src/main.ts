@@ -39,6 +39,9 @@ import {
 } from "./sync/sync-service";
 import { DirtyPathTracker } from "./sync/dirty-path-tracker";
 import { LocalStateChangedError } from "./sync/errors";
+import type { PathCollisionReview, PathCollisionResolution } from "./sync/path-collision-review";
+import { CollisionRenameJournal, type PendingCollisionRename } from "./sync/collision-rename-journal";
+import { isSafeTargetPath } from "./plugin/safe-vault-write";
 import {
   isFullHashVerificationDue,
   normalizeFullHashVerificationIntervalDays,
@@ -67,6 +70,7 @@ import {
   HeadChangedError,
   RemoteStateError,
   RemoteStore,
+  type RemoteIntegrityCheck,
 } from "./storage/remote-store";
 
 type PluginStatus =
@@ -85,11 +89,19 @@ class RepairModeError extends Error {
   }
 }
 
+interface PendingIntegrityIssue {
+  target: string;
+  message: string;
+  check: RemoteIntegrityCheck;
+}
+
 interface PersistedPluginData {
   cache?: CachedSyncState;
   fullHashVerificationRequired?: boolean;
   lastFullHashVerificationAt?: number;
   pendingPathRenames?: PersistedPathRenames;
+  pendingCollisionRename?: PendingCollisionRename;
+  pendingIntegrityChecks?: PendingIntegrityIssue[];
   pendingInitialization?: {
     bucket: string;
     region: string;
@@ -368,6 +380,85 @@ export default class S3VaultSyncPlugin
     return this.runExclusiveSyncService(service => service.reviewLocalContent(path));
   }
 
+  reviewPathCollision(paths: string[]): Promise<PathCollisionReview> {
+    return this.runExclusiveSyncService(async service => {
+      const pending = this.data.pendingCollisionRename;
+      const review = await service.reviewPathCollision(pending ? [...new Set([...paths, pending.from, pending.to])] : paths,
+        this.pathRenames.toPathMap(this.pathRenames.capture()));
+      return pending ? {...review, interruptedRename: pending,
+        reviewToken: JSON.stringify({base: review.reviewToken, pending})} : review;
+    }, true);
+  }
+
+  async resolvePathCollision(request: PathCollisionResolution): Promise<string> {
+    try {
+      const newPath = await this.runExclusiveSyncService(service => {
+        const expectedRenames = JSON.stringify(this.pathRenames.serialize());
+        return service.resolvePathCollision(request, this.pathRenames.toPathMap(this.pathRenames.capture()),
+          this.collisionRenameJournal(expectedRenames));
+      });
+      await this.requestSync();
+      return newPath;
+    } catch (error) { this.showError(error); throw error; }
+  }
+
+  async confirmInterruptedCollisionRename(paths: string[], reviewToken: string, side: "source" | "target"): Promise<void> {
+    await this.runExclusiveSyncService(async service => {
+      const pending = this.data.pendingCollisionRename;
+      if (!pending) throw new Error("The interrupted rename has already changed. Refresh sync status.");
+      const review = await service.reviewPathCollision(paths, this.pathRenames.toPathMap(this.pathRenames.capture()));
+      if (JSON.stringify({base: review.reviewToken, pending}) !== reviewToken) throw new Error("Recovery files changed. Reload the collision review.");
+      const path = side === "source" ? pending.from : pending.to;
+      const file = review.localFiles.find(file => file.path === path);
+      if (!file?.contentHash) throw new Error("The selected recovery file cannot be verified on this device.");
+      await this.collisionRenameJournal().recover({side, hash: file.contentHash});
+    }, true);
+    await this.requestSync();
+  }
+
+  private collisionRenameJournal(expectedRenames?: string): CollisionRenameJournal {
+    return new CollisionRenameJournal(new ObsidianVaultPort(this.app.vault, () => this.session.assertActive()), {
+      read: () => this.data.pendingCollisionRename,
+      prepare: async intent => {
+        this.session.assertActive();
+        if (expectedRenames !== undefined && JSON.stringify(this.pathRenames.serialize()) !== expectedRenames) {
+          throw new Error("Local rename records changed. Reload the collision review.");
+        }
+        const identitySourcePath = intent.entryId
+          ? [...this.pathRenames.capture()].find(([, rename]) => rename.entryId === intent.entryId)?.[0] ??
+            Object.values(this.data.cache?.files ?? {}).find(file => file.entryId === intent.entryId)?.path
+          : undefined;
+        if (intent.entryId && !identitySourcePath) throw new Error("The file identity changed. Reload the collision review.");
+        this.data.pendingCollisionRename = {...intent, identitySourcePath};
+        await this.savePluginData();
+      },
+      finish: async (intent, moved) => {
+        this.session.assertActive();
+        if (intent.entryId && intent.identitySourcePath) {
+          const dirty = this.pathRenames.setReviewedRename(intent.entryId, intent.identitySourcePath, moved ? intent.to : intent.from);
+          for (const path of dirty) this.dirtyPaths.mark(path);
+        }
+        this.data.pendingPathRenames = this.pathRenames.serialize();
+        this.dirtyPaths.mark(intent.from); this.dirtyPaths.mark(intent.to);
+        this.data.pendingCollisionRename = undefined;
+        try { await this.savePluginData(); }
+        catch (error) { this.data.pendingCollisionRename = intent; throw error; }
+      },
+    });
+  }
+
+  private async recoverCollisionRename(allowReview = false): Promise<void> {
+    const pending = this.data.pendingCollisionRename;
+    if (!pending) return;
+    if (!isSafeTargetPath(pending.from) || !isSafeTargetPath(pending.to)) throw new Error("An interrupted rename contains an unsafe path.");
+    if (await this.collisionRenameJournal().recover() === "needs-review") {
+      if (!this.pendingLocalIssues.some(issue => issue.kind === "path-collision" && issue.paths.includes(pending.to))) {
+        this.pendingLocalIssues.push({kind: "path-collision", paths: [pending.from, pending.to]});
+      }
+      if (!allowReview) throw new Error("An interrupted rename needs confirmation. Open sync status and choose Review path collision.");
+    }
+  }
+
   openVersionHistory(path: string): void {
     const entry = this.getLiveEntry(path);
     if (!entry?.history?.length) throw new Error("No recoverable versions are available for this file. Sync to refresh its history.");
@@ -412,7 +503,7 @@ export default class S3VaultSyncPlugin
       this.pendingLocalIssues = this.pendingLocalIssues.filter(
         (issue) => issue.kind !== "import-candidate" || issue.path !== path,
       );
-      this.setStatus("Idle", "Local file uploaded to S3 as a new file.");
+      this.reportManualCompletion("Local file uploaded to S3 as a new file.");
     } catch (error) {
       this.showError(error);
       throw error;
@@ -427,7 +518,7 @@ export default class S3VaultSyncPlugin
       this.pendingDeferredDownloads = this.pendingDeferredDownloads.filter(
         (entry) => entry.entryId !== entryId,
       );
-      this.setStatus("Idle", "Large file downloaded after explicit confirmation.");
+      this.reportManualCompletion("Large file downloaded after explicit confirmation.");
     } catch (error) {
       this.showError(error);
       throw error;
@@ -446,7 +537,7 @@ export default class S3VaultSyncPlugin
       await this.runExclusiveSyncService((service) =>
         service.restoreRevision(entryId, revisionId),
       );
-      this.setStatus("Idle", "Historical Revision restored.");
+      this.reportManualCompletion("Historical Revision restored.");
     } catch (error) {
       this.showError(error);
       throw error;
@@ -467,7 +558,7 @@ export default class S3VaultSyncPlugin
       await this.runExclusiveSyncService((service) =>
         service.restoreDeleted(entryId, revisionId),
       );
-      this.setStatus("Idle", "Deleted file restored as a new Revision.");
+      this.reportManualCompletion("Deleted file restored as a new Revision.");
     } catch (error) {
       this.showError(error);
       throw error;
@@ -491,8 +582,11 @@ export default class S3VaultSyncPlugin
   }
 
   private async initializeOrUnlockExclusive(password: string): Promise<void> {
+    await this.recoverCollisionRename(true);
+    const needsRenameReview = this.data.pendingCollisionRename !== undefined;
     const assertTarget = this.captureTargetGuard();
     const { bucket, region } = this.data.settings;
+    const integrityTarget = this.integrityTarget();
     try {
       if (!password) {
         throw new Error("Enter the Vault password first");
@@ -505,7 +599,7 @@ export default class S3VaultSyncPlugin
         .filter(probe => probe.bucket === bucket && probe.region === region && probe.prefix === prefix &&
           isProbeObjectKey(probe.key, prefix))
         .map(probe => probe.key));
-      for (const key of ownedProbeKeys) await objects.delete(key);
+      if (!needsRenameReview) for (const key of ownedProbeKeys) await objects.delete(key);
       const bootstrap = new BootstrapStore(objects, prefix);
       const existing = await bootstrap.read();
       const isNewRemote = existing === undefined;
@@ -523,6 +617,7 @@ export default class S3VaultSyncPlugin
         vaultId = existing.vaultId;
         vaultKey = await VaultCrypto.unwrapKey(password, existing.envelope);
       } else {
+        if (needsRenameReview) throw new Error("Resolve the interrupted rename before initializing a new Remote Store.");
         const existingKeys = await objects.list(prefix ? `${prefix}/` : "");
         if (existingKeys.some(key => !ownedProbeKeys.has(key))) {
           throw new Error("The selected S3 prefix is not empty");
@@ -587,6 +682,7 @@ export default class S3VaultSyncPlugin
         throw new Error("The selected prefix belongs to a different Vault");
       }
       if (!currentHead) {
+        if (needsRenameReview) throw new RepairModeError("The existing Head must be recovered before path repair can continue");
         const pending = this.data.pendingInitialization;
         const canResume = pending?.phase === "uploading" &&
           pending.vaultId === vaultId && pending.prefix === prefix &&
@@ -618,13 +714,18 @@ export default class S3VaultSyncPlugin
       this.session.assertActive();
       this.credentials.saveVaultKey(vaultKey);
       this.data.settings.vaultId = vaultId;
-      this.data.pendingInitialization = undefined;
-      this.data.pendingProbes = (this.data.pendingProbes ?? []).filter(probe =>
-        !(probe.bucket === bucket && probe.region === region && probe.prefix === prefix && ownedProbeKeys.has(probe.key)));
+      if (!needsRenameReview) {
+        this.data.pendingInitialization = undefined;
+        this.data.pendingProbes = (this.data.pendingProbes ?? []).filter(probe =>
+          !(probe.bucket === bucket && probe.region === region && probe.prefix === prefix && ownedProbeKeys.has(probe.key)));
+      }
       await this.savePluginData();
-      this.setStatus("Idle", "Encrypted Remote Store is ready.");
-      new Notice("S3 Vault Sync is ready");
+      this.setStatus(needsRenameReview ? "Action required" : "Idle", needsRenameReview
+        ? "Unlocked. Open sync status to review the interrupted rename."
+        : "Encrypted Remote Store is ready.");
+      new Notice(needsRenameReview ? "Vault unlocked. Review the interrupted rename to resume sync." : "S3 Vault Sync is ready");
     } catch (error) {
+      await this.rememberIntegrityFailure(error, integrityTarget);
       this.showError(error);
       throw error;
     }
@@ -701,6 +802,7 @@ export default class S3VaultSyncPlugin
     remote: RemoteStore,
   ): SyncService {
     const assertTarget = this.captureTargetGuard();
+    const integrityTarget = this.integrityTarget();
     const cache: SyncCachePort = {
       load: () => Promise.resolve(this.data.cache),
       save: async (state) => {
@@ -719,6 +821,7 @@ export default class S3VaultSyncPlugin
       maxAutomaticFileBytes: mobileAutomaticFileLimit,
       remote,
       onProgress: (progress) => this.updateSyncProgress(progress),
+      onIntegrityVerified: check => this.clearVerifiedIntegrityIssue(integrityTarget, check),
       replicaId: this.data.settings.replicaId,
       yieldDuringHashing: this.yieldDuringHashing,
     });
@@ -726,8 +829,11 @@ export default class S3VaultSyncPlugin
 
   private runExclusiveSyncService<T>(
     operation: (service: SyncService) => Promise<T>,
+    allowCollisionReview = false,
   ): Promise<T> {
     return this.syncRequests.runExclusive(() => this.session.run(async () => {
+      const integrityTarget = this.integrityTarget();
+      await this.recoverCollisionRename(allowCollisionReview);
       const vaultKey = this.credentials.loadVaultKey();
       if (!vaultKey) {
         throw new Error("Unlock the encrypted Vault first");
@@ -737,7 +843,17 @@ export default class S3VaultSyncPlugin
         prefix: this.data.settings.prefix,
         vaultKey,
       });
-      return operation(this.createSyncService(remote));
+      try {
+        const pendingBefore = this.currentIntegrityChecks().length;
+        const result = await operation(this.createSyncService(remote));
+        if (this.integrityTarget() === integrityTarget && this.currentIntegrityChecks().length < pendingBefore) {
+          this.reportManualCompletion("Previously reported remote content has been verified.");
+        }
+        return result;
+      } catch (error) {
+        await this.rememberIntegrityFailure(error, integrityTarget);
+        throw error;
+      }
     }));
   }
 
@@ -754,6 +870,8 @@ export default class S3VaultSyncPlugin
         stored?.fullHashVerificationRequired ?? false,
       lastFullHashVerificationAt: stored?.lastFullHashVerificationAt,
       pendingPathRenames: stored?.pendingPathRenames ?? {},
+      pendingCollisionRename: stored?.pendingCollisionRename,
+      pendingIntegrityChecks: stored?.pendingIntegrityChecks ?? [],
       pendingInitialization: stored?.pendingInitialization,
       pendingProbes: stored?.pendingProbes ?? [],
       settings,
@@ -776,10 +894,43 @@ export default class S3VaultSyncPlugin
     };
   }
 
+  private integrityTarget(): string {
+    const {bucket, region, prefix, vaultId} = this.data.settings;
+    return JSON.stringify([bucket, region, normalizePrefix(prefix), vaultId]);
+  }
+
+  private currentIntegrityChecks(): PendingIntegrityIssue[] {
+    const target = this.integrityTarget();
+    return (this.data.pendingIntegrityChecks ?? []).filter(issue => issue.target === target);
+  }
+
+  private async clearVerifiedIntegrityIssue(target: string, check: RemoteIntegrityCheck): Promise<void> {
+    this.session.assertActive();
+    if (target !== this.integrityTarget()) throw new Error("Vault changed during integrity recheck. Retry synchronization.");
+    const previous = this.data.pendingIntegrityChecks ?? [];
+    const remaining = previous.filter(issue => issue.target !== target || JSON.stringify(issue.check) !== JSON.stringify(check));
+    if (remaining.length === previous.length) return;
+    this.data.pendingIntegrityChecks = remaining;
+    try { await this.savePluginData(); }
+    catch (error) { this.data.pendingIntegrityChecks = previous; throw error; }
+  }
+
+  private async rememberIntegrityFailure(error: unknown, target: string): Promise<void> {
+    if (this.session.signal.aborted || !(error instanceof RemoteStateError || error instanceof RepairModeError)) return;
+    const check: RemoteIntegrityCheck = error instanceof RemoteStateError ? error.integrityCheck : {kind: "metadata"};
+    const issues = this.data.pendingIntegrityChecks ?? [];
+    this.data.pendingIntegrityChecks = issues.filter(issue => issue.target !== target || JSON.stringify(issue.check) !== JSON.stringify(check));
+    this.data.pendingIntegrityChecks.push({target, check, message: error.message});
+    if (target === this.integrityTarget()) this.setStatus("Action required", `Repair Mode: ${error.message}`);
+    await this.savePluginData();
+  }
+
   private async performSync({
     allowBulkDeletion,
     fullHashVerification: requestedFullHashVerification,
   }: SyncRunOptions): Promise<void> {
+    const integrityTarget = this.integrityTarget();
+    const assertIntegrityTarget = this.captureTargetGuard();
     if (this.data.settings.paused) {
       this.setStatus("Paused", "Automatic sync is paused on this device.");
       return;
@@ -792,6 +943,8 @@ export default class S3VaultSyncPlugin
     if (this.headRetryTimer !== undefined) {
       this.clearHeadRetryTimer();
     }
+    try { await this.recoverCollisionRename(); }
+    catch (error) { this.showError(error); return; }
     const dirtySnapshot = this.dirtyPaths.capture();
     const pathRenameSnapshot = this.pathRenames.capture();
     const fullHashVerification =
@@ -831,6 +984,13 @@ export default class S3VaultSyncPlugin
         throw new RepairModeError(
           "Remote Head is missing or belongs to a different Vault",
         );
+      }
+      const integrityChecks = this.currentIntegrityChecks();
+      for (const issue of integrityChecks) {
+        await this.createSyncService(remote).verifyRemoteIntegrity([issue.check], this.data.settings.vaultId);
+        this.session.assertActive();
+        assertIntegrityTarget();
+        await this.clearVerifiedIntegrityIssue(integrityTarget, issue.check);
       }
       const retryHashMemo = new Map<string, VerifiedLocalFile>();
       const result = await retryHeadChanges(
@@ -931,6 +1091,7 @@ export default class S3VaultSyncPlugin
         );
         this.scheduleAfterLocalChange();
       } else {
+        await this.rememberIntegrityFailure(error, integrityTarget);
         this.showError(error);
       }
     } finally {
@@ -985,10 +1146,28 @@ export default class S3VaultSyncPlugin
       await this.runExclusiveSyncService((service) =>
         service.resolveConflict(entryId, resolution),
       );
-      this.setStatus("Idle", "Conflict resolved and shared with every device.");
+      this.reportManualCompletion("Conflict resolution saved to S3.");
     } catch (error) {
       this.showError(error);
       throw error;
+    }
+  }
+
+  private reportManualCompletion(detail: string): void {
+    // A queued/running sync owns its status; one manual success cannot declare the whole Vault settled.
+    if (this.syncRequests.isRunning) return;
+    if (this.pendingLocalIssues.length || this.getConflicts().length ||
+      this.pendingDeferredDownloads.some(entry => entry.reason === "unsupported-path") ||
+      this.pendingBulkDeletion || this.data.pendingCollisionRename) {
+      this.setStatus("Action required", `${detail} Other items still need attention. Open sync status to review them.`);
+    } else {
+      const deferred = this.pendingDeferredDownloads.length
+        ? ` Deferred downloads: ${this.pendingDeferredDownloads.length}.`
+        : "";
+      this.setStatus(
+        this.data.settings.paused ? "Paused" : "Idle",
+        `${detail}${deferred}${this.data.settings.paused ? " Automatic sync remains paused." : ""}`,
+      );
     }
   }
 
@@ -1093,6 +1272,13 @@ export default class S3VaultSyncPlugin
     detail: string,
     progressLabel?: string,
   ): void {
+    const integrityChecks = this.data ? this.currentIntegrityChecks() : [];
+    if (integrityChecks.length && status !== "Checking" && status !== "Syncing") {
+      const lastError = status === "Error" ? ` Last attempt: ${detail}` : "";
+      status = "Action required";
+      detail = `Repair Mode: ${integrityChecks[0]!.message} (${integrityChecks.length} pending integrity checks). Resolve the reported problem, then sync to recheck.` +
+        (this.data.settings.paused ? " Automatic sync remains paused." : "") + lastError;
+    }
     if (this.session.signal.aborted) return;
     if (status !== "Syncing") {
       this.syncProgressThrottle.reset();

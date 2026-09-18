@@ -118,6 +118,18 @@ export class PathRenameTracker {
     );
   }
 
+  // Only an explicitly reviewed or journal-recovered move may replace one Entry's pending intent.
+  setReviewedRename(entryId: string, sourcePath: string, targetPath: string): Set<string> {
+    const dirty = new Set([sourcePath, targetPath]);
+    for (const [from, rename] of this.renames) {
+      if (rename.entryId !== entryId) continue;
+      dirty.add(from); dirty.add(rename.toPath);
+      this.renames.delete(from);
+    }
+    if (sourcePath !== targetPath) this.renames.set(sourcePath, {entryId, toPath: targetPath, version: ++this.nextVersion});
+    return dirty;
+  }
+
   toPathMap(snapshot: PathRenameSnapshot): Map<string, PersistedPathRename> {
     return new Map(
       [...snapshot].map(([fromPath, state]) => [

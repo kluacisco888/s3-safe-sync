@@ -21,6 +21,8 @@ import {
 import { SyncRequestQueue } from "../src/sync/sync-request-queue";
 import { sha256Content } from "../src/sync/content-hash";
 import { LocalStateChangedError } from "../src/sync/errors";
+import { PathRenameTracker } from "../src/sync/path-rename-tracker";
+import { CollisionRenameJournal, type PendingCollisionRename } from "../src/sync/collision-rename-journal";
 
 class MemoryObjectStore implements ObjectStore {
   private sequence = 0;
@@ -236,7 +238,80 @@ const currentLiveEntryIds = async (remote: RemoteStore): Promise<string[]> => {
   );
 };
 
+const collisionJournal = (local: LocalVaultPort, cache: MemorySyncCache, tracker: PathRenameTracker): CollisionRenameJournal => {
+  let pending: PendingCollisionRename | undefined;
+  return new CollisionRenameJournal(local, {
+    read: () => pending,
+    prepare: async value => {pending = {...value, identitySourcePath: value.entryId
+      ? [...tracker.capture()].find(([, rename]) => rename.entryId === value.entryId)?.[0] ??
+        Object.values(cache.state?.files ?? {}).find(file => file.entryId === value.entryId)?.path : undefined};},
+    finish: async (value, moved) => {
+      if (value.entryId && value.identitySourcePath) tracker.setReviewedRename(value.entryId, value.identitySourcePath, moved ? value.to : value.from);
+      pending = undefined;
+    },
+  });
+};
+
 describe("SyncService", () => {
+  it("rechecks only referenced content, accepts an alternate recovery copy, and respects device limits", async () => {
+    const objects = new MemoryObjectStore();
+    const remote = await RemoteStore.open({objects, prefix: "integrity", vaultKey: new Uint8Array(32)});
+    const local = new MemoryVault();
+    const cache = new MemorySyncCache();
+    await local.write("note.md", new TextEncoder().encode("original"));
+    const service = new SyncService({cache, local, remote, replicaId: "test"});
+    await service.initializeNew("vault");
+    const head = (await remote.readHead())!;
+    const snapshot = await remote.readSnapshot(head.value);
+    const entry = Object.values(snapshot.entries)[0]!;
+    if (entry.kind !== "live") throw new Error("Expected live fixture");
+    const recovery = {kind: "recovery" as const, entryId: entry.entryId, contentHash: entry.revision.contentHash};
+    await objects.put(`integrity/v1/blobs/${entry.revision.blobId}`, new TextEncoder().encode("damaged"));
+    await expect(service.verifyRemoteIntegrity([recovery], "vault")).rejects.toThrow("No authenticated remote recovery");
+    await expect(service.verifyRemoteIntegrity([{kind: "blob", blobId: entry.revision.blobId}], "vault"))
+      .rejects.toMatchObject({integrityCheck: {kind: "blob", blobId: entry.revision.blobId}});
+    // Repair can supply another authenticated copy without deleting the old evidence.
+    await remote.writeBlob("alternate", new TextEncoder().encode("original"));
+    await remote.advance({expectedHeadEtag: head.etag, head: {...head.value, commitId: "alternate", generation: 2},
+      commit: {commitId: "alternate", protocolVersion: 1, vaultId: "vault", replicaId: "test", createdAt: head.serverDate,
+        parentIds: [head.value.commitId], changes: [{kind: "set-entry", entry: {...entry,
+          history: [{...entry.revision, blobId: "alternate", revisionId: "alternate"}]}}]}});
+    await expect(service.verifyRemoteIntegrity([recovery], "vault")).resolves.toBeUndefined();
+    await expect(service.verifyRemoteIntegrity([{kind: "recovery", entryId: entry.entryId, contentHash: "sha256:unavailable"}], "vault"))
+      .rejects.toThrow("No authenticated remote recovery");
+    const limited = new SyncService({cache, local, remote, replicaId: "phone", maxAutomaticFileBytes: 1});
+    const reads: string[] = [];
+    objects.onGet = key => {reads.push(key);};
+    for (const check of [recovery, {kind: "blob" as const, blobId: entry.revision.blobId}]) {
+      await expect(limited.verifyRemoteIntegrity([check], "vault")).rejects.toThrow("transfer limit");
+    }
+    expect(reads.some(key => key.includes("/blobs/"))).toBe(false);
+    // A rejected upload not referenced by accepted history must not leave an eternal blocker.
+    await objects.put("integrity/v1/blobs/orphan", new TextEncoder().encode("damaged orphan"));
+    await expect(service.verifyRemoteIntegrity([{kind: "blob", blobId: "orphan"}], "vault")).resolves.toBeUndefined();
+    expect(reads).not.toContain("integrity/v1/blobs/orphan");
+  });
+
+  it("does not clear a materialized-candidate failure just because metadata decrypts", async () => {
+    const objects = new MemoryObjectStore();
+    const remote = await RemoteStore.open({objects, prefix: "integrity", vaultKey: new Uint8Array(32)});
+    const local = new MemoryVault();
+    const cache = new MemorySyncCache();
+    const service = new SyncService({cache, local, remote, replicaId: "test"});
+    await local.write("note.md", new TextEncoder().encode("original"));
+    await service.initializeNew("vault");
+    const head = (await remote.readHead())!;
+    const entry = Object.values((await remote.readSnapshot(head.value)).entries)[0]!;
+    if (entry.kind !== "live") throw new Error("Expected live fixture");
+    await remote.advance({expectedHeadEtag: head.etag, head: {...head.value, commitId: "conflict", generation: 2},
+      commit: {commitId: "conflict", protocolVersion: 1, vaultId: "vault", replicaId: "test", createdAt: head.serverDate,
+        parentIds: [head.value.commitId], changes: [{kind: "set-entry", entry: {kind: "conflicted", entryId: entry.entryId,
+          path: entry.path, reason: "edit-edit", candidates: [], materializedContentHash: entry.revision.contentHash,
+          history: [entry.revision]}}]}});
+    await expect(service.verifyRemoteIntegrity([{kind: "recovery", entryId: entry.entryId, contentHash: entry.revision.contentHash}], "vault"))
+      .rejects.toThrow("no authenticated materialized candidate");
+  });
+
   it("rejects a cross-platform path collision before initializing Head", async () => {
     const objects = new MemoryObjectStore();
     const remote = await RemoteStore.open({
@@ -651,6 +726,28 @@ describe("SyncService", () => {
       expect((await service.synchronize()).localIssues).toEqual([{kind: "bootstrap-mismatch", path: "unreviewed.md"}]);
       await service.restoreRevision(entry.entryId, backup.revisionId);
       expect(local.readText("article.md")).toBe("local article");
+    });
+
+    it("does not infer a deleted reviewed file's identity onto an untouched S3-owned path", async () => {
+      const {service, remote, local, cache, source, sourceService} = await setup();
+      await source.write("unreviewed.md", new TextEncoder().encode("remote article"));
+      await sourceService.synchronize();
+      await local.write("unreviewed.md", new TextEncoder().encode("remote article"));
+      const before = await remote.readSnapshot((await remote.readHead())!.value);
+      const untouched = Object.values(before.entries).find(entry => entry.path === "unreviewed.md")!;
+      const removed = Object.values(before.entries).find(entry => entry.path === "article.md")!;
+      const review = await service.reviewLocalContent("article.md");
+      await service.resolveLocalContent("article.md", review.reviewToken, "remote");
+      await local.delete("article.md");
+      const plan = await service.synchronize();
+      expect(plan.localIssues).toEqual([]);
+      expect(plan.bulkDeletion?.entryIds).toEqual([removed.entryId]);
+      await service.synchronize(plan.bulkDeletion!.entryIds);
+      expect(cache.state!.files["unreviewed.md"]!.entryId).toBe(untouched.entryId);
+      expect(local.readText("unreviewed.md")).toBe("remote article");
+      const after = await remote.readSnapshot((await remote.readHead())!.value);
+      expect(after.entries[untouched.entryId]).toEqual(untouched);
+      expect(after.entries[removed.entryId]?.kind).toBe("deleted");
     });
 
     it("publishes the local choice while keeping S3's previous version recoverable", async () => {
@@ -4471,6 +4568,188 @@ describe("SyncService", () => {
     ]);
     expect(phoneVault.readText("notes/a.md")).toBe("remote");
     expect(phoneVault.readText("notes/b.md")).toBe("local draft");
+  });
+
+  it("resolves an occupied remote-move target by renaming the local draft and preserves both contents", async () => {
+    const objects = new MemoryObjectStore();
+    const remote = await RemoteStore.open({objects, prefix: "collision", vaultKey: new Uint8Array(32)});
+    const source = new MemoryVault();
+    const local = new MemoryVault();
+    const cache = new MemorySyncCache();
+    const tracker = new PathRenameTracker();
+    const desktop = new SyncService({remote, local: source, cache: new MemorySyncCache(), replicaId: "source"});
+    const service = new SyncService({remote, local, cache, replicaId: "target"});
+    await source.write("notes/a.md", new TextEncoder().encode("remote original"));
+    await desktop.initializeNew("vault");
+    await service.synchronize();
+    const originalId = cache.state!.files["notes/a.md"]!.entryId;
+    await local.write("notes/b.md", new TextEncoder().encode("local draft"));
+    await source.move("notes/a.md", "notes/b.md");
+    await desktop.synchronize();
+    expect((await service.synchronize()).localIssues).toEqual([{kind: "path-collision", paths: ["notes/b.md"]}]);
+    const review = await service.reviewPathCollision(["notes/b.md"], tracker.capture());
+    expect(review.localFiles[0]?.preview).toBe("local draft");
+    expect(review.remoteFiles[0]?.preview).toBe("remote original");
+    expect(review.remoteFiles[0]?.previousPath).toBe("notes/a.md");
+    expect(review.relatedPaths).toContain("notes/a.md");
+    await service.resolvePathCollision({paths: review.paths, reviewToken: review.reviewToken, side: "local",
+      path: "notes/b.md", newName: "b-local-draft.md"}, tracker.capture(), collisionJournal(local, cache, tracker));
+    expect(local.readText("notes/b-local-draft.md")).toBe("local draft");
+    expect((await service.synchronize([], {pathRenames: tracker.capture()})).status).toBe("complete");
+    expect(local.readText("notes/b.md")).toBe("remote original");
+    expect(cache.state!.files["notes/b.md"]!.entryId).toBe(originalId);
+    expect(local.readText("notes/b-local-draft.md")).toBe("local draft");
+    await desktop.synchronize();
+    expect(source.readText("notes/b-local-draft.md")).toBe("local draft");
+  });
+
+  it("resolves a reused local old path without stealing the pending move's identity", async () => {
+    const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "collision", vaultKey: new Uint8Array(32)});
+    const local = new MemoryVault();
+    const cache = new MemorySyncCache();
+    const tracker = new PathRenameTracker();
+    const service = new SyncService({remote, local, cache, replicaId: "local"});
+    await local.write("b.md", new TextEncoder().encode("tracked original"));
+    await service.initializeNew("vault");
+    const id = cache.state!.files["b.md"]!.entryId;
+    await local.move("b.md", "c.md");
+    tracker.record(Object.values(cache.state!.files), "b.md", "c.md");
+    await local.write("b.md", new TextEncoder().encode("new draft"));
+    expect((await service.synchronize([], {pathRenames: tracker.capture()})).localIssues).toEqual([{kind: "path-collision", paths: ["b.md"]}]);
+    const review = await service.reviewPathCollision(["b.md"], tracker.capture());
+    expect(review.localFiles[0]?.entryId).toBeUndefined();
+    expect(review.pendingMoves).toEqual([{from: "b.md", to: "c.md"}]);
+    await service.resolvePathCollision({paths: review.paths, reviewToken: review.reviewToken, side: "local",
+      path: "b.md", newName: "draft.md"}, tracker.capture(), collisionJournal(local, cache, tracker));
+    expect(tracker.serialize()).toEqual({"b.md": {entryId: id, toPath: "c.md"}});
+    expect((await service.synchronize([], {pathRenames: tracker.capture()})).status).toBe("complete");
+    expect(cache.state!.files["c.md"]!.entryId).toBe(id);
+    expect(local.readText("c.md")).toBe("tracked original");
+    expect(local.readText("draft.md")).toBe("new draft");
+    expect(cache.state!.files["draft.md"]!.entryId).not.toBe(id);
+  });
+
+  it("separates duplicate S3 path owners without changing either identity or history", async () => {
+    const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "collision", vaultKey: new Uint8Array(32)});
+    const local = new MemoryVault();
+    const cache = new MemorySyncCache();
+    const tracker = new PathRenameTracker();
+    const service = new SyncService({remote, local, cache, replicaId: "test"});
+    await local.write("a.md", new TextEncoder().encode("file a"));
+    await local.write("b.md", new TextEncoder().encode("file b"));
+    await service.initializeNew("vault");
+    await local.write("b.md", new TextEncoder().encode("updated b"));
+    await service.synchronize();
+    const head = (await remote.readHead())!;
+    const snapshot = await remote.readSnapshot(head.value);
+    const b = Object.values(snapshot.entries).find(entry => entry.path === "b.md")!;
+    const duplicated = {...b, path: "a.md"};
+    const commitId = crypto.randomUUID();
+    await remote.advance({expectedHeadEtag: head.etag, head: {...head.value, commitId},
+      commit: {commitId, vaultId: snapshot.vaultId, protocolVersion: 1, createdAt: head.serverDate,
+        parentIds: [head.value.commitId], replicaId: "old-client", changes: [{kind: "set-entry", entry: duplicated}]}});
+    expect((await service.synchronize()).localIssues.some(issue => issue.kind === "path-collision")).toBe(true);
+    const review = await service.reviewPathCollision(["a.md"], tracker.capture());
+    expect(review.remoteFiles).toHaveLength(2);
+    const before = structuredClone(cache.state);
+    await service.resolvePathCollision({paths: review.paths, reviewToken: review.reviewToken, side: "remote",
+      path: "a.md", entryId: b.entryId, newName: "b-kept.md"}, tracker.capture(), collisionJournal(local, cache, tracker));
+    expect(cache.state).toEqual(before);
+    const repaired = await remote.readSnapshot((await remote.readHead())!.value);
+    expect(repaired.entries[b.entryId]).toEqual({...b, path: "b-kept.md"});
+    expect((await service.synchronize()).status).toBe("complete");
+    expect(local.readText("a.md")).toBe("file a");
+    expect(local.readText("b-kept.md")).toBe("updated b");
+    expect(cache.state!.files["b-kept.md"]!.entryId).toBe(b.entryId);
+  });
+
+  it("preserves a stale deleted local identity as a new file without reviving its deletion record", async () => {
+    const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "collision", vaultKey: new Uint8Array(32)});
+    const source = new MemoryVault();
+    const local = new MemoryVault();
+    const cache = new MemorySyncCache();
+    const tracker = new PathRenameTracker();
+    const sourceService = new SyncService({remote, local: source, cache: new MemorySyncCache(), replicaId: "source"});
+    const service = new SyncService({remote, local, cache, replicaId: "target"});
+    await source.write("a.md", new TextEncoder().encode("old a"));
+    await source.write("b.md", new TextEncoder().encode("file b"));
+    await sourceService.initializeNew("vault");
+    await service.synchronize();
+    const deletedId = cache.state!.files["a.md"]!.entryId;
+    const liveId = cache.state!.files["b.md"]!.entryId;
+    await source.delete("a.md");
+    const deletion = await sourceService.synchronize();
+    await sourceService.synchronize(deletion.bulkDeletion!.entryIds);
+    await source.move("b.md", "a.md");
+    await sourceService.synchronize();
+    expect((await service.synchronize()).localIssues).toContainEqual({kind: "path-collision", paths: ["a.md"]});
+    const review = await service.reviewPathCollision(["a.md"], tracker.capture());
+    expect(review.localFiles[0]?.preserveAsNew).toBe(true);
+    await service.resolvePathCollision({paths: review.paths, reviewToken: review.reviewToken, side: "local",
+      path: "a.md", newName: "a-kept.md"}, tracker.capture(), collisionJournal(local, cache, tracker));
+    expect((await service.synchronize()).status).toBe("complete");
+    const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+    expect(snapshot.entries[deletedId]?.kind).toBe("deleted");
+    expect(cache.state!.files["a.md"]!.entryId).toBe(liveId);
+    expect(cache.state!.files["a-kept.md"]!.entryId).not.toBe(deletedId);
+    expect(local.readText("a-kept.md")).toBe("old a");
+    expect(local.readText("a.md")).toBe("file b");
+  });
+
+  it.each(["occupied.md", "OCCUPIED.md", "../escape.md", "bad:name.md", "_excluded.md"])(
+    "rejects unsafe or remotely occupied rename destination %s before publication", async newName => {
+      const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "collision", vaultKey: new Uint8Array(32)});
+      const source = new MemoryVault();
+      await source.write("note.md", new TextEncoder().encode("note"));
+      await source.write("occupied.md/child.md", new TextEncoder().encode("child"));
+      await new SyncService({remote, local: source, cache: new MemorySyncCache(), replicaId: "source"}).initializeNew("vault");
+      const local = new MemoryVault();
+      const cache = new MemorySyncCache();
+      const tracker = new PathRenameTracker();
+      const service = new SyncService({remote, local, cache, replicaId: "target"});
+      const review = await service.reviewPathCollision(["note.md"], tracker.capture());
+      const head = await remote.readHead();
+      await expect(service.resolvePathCollision({paths: review.paths, reviewToken: review.reviewToken, side: "remote",
+        path: "note.md", entryId: review.remoteFiles[0]!.entryId, newName}, tracker.capture(), collisionJournal(local, cache, tracker))).rejects.toThrow();
+      expect(await remote.readHead()).toEqual(head);
+      expect(await local.list()).toEqual([]);
+    },
+  );
+
+  it("rejects collision rename after a local edit without moving anything", async () => {
+    const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "collision", vaultKey: new Uint8Array(32)});
+    const local = new MemoryVault();
+    const cache = new MemorySyncCache();
+    const tracker = new PathRenameTracker();
+    const service = new SyncService({remote, local, cache, replicaId: "test"});
+    await local.write("note.md", new TextEncoder().encode("first"));
+    await service.initializeNew("vault");
+    const review = await service.reviewPathCollision(["note.md"], tracker.capture());
+    await local.write("note.md", new TextEncoder().encode("typing"));
+    const head = await remote.readHead();
+    await expect(service.resolvePathCollision({paths: review.paths, reviewToken: review.reviewToken, side: "local",
+      path: "note.md", newName: "renamed.md"}, tracker.capture(), collisionJournal(local, cache, tracker))).rejects.toThrow("changed");
+    expect(await remote.readHead()).toEqual(head);
+    expect(local.readText("note.md")).toBe("typing");
+    expect(local.readText("renamed.md")).toBeUndefined();
+  });
+
+  it("rejects a remote rename into an existing empty local directory", async () => {
+    const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "collision", vaultKey: new Uint8Array(32)});
+    const source = new MemoryVault();
+    await source.write("note.md", new TextEncoder().encode("note"));
+    await new SyncService({remote, local: source, cache: new MemorySyncCache(), replicaId: "source"}).initializeNew("vault");
+    const local: LocalVaultPort = new MemoryVault();
+    local.pathExists = async path => path.toLowerCase() === "empty.md";
+    const cache = new MemorySyncCache();
+    const tracker = new PathRenameTracker();
+    const service = new SyncService({remote, local, cache, replicaId: "target"});
+    const review = await service.reviewPathCollision(["note.md"], tracker.capture());
+    const head = await remote.readHead();
+    await expect(service.resolvePathCollision({paths: review.paths, reviewToken: review.reviewToken, side: "remote",
+      path: "note.md", entryId: review.remoteFiles[0]!.entryId, newName: "EMPTY.md"}, tracker.capture(), collisionJournal(local, cache, tracker)))
+      .rejects.toThrow("occupied");
+    expect(await remote.readHead()).toEqual(head);
   });
 
   it("preserves a target created after a remote move was planned", async () => {

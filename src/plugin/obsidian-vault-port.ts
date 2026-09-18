@@ -14,6 +14,7 @@ import type {
 } from "../sync/sync-service";
 import { sha256Content as sha256 } from "../sync/content-hash";
 import { LocalStateChangedError } from "../sync/errors";
+import { canonicalVaultPath } from "../sync/canonical-path";
 import {
   hashDesktopFile,
   type DesktopHashDependencies,
@@ -225,6 +226,16 @@ export class ObsidianVaultPort implements LocalVaultPort {
           size: file.stat.size,
         }
       : undefined;
+  }
+
+  async pathExists(path: string): Promise<boolean> {
+    await this.ensureRecovered();
+    const canonical = canonicalVaultPath(path);
+    if (this.vault.getAllLoadedFiles().some(file => {
+      const existing = canonicalVaultPath(file.path);
+      return existing === canonical || (file instanceof TFile && canonical.startsWith(`${existing}/`));
+    })) return true;
+    return this.vault.adapter.exists(normalizePath(path));
   }
 
   supportsPath(path: string): boolean {

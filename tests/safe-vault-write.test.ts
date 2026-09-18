@@ -142,6 +142,107 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
 }
 
 describe("safeReplaceVaultFile", () => {
+  it("does not overwrite a target recreated while recovery verifies the backup", async () => {
+    const adapter = new MemorySafeWriteAdapter();
+    const journalPath = `${STAGING}/recovery-race.json`;
+    const backupPath = `${STAGING}/recovery-race.backup`;
+    const temporaryPath = `${STAGING}/recovery-race.new`;
+    const targetPath = "notes/example.md";
+    adapter.files.set(backupPath, bytes("before"));
+    adapter.files.set(temporaryPath, bytes("remote"));
+    adapter.files.set(journalPath, bytes(JSON.stringify({backupPath, temporaryPath, targetPath,
+      hadOriginal: true, originalHash: await hash(bytes("before")), expectedHash: await hash(bytes("remote"))})));
+    adapter.onReadBinary = path => {
+      if (path === backupPath) adapter.files.set(targetPath, bytes("new user edit"));
+    };
+
+    await expect(recoverPendingVaultWrites(adapter)).rejects.toThrow();
+
+    expect(new TextDecoder().decode(adapter.files.get(targetPath))).toBe("new user edit");
+    expect(new TextDecoder().decode(adapter.files.get(backupPath))).toBe("before");
+    expect(adapter.files.has(journalPath)).toBe(true);
+    expect(adapter.files.has(temporaryPath)).toBe(true);
+  });
+
+  it("keeps the original target and backup if another writer wins the recovery copy", async () => {
+    const adapter = new MemorySafeWriteAdapter();
+    const targetPath = "notes/example.md";
+    const backupPath = `${STAGING}/copy-race.backup`;
+    const journalPath = `${STAGING}/copy-race.json`;
+    const temporaryPath = `${STAGING}/copy-race.new`;
+    adapter.files.set(backupPath, bytes("before"));
+    adapter.files.set(temporaryPath, bytes("remote"));
+    adapter.files.set(journalPath, bytes(JSON.stringify({backupPath, temporaryPath, targetPath, hadOriginal: true,
+      originalHash: await hash(bytes("before")), expectedHash: await hash(bytes("remote"))})));
+    adapter.beforeCopy = (_from, to) => {adapter.files.set(to, bytes("last-moment edit"));};
+
+    await expect(recoverPendingVaultWrites(adapter)).rejects.toThrow("already exists");
+
+    expect(new TextDecoder().decode(adapter.files.get(targetPath))).toBe("last-moment edit");
+    expect(new TextDecoder().decode(adapter.files.get(backupPath))).toBe("before");
+    expect(adapter.files.has(journalPath)).toBe(true);
+    expect(adapter.trashed).toEqual([]);
+  });
+
+  it("keeps both files and the journal when the backup changes during restoration", async () => {
+    const adapter = new MemorySafeWriteAdapter();
+    const targetPath = "notes/example.md";
+    const backupPath = `${STAGING}/changing-backup.backup`;
+    const journalPath = `${STAGING}/changing-backup.json`;
+    const temporaryPath = `${STAGING}/changing-backup.new`;
+    adapter.files.set(backupPath, bytes("before"));
+    adapter.files.set(journalPath, bytes(JSON.stringify({backupPath, temporaryPath, targetPath, hadOriginal: true,
+      originalHash: await hash(bytes("before")), expectedHash: await hash(bytes("remote"))})));
+    adapter.beforeCopy = from => {adapter.files.set(from, bytes("new backup edit"));};
+
+    await expect(recoverPendingVaultWrites(adapter)).rejects.toThrow("Restored backup needs review");
+
+    expect(new TextDecoder().decode(adapter.files.get(targetPath))).toBe("new backup edit");
+    expect(new TextDecoder().decode(adapter.files.get(backupPath))).toBe("new backup edit");
+    expect(adapter.files.has(journalPath)).toBe(true);
+    expect(adapter.trashed).toEqual([]);
+  });
+
+  it("finishes recovery after the original was copied back but backup retirement was interrupted", async () => {
+    const adapter = new MemorySafeWriteAdapter();
+    const targetPath = "notes/example.md";
+    const backupPath = `${STAGING}/already-restored.backup`;
+    const journalPath = `${STAGING}/already-restored.json`;
+    const temporaryPath = `${STAGING}/already-restored.new`;
+    adapter.files.set(targetPath, bytes("before"));
+    adapter.files.set(backupPath, bytes("before"));
+    adapter.files.set(temporaryPath, bytes("remote"));
+    adapter.files.set(journalPath, bytes(JSON.stringify({backupPath, temporaryPath, targetPath, hadOriginal: true,
+      originalHash: await hash(bytes("before")), expectedHash: await hash(bytes("remote"))})));
+
+    await recoverPendingVaultWrites(adapter);
+    await recoverPendingVaultWrites(adapter);
+
+    expect(new TextDecoder().decode(adapter.files.get(targetPath))).toBe("before");
+    expect(adapter.trashed.map(body => new TextDecoder().decode(body))).toEqual(["before"]);
+    expect(adapter.files.has(journalPath)).toBe(false);
+    expect(adapter.files.has(temporaryPath)).toBe(false);
+  });
+
+  it("never replaces a newly saved target even when rollback sees a changed backup", async () => {
+    const adapter = new MemorySafeWriteAdapter();
+    adapter.files.set("notes/example.md", bytes("before"));
+    let backupReads = 0;
+    adapter.beforeRename = (from, to) => {
+      if (to.endsWith("changed.backup")) adapter.files.set(from, bytes("edited while backing up"));
+    };
+    adapter.onReadBinary = path => {
+      if (path.endsWith("changed.backup") && ++backupReads === 2) adapter.files.set("notes/example.md", bytes("newer saved target"));
+    };
+
+    await expect(safeReplaceVaultFile(adapter, "notes/example.md", bytes("remote"), await hash(bytes("before")), () => "changed"))
+      .rejects.toThrow();
+
+    expect(new TextDecoder().decode(adapter.files.get("notes/example.md"))).toBe("newer saved target");
+    expect(new TextDecoder().decode(adapter.files.get(`${STAGING}/changed.backup`))).toBe("edited while backing up");
+    expect(adapter.files.has(`${STAGING}/changed.json`)).toBe(true);
+  });
+
   it("does not start a stopped write after waiting for the mutation lock", async () => {
     const adapter = new MemorySafeWriteAdapter();
     adapter.files.set("notes/example.md", bytes("before"));
