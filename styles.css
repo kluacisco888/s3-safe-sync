@@ -44,6 +44,20 @@
   margin-block: var(--size-4-3) var(--size-4-5);
 }
 
+.s3-vault-sync-review-choice {
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+
+.s3-vault-sync-review-choice button {
+  width: 100%;
+}
+
+.s3-vault-sync-review-choice p {
+  font-size: var(--font-smaller);
+  color: var(--text-muted);
+}
+
 .s3-vault-sync-conflict {
   display: grid;
   gap: var(--size-4-2);
@@ -133,6 +147,47 @@
   overflow-wrap: anywhere;
   user-select: text;
   -webkit-user-select: text;
+}
+
+.s3-vault-sync-diff {
+  max-height: 55vh;
+  overflow: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  font-size: var(--font-smaller);
+}
+
+.s3-vault-sync-diff-row {
+  display: grid;
+  grid-template-columns: 4.5em 4.5em minmax(0, 1fr);
+  gap: var(--size-4-1);
+  padding: var(--size-2-1) var(--size-4-2);
+}
+
+.s3-vault-sync-diff-row > span {
+  color: var(--text-muted);
+  text-align: right;
+}
+
+.s3-vault-sync-diff-row code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: transparent;
+  color: inherit;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.s3-vault-sync-diff-local {
+  background: rgba(var(--color-green-rgb), 0.12);
+}
+
+.s3-vault-sync-diff-remote {
+  background: rgba(var(--color-red-rgb), 0.12);
+}
+
+.s3-vault-sync-diff-omitted {
+  color: var(--text-muted);
 }
 
 @media (max-width: 600px) {

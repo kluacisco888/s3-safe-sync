@@ -633,6 +633,153 @@ describe("SyncService", () => {
       return {objects, remote, local, cache, service, source, sourceService, sourceCache};
     };
 
+    it("accepts S3 only after preserving the unpublished local version in recoverable history", async () => {
+      const {service, remote, local} = await setup();
+      const before = await local.list();
+      const review = await service.reviewLocalContent("article.md");
+      await service.resolveLocalContent("article.md", review.reviewToken, "remote");
+      expect(local.readText("article.md")).toBe("remote article");
+      expect((await local.list()).map(file => file.path)).toEqual(before.map(file => file.path));
+      const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      const entry = Object.values(snapshot.entries).find(entry => entry.path === "article.md");
+      if (entry?.kind !== "live") throw new Error("Expected the original live Entry");
+      expect(entry.history).toHaveLength(1);
+      const backup = entry.history![0]!;
+      expect(new TextDecoder().decode(await remote.readBlob(backup.blobId))).toBe("local article");
+      expect(new TextDecoder().decode(await service.readHistoricalRevision(entry.entryId, backup.revisionId))).toBe("local article");
+      expect(backup.expiresAt).toBe("2026-10-05T00:00:00.000Z");
+      expect((await service.synchronize()).localIssues).toEqual([{kind: "bootstrap-mismatch", path: "unreviewed.md"}]);
+      await service.restoreRevision(entry.entryId, backup.revisionId);
+      expect(local.readText("article.md")).toBe("local article");
+    });
+
+    it("publishes the local choice while keeping S3's previous version recoverable", async () => {
+      const {service, remote, local, cache, sourceService, source} = await setup();
+      const before = await local.list();
+      const review = await service.reviewLocalContent("article.md");
+      await service.resolveLocalContent("article.md", review.reviewToken, "local");
+      expect(await local.list()).toEqual(before);
+      expect(local.readText("article.md")).toBe("local article");
+      expect((await cache.load())?.bootstrapPending).toBe(true);
+      expect(local.readText("unreviewed.md")).toBe("local other");
+      const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      const entry = Object.values(snapshot.entries).find(entry => entry.path === "article.md");
+      if (entry?.kind !== "live") throw new Error("Expected a live original Entry");
+      expect(new TextDecoder().decode(await remote.readBlob(entry.revision.blobId))).toBe("local article");
+      const backup = entry.history![0]!;
+      expect(new TextDecoder().decode(await remote.readBlob(backup.blobId))).toBe("remote article");
+      expect(backup.expiresAt).toBe("2026-10-05T00:00:00.000Z");
+      await sourceService.synchronize();
+      expect(source.readText("article.md")).toBe("local article");
+      await service.restoreRevision(entry.entryId, backup.revisionId);
+      expect(local.readText("article.md")).toBe("remote article");
+    });
+
+    it.each(["local", "remote", "both"] as const)("rejects a stale %s choice without publishing or replacing content", async choice => {
+      for (const changed of ["local", "remote"] as const) {
+        const {service, remote, local, source, sourceService} = await setup();
+        const review = await service.reviewLocalContent("article.md");
+        if (changed === "local") await local.write("article.md", new TextEncoder().encode("new draft"));
+        else { await source.write("article.md", new TextEncoder().encode("new S3 version")); await sourceService.synchronize(); }
+        const head = await remote.readHead();
+        const before = await local.list();
+        await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("changed. Review");
+        expect(await remote.readHead()).toEqual(head);
+        expect(await local.list()).toEqual(before);
+        expect(local.readText("article.md")).toBe(changed === "local" ? "new draft" : "local article");
+      }
+    });
+
+    it.each(["local", "remote"] as const)("keeps both existing versions if a %s choice upload fails verification", async choice => {
+      const {service, remote, local, objects, cache} = await setup();
+      const review = await service.reviewLocalContent("article.md");
+      const head = await remote.readHead();
+      const before = await local.list();
+      objects.corruptNextBlobPut = true;
+      await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow();
+      expect(await remote.readHead()).toEqual(head);
+      expect(await local.list()).toEqual(before);
+      expect(local.readText("article.md")).toBe("local article");
+      expect(await cache.load()).toBeUndefined();
+    });
+
+    it.each(["local", "remote"] as const)("does not overwrite typing during a %s choice's upload", async choice => {
+      const {service, remote, local, objects} = await setup();
+      const review = await service.reviewLocalContent("article.md");
+      const head = await remote.readHead();
+      objects.onPut = async key => {
+        if (!key.includes("/blobs/")) return;
+        objects.onPut = undefined;
+        await local.write("article.md", new TextEncoder().encode("typing while saving"));
+      };
+      await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("changed");
+      expect(local.readText("article.md")).toBe("typing while saving");
+      expect(await remote.readHead()).toEqual(head);
+    });
+
+    it.each(["local", "remote"] as const)("rejects a %s choice when another device wins publication", async choice => {
+      const {service, remote, local, objects, source, sourceService} = await setup();
+      const review = await service.reviewLocalContent("article.md");
+      objects.onPut = async key => {
+        if (!key.includes("/blobs/")) return;
+        objects.onPut = undefined;
+        await source.write("article.md", new TextEncoder().encode("concurrent remote update"));
+        await sourceService.synchronize();
+      };
+      await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("Head changed");
+      expect(local.readText("article.md")).toBe("local article");
+      const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      const entry = Object.values(snapshot.entries).find(value => value.path === "article.md");
+      if (entry?.kind !== "live") throw new Error("Expected the competing live Entry");
+      expect(new TextDecoder().decode(await remote.readBlob(entry.revision.blobId))).toBe("concurrent remote update");
+    });
+
+    it("retains the unpublished backup when local replacement is interrupted after S3 accepts it", async () => {
+      const {service, remote, local, objects, cache} = await setup();
+      const review = await service.reviewLocalContent("article.md");
+      objects.onPut = async key => {
+        if (!key.endsWith("/head")) return;
+        objects.onPut = undefined;
+        await local.write("article.md", new TextEncoder().encode("typing during publication"));
+      };
+      await expect(service.resolveLocalContent("article.md", review.reviewToken, "remote")).rejects.toThrow("changed");
+      expect(local.readText("article.md")).toBe("typing during publication");
+      const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      const entry = Object.values(snapshot.entries).find(value => value.path === "article.md");
+      if (entry?.kind !== "live") throw new Error("Expected the original live Entry");
+      expect(new TextDecoder().decode(await service.readHistoricalRevision(entry.entryId, entry.history![0]!.revisionId))).toBe("local article");
+      expect(await cache.load()).toBeUndefined();
+    });
+
+    it("refuses expired or corrupted backup previews and restores", async () => {
+      const {service, remote, local, objects} = await setup();
+      const review = await service.reviewLocalContent("article.md");
+      await service.resolveLocalContent("article.md", review.reviewToken, "remote");
+      const head = (await remote.readHead())!;
+      const snapshot = await remote.readSnapshot(head.value);
+      const entry = Object.values(snapshot.entries).find(value => value.path === "article.md");
+      if (entry?.kind !== "live") throw new Error("Expected a live Entry");
+      const backup = entry.history![0]!;
+      objects.onGet = key => { if (key.includes(backup.blobId)) throw new Error("Network unavailable"); };
+      await expect(service.readHistoricalRevision(entry.entryId, backup.revisionId)).rejects.toThrow("Network unavailable");
+      objects.onGet = undefined;
+      const key = (await objects.list("test/")).find(key => key.includes("/blobs/") && key.endsWith(backup.blobId))!;
+      const stored = (await objects.get(key))!;
+      await objects.put(key, new Uint8Array([1, 2, 3]));
+      await expect(service.readHistoricalRevision(entry.entryId, backup.revisionId)).rejects.toThrow();
+      await expect(service.restoreRevision(entry.entryId, backup.revisionId)).rejects.toThrow();
+      expect(local.readText("article.md")).toBe("remote article");
+      await objects.put(key, stored.body);
+      const expired = {...entry, history: [{...backup, expiresAt: "2026-09-04T00:00:00.000Z"}]};
+      const commitId = "expired-backup-test";
+      await remote.advance({expectedHeadEtag: head.etag, head: {...head.value, commitId},
+        commit: {commitId, vaultId: snapshot.vaultId, protocolVersion: 1, createdAt: head.serverDate,
+          parentIds: [head.value.commitId], replicaId: "test", changes: [{kind: "set-entry", entry: expired}]}});
+      await expect(service.readHistoricalRevision(entry.entryId, backup.revisionId)).rejects.toThrow("expired");
+      await expect(service.restoreRevision(entry.entryId, backup.revisionId)).rejects.toThrow("expired");
+      expect(local.readText("article.md")).toBe("remote article");
+    });
+
     it("keeps unrelated Import Candidates unapproved through reviews, imports and restart", async () => {
       const {service, remote, local, cache} = await setup();
       await local.write("private-unreviewed.md", new TextEncoder().encode("needs explicit import"));
@@ -717,7 +864,7 @@ describe("SyncService", () => {
       expect((await service.synchronize()).localIssues).toContainEqual({kind: "bootstrap-mismatch", path: "article.md"});
       const review = await service.reviewLocalContent("article.md");
       expect(review.remoteVersions[0]?.preview).toBe("remote other");
-      const copyPath = await service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken);
+      const copyPath = await service.resolveLocalContent("article.md", review.reviewToken, "both");
       expect(local.readText(copyPath!)).toBe(draft);
       expect(local.readText("article.md")).toBe("remote other");
       const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
@@ -753,6 +900,26 @@ describe("SyncService", () => {
       if (name.endsWith(".md")) expect(copyPath).toMatch(/\.md$/);
       expect(local.readText(copyPath!)).toBe("local long-name content");
       expect(local.readText(path)).toBe("remote long-name content");
+    });
+
+    it("retains BOM and line endings in authenticated previews without writing either version", async () => {
+      const {service, remote, local, source, sourceService, cache} = await setup();
+      const remoteText = "\uFEFFremote\r\narticle\r\n";
+      const localText = "\uFEFFlocal\narticle  \n";
+      await source.write("article.md", new TextEncoder().encode(remoteText));
+      await sourceService.synchronize();
+      await local.write("article.md", new TextEncoder().encode(localText));
+      const head = await remote.readHead();
+      const cached = await cache.load();
+      const files = await local.list();
+      const review = await service.reviewLocalContent("article.md");
+      expect(review.localPreview).toBe(localText);
+      expect(review.localModifiedAt).toBe((await local.stat("article.md"))!.modifiedAt);
+      expect(review.remoteVersions[0]?.preview).toBe(remoteText);
+      expect(await remote.readHead()).toEqual(head);
+      expect(await cache.load()).toEqual(cached);
+      expect(await local.list()).toEqual(files);
+      expect(await local.read("article.md")).toEqual(new TextEncoder().encode(localText));
     });
 
     it("preserves a verified local copy before accepting remote and leaves other mismatches blocked", async () => {
@@ -839,7 +1006,9 @@ describe("SyncService", () => {
       const review = await service.reviewLocalContent("article.md");
       expect(review.blockedReason).toContain("device's transfer limit");
       expect(local.readCount).toBe(reads);
-      await expect(service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken)).rejects.toThrow("device's transfer limit");
+      for (const choice of ["local", "remote", "both"] as const) {
+        await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("device's transfer limit");
+      }
     });
 
     it("keeps the original draft after a concurrent remote commit wins the Head race", async () => {

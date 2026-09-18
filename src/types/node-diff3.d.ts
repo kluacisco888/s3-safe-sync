@@ -1,4 +1,9 @@
 declare module "node-diff3" {
+  export function diffIndices<T>(a: T[], b: T[]): Array<{
+    buffer1: [number, number];
+    buffer2: [number, number];
+  }>;
+
   export interface MergeRegion<T> {
     conflict?: {
       a: T[];

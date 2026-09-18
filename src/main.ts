@@ -31,6 +31,7 @@ import {
   type DeferredDownloadEntry,
   type LocalSyncIssue,
   type LocalContentReview,
+  type LocalContentChoice,
   type PossibleRenameResolution,
   type SyncCachePort,
   type SyncProgress,
@@ -200,7 +201,7 @@ export default class S3VaultSyncPlugin
           return false;
         }
         if (!checking) {
-          new VersionHistoryModal(this.app, this, entry).open();
+          this.openVersionHistory(entry.path);
         }
         return true;
       },
@@ -367,13 +368,22 @@ export default class S3VaultSyncPlugin
     return this.runExclusiveSyncService(service => service.reviewLocalContent(path));
   }
 
-  async preserveLocalCopyAndAcceptRemote(path: string, reviewToken: string): Promise<string | undefined> {
+  openVersionHistory(path: string): void {
+    const entry = this.getLiveEntry(path);
+    if (!entry?.history?.length) throw new Error("No recoverable versions are available for this file. Sync to refresh its history.");
+    new VersionHistoryModal(this.app, this, entry).open();
+  }
+
+  readHistoricalRevision(entryId: string, revisionId: string): Promise<Uint8Array> {
+    return this.runExclusiveSyncService(service => service.readHistoricalRevision(entryId, revisionId));
+  }
+
+  async resolveLocalContent(path: string, reviewToken: string, choice: LocalContentChoice): Promise<string | undefined> {
     try {
       const copyPath = await this.runExclusiveSyncService(service =>
-        service.preserveLocalCopyAndAcceptRemote(path, reviewToken),
+        service.resolveLocalContent(path, reviewToken, choice),
       );
       this.pendingLocalIssues = this.pendingLocalIssues.filter(issue => !("path" in issue && issue.path === path));
-      if (copyPath) new Notice(`Local version preserved: ${copyPath}`);
       await this.requestSync();
       return copyPath;
     } catch (error) {
@@ -402,7 +412,7 @@ export default class S3VaultSyncPlugin
       this.pendingLocalIssues = this.pendingLocalIssues.filter(
         (issue) => issue.kind !== "import-candidate" || issue.path !== path,
       );
-      this.setStatus("Idle", "Import Candidate added to the shared Vault.");
+      this.setStatus("Idle", "Local file uploaded to S3 as a new file.");
     } catch (error) {
       this.showError(error);
       throw error;

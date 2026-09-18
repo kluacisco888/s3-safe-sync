@@ -45,20 +45,43 @@ vi.mock("obsidian", () => ({
   },
 }));
 
-import { StatusModal, type StatusModalController } from "../src/plugin/modals";
+import { StatusModal, VersionHistoryModal, type StatusModalController } from "../src/plugin/modals";
 import type { LocalSyncIssue } from "../src/sync/sync-service";
 
 const reviewActions = {
   openSettings: () => {},
+  openVersionHistory: () => {},
   readConflictCandidate: async () => new Uint8Array(),
   openLocalFile: async () => {},
   reviewLocalContent: async (path: string) => ({path, reviewToken: "review", localExists: true,
-    localSize: 5, localPreview: "local", remoteKind: "live" as const,
+    localSize: 5, localModifiedAt: Date.parse("2026-09-17T10:00:00Z"), localPreview: "local", remoteKind: "live" as const,
     remoteVersions: [{size: 6, createdAt: "2026-09-18", preview: "remote"}]}),
-  preserveLocalCopyAndAcceptRemote: async () => "article (local copy).md",
+  resolveLocalContent: async () => "article (local copy).md",
 };
 
 describe("StatusModal", () => {
+  it("offers an authenticated backup preview, expiry and an explicit restore action", async () => {
+    const revision = {revisionId: "backup", blobId: "blob", contentHash: "hash", size: 14,
+      createdAt: "2026-09-18T10:00:00Z", expiresAt: "2026-10-18T10:00:00Z"};
+    const read = vi.fn().mockResolvedValue(new TextEncoder().encode("unsynced draft"));
+    const restore = vi.fn().mockResolvedValue(undefined);
+    const modal = new VersionHistoryModal({} as App, {readHistoricalRevision: read, restoreRevision: restore},
+      {kind: "live", entryId: "entry", path: "article.md", revision: {...revision, revisionId: "current"}, history: [revision]});
+    modal.onOpen();
+    type FakeElement = InstanceType<typeof Element>;
+    const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
+    const nodes = all(modal.contentEl as unknown as FakeElement);
+    expect(nodes.some(node => node.text.includes("recoverable until 2026-10-18T10:00:00Z"))).toBe(true);
+    nodes.find(node => node.text === "Preview")!.events.get("click")!();
+    const preview = opened.at(-1)!;
+    await vi.waitFor(() => expect(all(preview.contentEl).some(node => node.text === "unsynced draft")).toBe(true));
+    expect(read).toHaveBeenCalledWith("entry", "backup");
+    expect(restore).not.toHaveBeenCalled();
+    nodes.find(node => node.text === "Restore")!.events.get("click")!();
+    expect(restore).toHaveBeenCalledWith("entry", "backup");
+    await vi.waitFor(() => expect(restore).toHaveResolved());
+  });
+
   it("adds bulk-deletion and repair actions when the already-open status changes", () => {
     const controller = issueController([]);
     let status = "Idle: ready";
@@ -168,26 +191,153 @@ describe("StatusModal", () => {
     type FakeElement = InstanceType<typeof Element>;
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
     const buttons = all(modal.contentEl as unknown as FakeElement).filter(node => node.tag === "button");
-    expect(buttons.filter(button => button.text === "How to resolve")).toHaveLength(8);
+    expect(buttons.filter(button => button.text === "How to resolve")).toHaveLength(0);
+    const help = all(modal.contentEl as unknown as FakeElement).filter(node =>
+      node.tag === "details" && node.children.some(child => child.text === "Why this needs attention"));
+    expect(help).toHaveLength(8);
+    expect(help.every(node => !node.open)).toBe(true);
     expect(buttons.filter(button => button.text === "Copy path")).toHaveLength(8);
-    expect(buttons.filter(button => button.text === "Review versions")).toHaveLength(3);
+    expect(buttons.filter(button => button.text === "Compare and resolve")).toHaveLength(3);
   });
 
   it("shows both previews before dispatching an explicitly confirmed preservation", async () => {
     const controller = issueController([{kind: "bootstrap-mismatch", path: "article.md"}]);
     const preserve = vi.fn(async () => "article (local copy).md");
-    controller.preserveLocalCopyAndAcceptRemote = preserve;
+    controller.resolveLocalContent = preserve;
     const modal = new StatusModal({} as App, controller);
     modal.onOpen();
     type FakeElement = InstanceType<typeof Element>;
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
-    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Review versions")!.events.get("click")!();
+    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Compare and resolve")!.events.get("click")!();
     const review = opened.at(-1)!;
     await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "remote")).toBe(true));
     expect(all(review.contentEl).some(node => node.text === "local")).toBe(true);
     expect(preserve).not.toHaveBeenCalled();
-    all(review.contentEl).find(node => node.text === "Preserve local copy and accept remote")!.events.get("click")!();
-    expect(preserve).toHaveBeenCalledWith("article.md", "review");
+    const nodes = all(review.contentEl);
+    expect(nodes.findIndex(node => node.text === "Keep both (local copy)"))
+      .toBeLessThan(nodes.findIndex(node => node.tag === "pre"));
+    all(review.contentEl).find(node => node.text === "Keep both (local copy)")!.events.get("click")!();
+    expect(preserve).toHaveBeenCalledWith("article.md", "review", "both");
+    await vi.waitFor(() => expect(preserve).toHaveResolved());
+  });
+
+  it("highlights local and remote differences without writing either version", async () => {
+    const controller = issueController([{kind: "bootstrap-mismatch", path: "article.md"}]);
+    controller.reviewLocalContent = async path => ({path, reviewToken: "review", localExists: true,
+      localSize: 27, localPreview: "# Article\nshared\nlocal edit\n", remoteKind: "live",
+      remoteVersions: [{size: 28, createdAt: "2026-09-18", preview: "# Article\nshared\nremote edit\n"}]});
+    const preserve = vi.fn();
+    controller.resolveLocalContent = preserve;
+    const modal = new StatusModal({} as App, controller);
+    modal.onOpen();
+    type FakeElement = InstanceType<typeof Element>;
+    const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
+    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Compare and resolve")!.events.get("click")!();
+    const review = opened.at(-1)!;
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "− remote edit")).toBe(true));
+    expect(all(review.contentEl).some(node => node.text === "+ local edit")).toBe(true);
+    expect(all(review.contentEl).some(node => node.text === "1 remote-only line · 1 local-only line")).toBe(true);
+    const fullVersions = all(review.contentEl).filter(node => node.tag === "details");
+    expect(fullVersions).toHaveLength(2);
+    expect(fullVersions.every(node => !node.open)).toBe(true);
+    expect(preserve).not.toHaveBeenCalled();
+  });
+
+  it.each([["Use local version", "local"], ["Use S3 version", "remote"], ["Keep both (local copy)", "both"]] as const)(
+    "offers %s with clear consequences, timestamps and access to recovery", async (label, choice) => {
+      const controller = issueController([{kind: "bootstrap-mismatch", path: "article.md"}]);
+      const resolve = vi.fn().mockResolvedValue(choice === "both" ? "article (local copy).md" : undefined);
+      const history = vi.fn();
+      controller.resolveLocalContent = resolve;
+      controller.openVersionHistory = history;
+      const modal = new StatusModal({} as App, controller);
+      modal.onOpen();
+      type FakeElement = InstanceType<typeof Element>;
+      const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
+      all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Compare and resolve")!.events.get("click")!();
+      const review = opened.at(-1)!;
+      await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === label)).toBe(true));
+      const nodes = all(review.contentEl);
+      expect(nodes.some(node => node.text.startsWith("Local last modified:"))).toBe(true);
+      expect(nodes.some(node => node.text.startsWith("S3 version recorded:"))).toBe(true);
+      expect(nodes.some(node => node.text.includes("30 days"))).toBe(true);
+      expect(nodes.some(node => node.text === "Decide later")).toBe(true);
+      expect(resolve).not.toHaveBeenCalled();
+      nodes.find(node => node.text === label)!.events.get("click")!();
+      expect(resolve).toHaveBeenCalledWith("article.md", "review", choice);
+      expect(nodes.filter(node => ["Use local version", "Use S3 version", "Keep both (local copy)"].includes(node.text))
+        .every(node => node.disabled)).toBe(true);
+      await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Resolution complete")).toBe(true));
+      if (choice !== "both") {
+        all(review.contentEl).find(node => node.text === "Open version history")!.events.get("click")!();
+        expect(history).toHaveBeenCalledWith("article.md");
+      } else expect(all(review.contentEl).some(node => node.text.includes("article (local copy).md"))).toBe(true);
+    },
+  );
+
+  it("can postpone the choice without accepting either version", async () => {
+    const controller = issueController([{kind: "bootstrap-mismatch", path: "article.md"}]);
+    const resolve = vi.fn();
+    controller.resolveLocalContent = resolve;
+    const modal = new StatusModal({} as App, controller);
+    modal.onOpen();
+    type FakeElement = InstanceType<typeof Element>;
+    const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
+    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Compare and resolve")!.events.get("click")!();
+    const review = opened.at(-1)! as typeof opened[number] & {closed: boolean};
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Use local version")).toBe(true));
+    all(review.contentEl).find(node => node.text === "Decide later")!.events.get("click")!();
+    expect(review.closed).toBe(true);
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("explains unavailable text comparisons and respects device restrictions (blocked=%s)", async blocked => {
+    const controller = issueController([{kind: "deferred-local-edit", path: "large.bin"}]);
+    controller.reviewLocalContent = async path => ({path, reviewToken: "review", localExists: true,
+      localSize: 300_000, remoteKind: "live", remoteVersions: [{size: 300_000, createdAt: "2026-09-18"}],
+      blockedReason: blocked ? "This review exceeds this device's transfer limit." : undefined});
+    const preserve = vi.fn();
+    controller.resolveLocalContent = preserve;
+    const modal = new StatusModal({} as App, controller);
+    modal.onOpen();
+    type FakeElement = InstanceType<typeof Element>;
+    const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
+    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Compare and resolve")!.events.get("click")!();
+    const review = opened.at(-1)!;
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text.startsWith("Line comparison unavailable:"))).toBe(true));
+    expect(all(review.contentEl).some(node => node.text === "Keep both (local copy)")).toBe(!blocked);
+    expect(preserve).not.toHaveBeenCalled();
+  });
+
+  it("reloads a failed comparison and requires fresh confirmation after either version changes", async () => {
+    const controller = issueController([{kind: "bootstrap-mismatch", path: "article.md"}]);
+    controller.reviewLocalContent = vi.fn().mockRejectedValueOnce(new Error("Network disconnected"))
+      .mockResolvedValueOnce(await reviewActions.reviewLocalContent("article.md"))
+      .mockResolvedValueOnce({...await reviewActions.reviewLocalContent("article.md"), reviewToken: "fresh", localPreview: "fresh local"});
+    const preserve = vi.fn().mockRejectedValueOnce(new Error("Local or remote content changed. Review the versions again."))
+      .mockResolvedValueOnce("article (local copy).md");
+    controller.resolveLocalContent = preserve;
+    const modal = new StatusModal({} as App, controller);
+    modal.onOpen();
+    type FakeElement = InstanceType<typeof Element>;
+    const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
+    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Compare and resolve")!.events.get("click")!();
+    const review = opened.at(-1)!;
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Retry review")).toBe(true));
+    expect(preserve).not.toHaveBeenCalled();
+    all(review.contentEl).find(node => node.text === "Retry review")!.events.get("click")!();
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Keep both (local copy)")).toBe(true));
+    const confirm = all(review.contentEl).find(node => node.text === "Keep both (local copy)")!;
+    confirm.events.get("click")!();
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Reload review")).toBe(true));
+    expect(confirm.disabled).toBe(true);
+    confirm.events.get("click")!();
+    expect(preserve).toHaveBeenCalledTimes(1);
+    all(review.contentEl).find(node => node.text === "Reload review")!.events.get("click")!();
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "+ fresh local")).toBe(true));
+    expect(preserve).toHaveBeenCalledTimes(1);
+    all(review.contentEl).find(node => node.text === "Keep both (local copy)")!.events.get("click")!();
+    expect(preserve).toHaveBeenLastCalledWith("article.md", "fresh", "both");
     await vi.waitFor(() => expect(preserve).toHaveResolved());
   });
   it.each(["bootstrap-mismatch", "resolution-mismatch", "deferred-local-edit"] as const)(
@@ -208,7 +358,7 @@ describe("StatusModal", () => {
       type FakeElement = InstanceType<typeof Element>;
       const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
       expect(all(modal.contentEl as unknown as FakeElement).some(node =>
-        node.tag === "button" && node.text === "Review versions",
+        node.tag === "button" && node.text === "Compare and resolve",
       )).toBe(true);
     },
   );

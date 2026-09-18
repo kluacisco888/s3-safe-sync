@@ -142,9 +142,9 @@ liveDescribe("AwsS3ObjectStore live integration", () => {
     expect(downloaded?.body.at(-1)).toBe(255);
   }, 20_000);
 
-  it("preserves both versions after a first-connect content mismatch", async () => {
+  it.each(["both", "local", "remote"] as const)("preserves both versions after a first-connect content mismatch (%s)", async choice => {
     const remote = await RemoteStore.open({objects: multipartObjects,
-      prefix: `${testPrefix}/content-review`, vaultKey: crypto.getRandomValues(new Uint8Array(32))});
+      prefix: `${testPrefix}/content-review-${choice}`, vaultKey: crypto.getRandomValues(new Uint8Array(32))});
     const makeDevice = (initial: string) => {
       let clock = 1;
       const files = new Map([["article.md", {body: new TextEncoder().encode(initial), modifiedAt: clock}]]);
@@ -174,7 +174,26 @@ liveDescribe("AwsS3ObjectStore live integration", () => {
     await second.local.write("private-unreviewed.md", new TextEncoder().encode("explicit import required"));
     expect((await second.service.synchronize()).localIssues).toContainEqual({kind: "bootstrap-mismatch", path: "article.md"});
     const review = await second.service.reviewLocalContent("article.md");
-    const copyPath = await second.service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken);
+    const copyPath = await second.service.resolveLocalContent("article.md", review.reviewToken, choice);
+    if (choice !== "both") {
+      const chosen = choice === "local" ? "local unsynced test version" : "remote test version";
+      const unchosen = choice === "local" ? "remote test version" : "local unsynced test version";
+      expect(new TextDecoder().decode(await second.local.read("article.md"))).toBe(chosen);
+      expect((await second.local.list()).map(file => file.path)).toEqual(["article.md", "private-unreviewed.md"]);
+      const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      const entry = Object.values(snapshot.entries).find(value => value.path === "article.md");
+      if (entry?.kind !== "live") throw new Error("Expected a live test Entry");
+      expect(new TextDecoder().decode(await remote.readBlob(entry.revision.blobId))).toBe(chosen);
+      const backup = entry.history![0]!;
+      expect(new TextDecoder().decode(await second.service.readHistoricalRevision(entry.entryId, backup.revisionId))).toBe(unchosen);
+      expect(backup.expiresAt).toBeDefined();
+      expect((await second.service.synchronize()).localIssues).toEqual([{kind: "import-candidate", path: "private-unreviewed.md"}]);
+      await first.service.synchronize();
+      expect(new TextDecoder().decode(await first.local.read("article.md"))).toBe(chosen);
+      await second.service.restoreRevision(entry.entryId, backup.revisionId);
+      expect(new TextDecoder().decode(await second.local.read("article.md"))).toBe(unchosen);
+      return;
+    }
     expect(new TextDecoder().decode(await second.local.read("article.md"))).toBe("remote test version");
     expect(new TextDecoder().decode(await second.local.read(copyPath!))).toBe("local unsynced test version");
     const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
