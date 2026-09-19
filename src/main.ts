@@ -15,7 +15,6 @@ import { StatusModal, VersionHistoryModal } from "./plugin/modals";
 import { ObsidianVaultPort, isInSyncScope } from "./plugin/obsidian-vault-port";
 import { SerializedDataWriter } from "./plugin/serialized-data-writer";
 import { SyncSession, SyncStoppedError } from "./plugin/sync-session";
-import { automaticMobileFileLimit } from "./plugin/mobile-file-limit";
 import { formatSyncProgress } from "./plugin/sync-progress";
 import { SyncProgressThrottle } from "./plugin/sync-progress-throttle";
 import {
@@ -119,16 +118,6 @@ const normalizePrefix = (prefix: string): string =>
 
 const ANDROID_DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const ANDROID_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
-
-const mobileAutomaticFileLimit = (path: string): number | undefined => {
-  if (!Platform.isMobile) {
-    return undefined;
-  }
-  const network = (
-    navigator as Navigator & { connection?: { type?: string } }
-  ).connection;
-  return automaticMobileFileLimit(path, true, network?.type);
-};
 
 export default class S3VaultSyncPlugin
   extends Plugin
@@ -819,7 +808,6 @@ export default class S3VaultSyncPlugin
         this.session.assertActive();
         assertTarget();
       }),
-      maxAutomaticFileBytes: mobileAutomaticFileLimit,
       remote,
       onProgress: (progress) => this.updateSyncProgress(progress),
       onIntegrityVerified: check => this.clearVerifiedIntegrityIssue(integrityTarget, check),

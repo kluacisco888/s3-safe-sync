@@ -60,8 +60,8 @@ const initial = async () => {
 };
 
 describe("plugin collision recovery persistence", () => {
-  it.each([{paused: false, deferred: false}, {paused: true, deferred: false}, {paused: false, deferred: true}])(
-    "keeps remaining imports actionable without treating device-limit deferrals as errors (paused=$paused, deferred=$deferred)", async ({paused, deferred}) => {
+  it.each([{paused: false, largeAttachment: false}, {paused: true, largeAttachment: false}, {paused: false, largeAttachment: true}])(
+    "keeps remaining imports actionable and does not size-defer mobile attachments (paused=$paused, largeAttachment=$largeAttachment)", async ({paused, largeAttachment}) => {
     host.stored = {settings: {...DEFAULT_SETTINGS, replicaId: "test", bucket: "fixture", vaultId: "vault"}};
     const data = new Map<string, StoredObject>();
     let sequence = 0;
@@ -76,7 +76,7 @@ describe("plugin collision recovery persistence", () => {
     const vaultKey = new Uint8Array(32);
     const remote = await RemoteStore.open({objects, prefix: "obs-sync", vaultKey});
     const changes: CommitChange[] = [];
-    if (deferred) {
+    if (largeAttachment) {
       host.isMobile = true;
       vi.stubGlobal("navigator", {connection: {type: "cellular"}});
       const body = new Uint8Array(11 * 1024 * 1024);
@@ -110,7 +110,8 @@ describe("plugin collision recovery persistence", () => {
     });
     const secrets = new Map([["s3-vault-sync-access-key-id", "fixture-access"], ["s3-vault-sync-secret-access-key", "fixture-secret"],
       ["s3-vault-sync-vault-key", btoa(String.fromCharCode(...vaultKey))]]);
-    const plugin = await start(new Map([["first.md", "first"], ["second.md", "second"]]), secrets);
+    const files = new Map([["first.md", "first"], ["second.md", "second"]]);
+    const plugin = await start(files, secrets);
     const statuses: string[] = [];
     plugin.onStatusChange(status => statuses.push(status.text));
     await plugin.syncNow();
@@ -124,12 +125,20 @@ describe("plugin collision recovery persistence", () => {
     await plugin.importCandidate("second.md");
     expect(plugin.getLocalIssues()).toEqual([]);
     expect(plugin.getStatusText()).toMatch(paused ? /^Paused:/ : /^Idle:/);
-    if (deferred) {
-      expect(plugin.getDeferredDownloads()).toEqual([{entryId: "large", path: "large.bin", reason: "device-limit", size: 11 * 1024 * 1024}]);
-      expect(plugin.getStatusText()).toContain("Deferred downloads: 1");
+    if (largeAttachment) {
+      expect(plugin.getDeferredDownloads()).toEqual([]);
+      const write = vi.spyOn(ObsidianVaultPort.prototype, "write").mockImplementation(async (path, body) => {
+        files.set(path, new TextDecoder().decode(body));
+      });
+      try {
+        await plugin.syncNow();
+        expect(plugin.getStatusText()).toMatch(/^Idle:/);
+        expect(files.get("large.bin")?.length).toBe(11 * 1024 * 1024);
+        expect(plugin.getDeferredDownloads()).toEqual([]);
+      } finally {write.mockRestore();}
     }
     expect(Object.values((await remote.readSnapshot((await remote.readHead())!.value)).entries).map(entry => entry.path).sort())
-      .toEqual(deferred ? ["first.md", "large.bin", "second.md"] : ["first.md", "second.md"]);
+      .toEqual(largeAttachment ? ["first.md", "large.bin", "second.md"] : ["first.md", "second.md"]);
     plugin.onunload();
   });
 

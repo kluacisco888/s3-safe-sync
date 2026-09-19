@@ -49,11 +49,11 @@ The set of ordinary Vault files eligible for synchronization, excluding Obsidian
 _Avoid_: Entire Vault, backup set
 
 **Deferred Download**:
-A Remote Store Revision known to a mobile Replica but intentionally not materialized there because it exceeds the 50 MB mobile limit; its local absence is not a deletion.
+A Remote Store Revision known to a Replica but not materialized there; its local absence is not a deletion.
 _Avoid_: Pending transfer, ignored file, placeholder
 
 **Unsynced Local Entry**:
-A device-local Vault Entry that cannot be uploaded safely, such as a mobile file above 50 MB, and therefore remains explicitly reported as unprotected.
+A device-local Vault Entry that cannot be uploaded safely and therefore remains explicitly reported as unprotected.
 _Avoid_: Deferred Download, synced file
 
 **Bulk Deletion**:
