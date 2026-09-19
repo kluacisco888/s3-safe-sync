@@ -242,7 +242,7 @@ export class SyncEngine {
         const path = canonicalVaultPath(entry.path), owners = baseOwners.get(path) ?? new Set<string>();
         owners.add(entry.entryId); baseOwners.set(path, owners);
       }
-      for (const entry of Object.values(remote.entries)) if (entry.kind === "live") {
+      for (const entry of Object.values(remote.entries)) if (entry.kind !== "deleted") {
         const path = canonicalVaultPath(entry.path);
         remoteOwners.set(path, (remoteOwners.get(path) ?? 0) + 1);
       }

@@ -4671,6 +4671,31 @@ describe("SyncService", () => {
     expect(local.readText("new.md")).toBe("same");
   });
 
+  it("does not retire a copied move when a conflicted Entry also owns the remote target", async () => {
+    const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "conflicted-target", vaultKey: new Uint8Array(32)});
+    const local = new MemoryVault(), cache = new MemorySyncCache();
+    const service = new SyncService({remote, local, cache, replicaId: "phone"});
+    await local.write("old.md", new TextEncoder().encode("original"));
+    await service.initializeNew("vault");
+    const head = (await remote.readHead())!;
+    const source = Object.values((await remote.readSnapshot(head.value)).entries)[0]!;
+    if (source.kind !== "live") throw new Error("Expected live fixture");
+    await remote.advance({expectedHeadEtag: head.etag, head: {...head.value, commitId: "occupied", generation: 2},
+      commit: {commitId: "occupied", vaultId: "vault", protocolVersion: 1, replicaId: "other", createdAt: head.serverDate,
+        parentIds: [head.value.commitId], changes: [
+          {kind: "set-entry", entry: {...source, path: "new.md"}},
+          {kind: "set-entry", entry: {kind: "conflicted", entryId: "another-entry", path: "new.md", reason: "edit-edit",
+            candidates: [source.revision], materializedContentHash: source.revision.contentHash}},
+        ]}});
+    await local.write("new.md", new TextEncoder().encode("original"));
+    const result = await service.synchronize();
+    expect(result.cacheUpdated).toBe(false);
+    expect(result.localIssues).toEqual([{kind: "path-collision", paths: ["new.md"]}]);
+    expect(local.readText("old.md")).toBe("original");
+    expect(local.readText("new.md")).toBe("original");
+    expect(cache.state!.snapshot.commitId).toBe(head.value.commitId);
+  });
+
   it("preserves both move copies when the authenticated remote recovery is damaged", async () => {
     const objects = new MemoryObjectStore();
     const remote = await RemoteStore.open({objects, prefix: "damaged-move", vaultKey: new Uint8Array(32)});
