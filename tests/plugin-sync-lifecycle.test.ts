@@ -231,6 +231,85 @@ afterEach(() => {
 });
 
 describe("plugin synchronization lifecycle", () => {
+  it("invalidates network recovery when the target changes during the failing request", async () => {
+    const {plugin} = await setup();
+    const execute = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;
+    let fail = true;
+    host.requestUrl.mockImplementation(async (request: Parameters<ObsidianRequestExecutor>[0]) => {
+      if (fail && request.method === "GET" && new URL(request.url).pathname.endsWith("/head")) {
+        fail = false;
+        plugin.getSettings().prefix = "other-prefix";
+        throw new Error("Connection reset after target was edited");
+      }
+      return execute(request);
+    });
+    await plugin.togglePause();
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(plugin.getDiagnostics().records.at(-1)?.finishedAt).toBeDefined());
+    expect(plugin.getDiagnostics().records).toHaveLength(1);
+    expect(plugin.getDiagnostics().nextRetryAt).toBeUndefined();
+    plugin.onunload();
+  });
+
+  it.each(["success", "authentication"])("cancels obsolete retry timers when a queued follow-up ends with %s", async outcome => {
+    const {plugin} = await setup();
+    const execute = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;
+    let fail = true;
+    host.requestUrl.mockImplementation(async (request: Parameters<ObsidianRequestExecutor>[0]) => {
+      if (request.method === "GET" && new URL(request.url).pathname.endsWith("/head")) {
+        if (fail) {
+          fail = false;
+          void plugin.syncNow();
+          return {arrayBuffer: new ArrayBuffer(0), headers: {}, status: 503};
+        }
+        if (outcome === "authentication") return {arrayBuffer: new ArrayBuffer(0), headers: {}, status: 403};
+      }
+      return execute(request);
+    });
+    await plugin.togglePause();
+    expect(plugin.getDiagnostics().records).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(plugin.getDiagnostics().records).toHaveLength(2);
+    expect(plugin.getDiagnostics().nextRetryAt).toBeUndefined();
+    plugin.onunload();
+  });
+
+  it("does not access a changed S3 target after waiting for the initial diagnostic write", async () => {
+    const {plugin, app} = await setup();
+    const write = app.vault.adapter.write.bind(app.vault.adapter);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => {release = resolve;});
+    let waiting = false;
+    vi.spyOn(app.vault.adapter, "write").mockImplementation(async (path, body) => {
+      if (!waiting) {waiting = true; await gate;}
+      await write(path, body);
+    });
+    const requestCount = host.requestUrl.mock.calls.length;
+    const syncing = plugin.togglePause();
+    await vi.waitFor(() => expect(waiting).toBe(true));
+    plugin.getSettings().prefix = "different-prefix";
+    release();
+    await syncing;
+    expect(host.requestUrl.mock.calls.length).toBe(requestCount);
+    expect(plugin.getStatusText()).toContain("S3 target changed");
+    plugin.onunload();
+  });
+
+  it("does not start reading diagnostics after unloading during the existence check", async () => {
+    const {plugin, app} = await setup();
+    plugin.onunload();
+    let finish!: (exists: boolean) => void;
+    vi.spyOn(app.vault.adapter, "exists").mockImplementation(() => new Promise<boolean>(resolve => {finish = resolve;}));
+    const read = vi.spyOn(app.vault.adapter, "read");
+    const replacement = new S3VaultSyncPlugin(app, {id: "s3-vault-sync"} as PluginManifest);
+    const loading = replacement.onload().then(() => "loaded", () => "stopped");
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    replacement.onunload();
+    finish(true);
+    expect(await loading).toBe("stopped");
+    expect(read).not.toHaveBeenCalled();
+  });
+
   it("keeps a retry's accepted Head when an older timed-out PUT arrives late", async () => {
     const {plugin, remote, edit} = await setup();
     const execute = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;

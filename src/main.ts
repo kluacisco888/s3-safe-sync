@@ -188,8 +188,14 @@ export default class S3VaultSyncPlugin
     this.session.assertActive();
     const diagnosticPath = `${this.app.vault.configDir}/plugins/${this.manifest.id}/diagnostics.json`;
     this.diagnostics = new SyncDiagnostics({
-      read: async () => await this.app.vault.adapter.exists(diagnosticPath)
-        ? JSON.parse(await this.app.vault.adapter.read(diagnosticPath)) as unknown : undefined,
+      read: async () => {
+        const exists = await this.app.vault.adapter.exists(diagnosticPath);
+        this.session.assertActive();
+        if (!exists) return undefined;
+        const body = await this.app.vault.adapter.read(diagnosticPath);
+        this.session.assertActive();
+        return JSON.parse(body) as unknown;
+      },
       write: value => this.session.run(() => this.app.vault.adapter.write(diagnosticPath, JSON.stringify(value))),
     });
     await this.session.run(() => this.diagnostics.load());
@@ -989,6 +995,9 @@ export default class S3VaultSyncPlugin
   }: SyncRunOptions): Promise<void> {
     const triggers = [...this.pendingTriggers];
     this.pendingTriggers.clear();
+    // A queued/manual run consumes any recovery timer created by the preceding run.
+    this.clearNetworkRetryTimer();
+    if (triggers.some(trigger => trigger === "manual" || trigger === "resume" || trigger === "integrity-check")) this.networkRetryAttempt = 0;
     const integrityTarget = this.integrityTarget();
     const assertIntegrityTarget = this.captureTargetGuard();
     if (this.networkFailureTarget !== undefined && this.networkFailureTarget !== integrityTarget) {
@@ -1012,6 +1021,8 @@ export default class S3VaultSyncPlugin
     this.activeRun = diagnostic;
     let fullHashVerification = false;
     try {
+      this.session.assertActive();
+      assertIntegrityTarget();
       await this.recoverCollisionRename();
       const dirtySnapshot = this.dirtyPaths.capture();
       const pathRenameSnapshot = this.pathRenames.capture();
@@ -1178,7 +1189,7 @@ export default class S3VaultSyncPlugin
           "A local file changed during synchronization. Retrying after edits settle.",
         );
         this.scheduleAfterLocalChange();
-      } else if (retryableNetwork && this.scheduleNetworkRetry()) {
+      } else if (retryableNetwork && this.scheduleNetworkRetry(integrityTarget)) {
         diagnostic.outcome = "retrying";
       } else {
         diagnostic.outcome = "error";
@@ -1215,12 +1226,16 @@ export default class S3VaultSyncPlugin
     this.networkRetryAt = undefined;
   }
 
-  private scheduleNetworkRetry(): boolean {
-    this.networkFailureTarget = this.integrityTarget();
+  private scheduleNetworkRetry(target: string): boolean {
+    if (this.integrityTarget() !== target) {
+      this.networkFailureTarget = undefined;
+      this.networkRetryAttempt = 0;
+      return false;
+    }
+    this.networkFailureTarget = target;
     const delays = [2_000, 5_000, 15_000];
     const baseDelay = delays[this.networkRetryAttempt];
     if (this.session.signal.aborted || this.data.settings.paused || baseDelay === undefined) return false;
-    const target = this.integrityTarget();
     const delay = baseDelay + Math.floor(Math.random() * baseDelay / 4);
     this.networkRetryAttempt += 1;
     this.networkRetryAt = Date.now() + delay;
