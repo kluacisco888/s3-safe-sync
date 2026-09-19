@@ -239,6 +239,36 @@ afterEach(() => {
 });
 
 describe("plugin synchronization lifecycle", () => {
+  it("invalidates a retry queued behind an exclusive operation when its target changes", async () => {
+    const {plugin, hooks} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    hooks.headFailure = undefined;
+    const execute = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;
+    let held = false, retargetedRequests = 0;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => {release = resolve;});
+    host.requestUrl.mockImplementation(async (request: Parameters<ObsidianRequestExecutor>[0]) => {
+      const path = new URL(request.url).pathname;
+      if (path.startsWith("/queue-other-prefix/")) retargetedRequests++;
+      if (!held && request.method === "GET" && path.endsWith("/head")) {held = true; await gate;}
+      return execute(request);
+    });
+    const reading = plugin.readConflictCandidate("entry-1", "revision-1").catch(() => undefined);
+    await vi.waitFor(() => expect(held).toBe(true));
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(plugin.getDiagnostics().queued).toBe(true);
+    plugin.getSettings().prefix = "queue-other-prefix";
+    release();
+    await reading;
+    await vi.waitFor(() => {
+      expect(plugin.getDiagnostics().queued).toBe(false);
+      expect(plugin.getDiagnostics().records.at(-1)?.finishedAt).toBeDefined();
+    });
+    expect(retargetedRequests).toBe(0);
+    plugin.onunload();
+  });
+
   it("invalidates network recovery when the target changes during the failing request", async () => {
     const {plugin} = await setup();
     const execute = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;

@@ -142,6 +142,7 @@ export default class S3VaultSyncPlugin
   private activeRun: SyncRunRecord | undefined;
   private acceptedCommit: string | undefined;
   private readonly pendingTriggers = new Set<SyncTrigger>();
+  private pendingSyncTarget: string | undefined;
   private pendingBulkDeletion:
     | BulkDeletionPlan
     | undefined;
@@ -983,11 +984,19 @@ export default class S3VaultSyncPlugin
   }: SyncRunOptions): Promise<void> {
     const triggers = [...this.pendingTriggers];
     this.pendingTriggers.clear();
+    const requestedTarget = this.pendingSyncTarget;
+    this.pendingSyncTarget = undefined;
     // A queued/manual run consumes any recovery timer created by the preceding run.
     this.clearNetworkRetryTimer();
     if (triggers.some(trigger => trigger === "manual" || trigger === "resume" || trigger === "integrity-check")) this.networkRetryAttempt = 0;
     const integrityTarget = this.integrityTarget();
     const assertIntegrityTarget = this.captureTargetGuard();
+    if (requestedTarget !== undefined && requestedTarget !== integrityTarget) {
+      this.networkRetryAttempt = 0;
+      this.networkFailureTarget = undefined;
+      this.setStatus("Error", "S3 target changed while synchronization was queued. Check settings and sync again.");
+      return;
+    }
     if (this.networkFailureTarget !== undefined && this.networkFailureTarget !== integrityTarget) {
       this.clearNetworkRetryTimer();
       this.networkRetryAttempt = 0;
@@ -1378,7 +1387,10 @@ export default class S3VaultSyncPlugin
 
   private requestPeriodicSync(trigger: SyncTrigger = "periodic"): Promise<void> {
     if (this.session.signal.aborted) return Promise.resolve();
-    if (!this.syncRequests.isRunning && this.headRetryTimer === undefined && this.networkRetryTimer === undefined) this.pendingTriggers.add(trigger);
+    if (!this.syncRequests.isRunning && this.headRetryTimer === undefined && this.networkRetryTimer === undefined) {
+      this.pendingTriggers.add(trigger);
+      this.pendingSyncTarget = this.integrityTarget();
+    }
     return this.syncRequests.requestPeriodic(
       this.headRetryTimer !== undefined || this.networkRetryTimer !== undefined,
     ).catch((error: unknown) => {
@@ -1392,6 +1404,7 @@ export default class S3VaultSyncPlugin
   ): Promise<void> {
     if (this.session.signal.aborted) return Promise.resolve();
     this.pendingTriggers.add(trigger);
+    this.pendingSyncTarget = this.integrityTarget();
     this.clearHeadRetryTimer();
     this.clearNetworkRetryTimer();
     return this.syncRequests.request(options).catch((error: unknown) => {
