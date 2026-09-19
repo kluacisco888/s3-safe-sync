@@ -10,6 +10,8 @@ const host = vi.hoisted((): {
   beforeLoad?: () => Promise<void>;
   registrationCount: number;
   domEvents: Map<string, Array<() => void>>;
+  mobile: boolean;
+  android: boolean;
 } => ({
   data: undefined,
   notices: [],
@@ -17,6 +19,8 @@ const host = vi.hoisted((): {
   requestUrl: vi.fn(),
   registrationCount: 0,
   domEvents: new Map(),
+  mobile: false,
+  android: false,
 }));
 
 vi.mock("obsidian", () => ({
@@ -32,7 +36,7 @@ vi.mock("obsidian", () => ({
       },
     })};
   },
-  Platform: { isDesktop: false, isDesktopApp: false, isMobile: false },
+  Platform: { isDesktop: false, isDesktopApp: false, get isMobile() {return host.mobile;}, get isAndroidApp() {return host.android;} },
   Plugin: class {
     constructor(public app: unknown, public manifest: unknown) {}
     async loadData() { await host.beforeLoad?.(); return structuredClone(host.data); }
@@ -66,7 +70,7 @@ import { RemoteStore } from "../src/storage/remote-store";
 import { ObsidianVaultPort } from "../src/plugin/obsidian-vault-port";
 import { withVaultMutationLock } from "../src/plugin/safe-vault-write";
 
-const setup = async (initialized = true, configDir = ".obsidian") => {
+const setup = async (initialized = true, configDir = ".obsidian", initialFile = {path: "notes/example.md", text: "Original article."}) => {
   vi.useFakeTimers();
   vi.stubGlobal("window", globalThis);
   vi.stubGlobal("document", { visibilityState: "visible" });
@@ -151,16 +155,17 @@ const setup = async (initialized = true, configDir = ".obsidian") => {
     }),
     prefix: "test-prefix", vaultKey,
   });
-  await remote.writeBlob("original-blob", new TextEncoder().encode("Original article."));
+  const initialBytes = new TextEncoder().encode(initialFile.text);
+  await remote.writeBlob("original-blob", initialBytes);
   const entry = {
-    entryId: "entry-1", kind: "live" as const, path: "notes/example.md",
+    entryId: "entry-1", kind: "live" as const, path: initialFile.path,
     revision: {
       blobId: "original-blob", contentHash: "", createdAt: new Date().toUTCString(),
-      revisionId: "revision-1", size: 17,
+      revisionId: "revision-1", size: initialBytes.byteLength,
     },
   };
   const { sha256Content } = await import("../src/sync/content-hash");
-  entry.revision.contentHash = await sha256Content(new TextEncoder().encode("Original article."));
+  entry.revision.contentHash = await sha256Content(initialBytes);
   await remote.initialize({
     commit: {
       changes: [{ kind: "set-entry", entry }], commitId: "initial", createdAt: new Date().toUTCString(),
@@ -168,8 +173,8 @@ const setup = async (initialized = true, configDir = ".obsidian") => {
     },
     head: { commitId: "initial", generation: 1, protocolVersion: 1, vaultId: "vault-1" },
   });
-  let text = "Original article.";
-  const file = Object.assign(new TFile(), { path: entry.path, stat: { mtime: 1, size: 17 } });
+  let text = initialFile.text;
+  const file = Object.assign(new TFile(), { path: entry.path, stat: { mtime: 1, size: initialBytes.byteLength } });
   const events = new Map<string, Array<(file: TFile, oldPath?: string) => void>>();
   const edit = (value: string) => {
     text = value;
@@ -207,7 +212,7 @@ const setup = async (initialized = true, configDir = ".obsidian") => {
     settings: { ...DEFAULT_SETTINGS, bucket: "test-bucket", prefix: "test-prefix", paused: true, replicaId: "desktop", vaultId: "vault-1" },
     lastFullHashVerificationAt: Date.now(),
     cache: {
-      files: { [entry.path]: { path: entry.path, modifiedAt: 1, size: 17, entryId: entry.entryId, contentHash: entry.revision.contentHash } },
+      files: { [entry.path]: { path: entry.path, modifiedAt: 1, size: initialBytes.byteLength, entryId: entry.entryId, contentHash: entry.revision.contentHash } },
       snapshot: { commitId: "initial", entries: { [entry.entryId]: entry }, protocolVersion: 1, vaultId: "vault-1" },
       unmaterializedEntryIds: [],
     },
@@ -225,6 +230,9 @@ const setup = async (initialized = true, configDir = ".obsidian") => {
 };
 
 afterEach(() => {
+  host.mobile = false;
+  host.android = false;
+  host.requestUrl.mockClear();
   vi.clearAllTimers();
   vi.useRealTimers();
   vi.unstubAllGlobals();
@@ -541,6 +549,31 @@ describe("plugin synchronization lifecycle", () => {
     }
     replacement.onunload();
   });
+  it.each([
+    {device: "Android Wi-Fi", mobile: true, android: true, network: "wifi", mib: 51},
+    {device: "iOS Wi-Fi", mobile: true, android: false, network: "wifi", mib: 51},
+    {device: "Android cellular", mobile: true, android: true, network: "cellular", mib: 11},
+    {device: "iOS unknown network", mobile: true, android: false, network: undefined, mib: 11},
+    {device: "desktop", mobile: false, android: false, network: undefined, mib: 51},
+  ])("keeps accepted large attachments synchronized on $device", async ({mobile, android, network, mib}) => {
+    host.mobile = mobile;
+    host.android = android;
+    vi.stubGlobal("navigator", {connection: {type: network}});
+    const {plugin, remote, localText} = await setup(true, ".obsidian", {
+      path: "attachments/large.bin", text: "x".repeat(mib * 1024 * 1024),
+    });
+    try {
+      await plugin.togglePause();
+      expect(plugin.getStatusText()).toMatch(/^Idle:/);
+      expect(plugin.getLocalIssues()).toEqual([]);
+      expect(plugin.getDeferredDownloads()).toEqual([]);
+      await plugin.syncNow();
+      expect(plugin.getLocalIssues()).toEqual([]);
+      expect(plugin.getDeferredDownloads()).toEqual([]);
+      expect(localText().length).toBe(mib * 1024 * 1024);
+      expect((await remote.readHead())!.value.generation).toBe(1);
+    } finally {plugin.onunload();}
+  }, 120_000);
 
   it.each([".obsidian", ".custom-config"])("does not persist a staging backup as a user rename with configDir=%s", async configDir => {
     const {plugin, rename} = await setup(true, configDir);

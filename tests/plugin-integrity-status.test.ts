@@ -3,12 +3,12 @@ import type { App, PluginManifest } from "obsidian";
 interface FixtureRequest {url: string; method: string; headers: Record<string, string>; body?: ArrayBuffer}
 const host = vi.hoisted(() => {
   const stored: Record<string, unknown> = {};
-  return {stored, request: vi.fn<(request: FixtureRequest) => Promise<unknown>>(), limit: undefined as number | undefined};
+  return {stored, request: vi.fn<(request: FixtureRequest) => Promise<unknown>>(), mobile: false};
 });
 vi.mock("obsidian", () => ({
   App: class {}, PluginSettingTab: class {}, Modal: class {}, Setting: class {}, FileSystemAdapter: class {},
   TFile: class { constructor(public path: string, public stat: {mtime: number; size: number}) {} },
-  Platform: {isDesktop: false, isDesktopApp: false, get isMobile() {return host.limit !== undefined;}, isAndroidApp: false},
+  Platform: {isDesktop: false, isDesktopApp: false, get isMobile() {return host.mobile;}, isAndroidApp: false},
   normalizePath: (path: string) => path, requestUrl: host.request,
   Notice: class {messageEl = {createEl: () => ({addEventListener: () => {}})}; hide() {}},
   Plugin: class {
@@ -18,7 +18,6 @@ vi.mock("obsidian", () => ({
     addSettingTab() {} addRibbonIcon() {} addCommand() {} registerDomEvent() {} registerInterval() {}
   },
 }));
-vi.mock("../src/plugin/mobile-file-limit", () => ({automaticMobileFileLimit: () => host.limit}));
 import { TFile } from "obsidian";
 import S3VaultSyncPlugin from "../src/main";
 import { sha256Content } from "../src/sync/content-hash";
@@ -32,7 +31,7 @@ afterEach(() => {
   for (const plugin of activePlugins.splice(0)) plugin.onunload();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
-  host.limit = undefined;
+  host.mobile = false;
   host.request.mockReset();
 });
 
@@ -188,22 +187,22 @@ it("clears only verified failures when two different integrity issues are pendin
   expect(host.stored.pendingIntegrityChecks).toEqual([]);
 });
 
-it("keeps automatic rechecks bounded but clears an oversized issue after an explicitly requested download verifies it", async () => {
+it("rechecks authenticated recovery on mobile without a separate transfer ceiling", async () => {
   const {plugin, corrupt, files} = await fixture();
   const damaged = corrupt("/current-blob");
-  host.limit = 1;
+  host.mobile = true;
   await expect(plugin.downloadDeferred("existing")).rejects.toThrow("No authenticated remote recovery");
   damaged.restore();
   await plugin.syncNow();
-  expect(plugin.getStatusText()).toContain("transfer limit");
-  expect(host.stored.pendingIntegrityChecks).toHaveLength(1);
+  expect(plugin.getStatusText()).not.toContain("transfer limit");
+  expect(host.stored.pendingIntegrityChecks).toEqual([]);
   // Substitute only the filesystem boundary; real service still verifies ciphertext and hashes.
   vi.spyOn(ObsidianVaultPort.prototype, "write").mockImplementation(async (path, body) => {
     files.set(path, new TextDecoder().decode(body));
   });
   await plugin.downloadDeferred("existing");
   expect(host.stored.pendingIntegrityChecks).toEqual([]);
-  expect(plugin.getStatusText()).toMatch(/^Idle:/);
+  expect(plugin.getStatusText()).toMatch(/^Action required:/); // Unrelated import still needs review.
   expect(files.get("existing.md")).toBe("current");
 });
 
