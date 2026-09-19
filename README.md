@@ -37,6 +37,14 @@ It uses stable entry identities, permanent deletion records, immutable encrypted
 
 BRAT installs and updates the release assets while preserving this plugin's `data.json` and Obsidian SecretStorage values. Do not change the plugin ID or delete its entire plugin directory if you want to retain the existing local configuration.
 
+## Local diagnostics and network recovery
+
+The sync status window shows the last recorded successful run, the device's durably accepted Commit, the last observed S3 Head, queued checks, known transfer counts, error category, and the next scheduled retry. Unknown transfer counts are shown as not yet planned. Publishing to S3 is not confirmation that other devices have received it; deferred files can remain even when Commit IDs match.
+
+Ordinary automatic/manual sync runs are recorded locally in `.obsidian/plugins/s3-vault-sync/diagnostics.json` (under the active configuration directory). The journal retains at most 1,000 records for seven days and displays the latest 20. It records trigger reasons, phases/durations, acknowledged publication and cache acceptance separately, HTTP attempt counts and payload byte totals; these totals are not a billing or wire-traffic meter. A run left unfinished across reload is marked interrupted. **Copy diagnostics** exports allowlisted JSON, with a selectable text fallback if clipboard access is unavailable. The journal is not encrypted at rest and contains no note contents, file paths, credentials, request URLs/headers/bodies, or raw exception messages. It is not uploaded as shared S3 Sync Audit data. Diagnostic read/write failures show a warning without changing sync data.
+
+Temporary transport failures, timeouts, and HTTP 408/429/500/502/503/504 schedule at most three fast retries, with jittered delays based on 2, 5 and 15 seconds. Each retry enters the existing serial queue, re-reads Head and reconciles again; it never blindly repeats a timed-out write. An online event can bring a pending network recovery forward. Pause or unload cancels scheduled retries, while already-dispatched host requests may still finish. After fast retries are exhausted, normal foreground polling remains available; manual sync or Resume starts a fresh retry budget. Authentication, integrity and local-file errors do not receive these network retries. Initialization and explicit per-file recovery operations keep their existing user-driven retry flow.
+
 ## Configuration
 
 For each device, enter:
@@ -154,6 +162,8 @@ npm test
 npm run build
 npm run lint
 ```
+
+The lifecycle tests include a loopback HTTP fixture with real TCP resets/held responses and temporary note/diagnostic files. Run just these checks with `npm test -- tests/plugin-sync-lifecycle.test.ts -t loopback`. The fixture binds only to `127.0.0.1`, uses dummy credentials and emulated S3 conditional-write semantics, and cleans up its server and files. Timeout/backoff clocks are accelerated. This validates the plugin's network recovery and disk diagnostic flow without a phone or AWS account; it is not a real Obsidian-host, AWS-service, or mobile lifecycle test.
 
 Release builds produce `main.js`. A GitHub release must attach `main.js`, `manifest.json`, and `styles.css` as individual assets, and its tag must exactly match the version in `manifest.json`.
 

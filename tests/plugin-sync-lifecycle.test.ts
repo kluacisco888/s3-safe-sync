@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { App, PluginManifest } from "obsidian";
+import { createServer, request as httpRequest } from "node:http";
+import { access, mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
+import { readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
 const host = vi.hoisted((): {
   data: unknown;
@@ -9,6 +14,7 @@ const host = vi.hoisted((): {
   beforeSave?: () => Promise<void>;
   beforeLoad?: () => Promise<void>;
   registrationCount: number;
+  domEvents: Map<string, Array<() => void>>;
   mobile: boolean;
   android: boolean;
 } => ({
@@ -17,6 +23,7 @@ const host = vi.hoisted((): {
   noticeActions: [],
   requestUrl: vi.fn(),
   registrationCount: 0,
+  domEvents: new Map(),
   mobile: false,
   android: false,
 }));
@@ -42,7 +49,9 @@ vi.mock("obsidian", () => ({
     addCommand() { host.registrationCount += 1; }
     addRibbonIcon() {}
     addSettingTab() {}
-    registerDomEvent() {}
+    registerDomEvent(_target: unknown, name: string, listener: () => void) {
+      host.domEvents.set(name, [...(host.domEvents.get(name) ?? []), listener]);
+    }
     registerEvent() {}
     registerInterval() {}
   },
@@ -61,11 +70,14 @@ import { CredentialStore } from "../src/plugin/credential-store";
 import { DEFAULT_SETTINGS } from "../src/plugin/settings";
 import { AwsS3ObjectStore } from "../src/storage/aws-s3-object-store";
 import { executeObsidianHttpRequest } from "../src/storage/obsidian-http";
+import type { ObsidianRequestExecutor } from "../src/storage/obsidian-request-adapter";
 import { RemoteStore } from "../src/storage/remote-store";
 import { ObsidianVaultPort } from "../src/plugin/obsidian-vault-port";
 import { withVaultMutationLock } from "../src/plugin/safe-vault-write";
 
-const setup = async (initialized = true, configDir = ".obsidian", initialFile = {path: "notes/example.md", text: "Original article."}) => {
+const cleanups: Array<() => Promise<void>> = [];
+
+const setup = async (initialized = true, configDir = ".obsidian", initialFile = {path: "notes/example.md", text: "Original article."}, loopback = false) => {
   vi.useFakeTimers();
   vi.stubGlobal("window", globalThis);
   vi.stubGlobal("document", { visibilityState: "visible" });
@@ -74,14 +86,19 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
   host.beforeSave = undefined;
   host.beforeLoad = undefined;
   host.registrationCount = 0;
+  host.domEvents.clear();
   const objects = new Map<string, { body: Uint8Array; etag: string }>();
+  const diagnosticFiles = new Map<string, string>();
   let sequence = 0;
   const hooks: {
     beforeBlobRead?: () => void;
-    headFailure?: "network" | "corrupt";
+    headFailure?: "network" | "corrupt" | "forbidden";
     failNextBlobPut?: boolean;
     afterProbePut?: () => void;
+    afterHeadPut?: () => void;
+    wireFault?: "reset-read" | "hang-read" | "drop-head-put";
   } = {};
+  const wire = {requests: 0, headPublications: 0, faults: 0, signedRequests: 0};
   host.requestUrl.mockImplementation(async (request: {
     url: string; method: string; body?: ArrayBuffer; headers: Record<string, string>;
   }) => {
@@ -102,7 +119,7 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
       body = stored?.body ?? body;
       etag = stored?.etag;
       if (key.endsWith("/head") && hooks.headFailure) {
-        status = hooks.headFailure === "network" ? 503 : 200;
+        status = hooks.headFailure === "network" ? 503 : hooks.headFailure === "forbidden" ? 403 : 200;
         body = new TextEncoder().encode("invalid remote response");
       }
     } else if (request.method === "PUT") {
@@ -124,12 +141,66 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
       throw new Error(`Unexpected request method: ${request.method}`);
     }
     if (request.method === "PUT" && key.includes(".s3-vault-sync-probe-")) hooks.afterProbePut?.();
+    if (request.method === "PUT" && key.endsWith("/head") && status === 200) hooks.afterHeadPut?.();
     return {
       arrayBuffer: body.slice().buffer,
       headers: { date: new Date().toUTCString(), "last-modified": new Date().toUTCString(), ...(etag ? { etag } : {}) },
       status,
     };
   });
+  let localRoot: string | undefined;
+  if (loopback) {
+    localRoot = await mkdtemp(join(tmpdir(), "s3-sync-loopback-"));
+    const ownedRoot = localRoot;
+    cleanups.push(() => rm(ownedRoot, {recursive: true, force: true}));
+    await mkdir(dirname(join(localRoot, initialFile.path)), {recursive: true});
+    await writeFile(join(localRoot, initialFile.path), initialFile.text);
+    const protocol = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;
+    const server = createServer((request, response) => {
+      void (async () => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of request) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array));
+        const body = Buffer.concat(chunks);
+        const url = new URL(request.url ?? "/", "http://127.0.0.1");
+        wire.requests++;
+        if (request.headers.authorization?.startsWith("AWS4-HMAC-SHA256")) wire.signedRequests++;
+        const fault = hooks.wireFault;
+        if (request.method === "GET" && url.pathname.endsWith("/head") && (fault === "reset-read" || fault === "hang-read")) {
+          hooks.wireFault = undefined;
+          wire.faults++;
+          if (fault === "reset-read") response.destroy();
+          return;
+        }
+        const result = await protocol({url: url.toString(), method: request.method,
+          headers: Object.fromEntries(Object.entries(request.headers).flatMap(([key, value]) => value === undefined ? [] : [[key, Array.isArray(value) ? value.join(",") : value]])),
+          body: Uint8Array.from(body).buffer});
+        if (request.method === "PUT" && url.pathname.endsWith("/head") && result.status === 200) {
+          wire.headPublications++;
+          if (fault === "drop-head-put") {hooks.wireFault = undefined; wire.faults++; response.destroy(); return;}
+        }
+        response.writeHead(result.status, result.headers);
+        response.end(Buffer.from(result.arrayBuffer));
+      })().catch(() => response.destroy());
+    });
+    cleanups.push(async () => {server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));});
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Expected a loopback port");
+    host.requestUrl.mockImplementation((request: Parameters<ObsidianRequestExecutor>[0]) => new Promise<Awaited<ReturnType<ObsidianRequestExecutor>>>((resolve, reject) => {
+      const original = new URL(request.url);
+      const connection = httpRequest({hostname: "127.0.0.1", port: address.port, path: original.pathname + original.search,
+        method: request.method, headers: request.headers, agent: false}, response => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("error", reject);
+        response.on("aborted", () => reject(new Error("Response connection closed")));
+        response.on("end", () => resolve({status: response.statusCode ?? 0, arrayBuffer: Uint8Array.from(Buffer.concat(chunks)).buffer,
+          headers: Object.fromEntries(Object.entries(response.headers).flatMap(([key, value]) => value === undefined ? [] : [[key, Array.isArray(value) ? value.join(",") : value]]))}));
+      });
+      connection.on("error", reject);
+      connection.end(typeof request.body === "string" ? request.body : request.body ? Buffer.from(request.body) : undefined);
+    }));
+  }
   const secrets = new Map<string, string>();
   const secretStorage = {
     getSecret: (id: string) => secrets.get(id) ?? null,
@@ -169,6 +240,7 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
   const events = new Map<string, Array<(file: TFile, oldPath?: string) => void>>();
   const edit = (value: string) => {
     text = value;
+    if (localRoot) writeFileSync(join(localRoot, initialFile.path), text);
     file.stat = { ...file.stat, mtime: file.stat.mtime + 1, size: new TextEncoder().encode(text).length };
     for (const listener of events.get("modify") ?? []) listener(file);
   };
@@ -182,10 +254,14 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
     secretStorage,
     vault: {
       configDir,
-      adapter: { exists: () => Promise.resolve(false) },
+      adapter: {
+        exists: (path: string) => localRoot ? access(join(localRoot, path)).then(() => true, () => false) : Promise.resolve(diagnosticFiles.has(path)),
+        read: async (path: string) => { if (localRoot) return readFile(join(localRoot, path), "utf8"); const body = diagnosticFiles.get(path); if (body === undefined) throw new Error("Missing file"); return body; },
+        write: async (path: string, body: string) => { if (localRoot) {await mkdir(dirname(join(localRoot, path)), {recursive: true}); await writeFile(join(localRoot, path), body);} else diagnosticFiles.set(path, body); },
+      },
       getFiles: () => [file],
       getAbstractFileByPath: (path: string) => path === file.path ? file : null,
-      readBinary: () => Promise.resolve(new TextEncoder().encode(text).buffer),
+      readBinary: () => localRoot ? readFile(join(localRoot, initialFile.path)).then(body => Uint8Array.from(body).buffer) : Promise.resolve(new TextEncoder().encode(text).buffer),
       on: (name: string, listener: (file: TFile, oldPath?: string) => void) => {
         const listeners = events.get(name) ?? [];
         listeners.push(listener);
@@ -213,10 +289,12 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
   }
   const plugin = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
   await plugin.onload();
-  return { plugin, remote, hooks, edit, rename, localText: () => text, app, objects };
+  if (loopback) cleanups.push(() => {plugin.onunload(); return Promise.resolve();});
+  return { plugin, remote, hooks, edit, rename, localText: () => localRoot ? readFileSync(join(localRoot, initialFile.path), "utf8") : text, app, objects, diagnosticFiles, wire, localRoot };
 };
 
-afterEach(() => {
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   host.mobile = false;
   host.android = false;
   host.requestUrl.mockClear();
@@ -226,6 +304,452 @@ afterEach(() => {
 });
 
 describe("plugin synchronization lifecycle", () => {
+  it("cancels a held loopback request on unload and recognizes the unfinished disk record on reload", async () => {
+    const {plugin, app, hooks, wire} = await setup(true, ".obsidian", undefined, true);
+    hooks.wireFault = "hang-read";
+    const syncing = plugin.togglePause();
+    await vi.waitFor(() => expect(wire.faults).toBe(1));
+    await plugin.togglePause();
+    plugin.onunload();
+    await syncing;
+    const requests = wire.requests;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(wire.requests).toBe(requests);
+    const replacement = new S3VaultSyncPlugin(app, {id: "s3-vault-sync"} as PluginManifest);
+    await replacement.onload();
+    expect(replacement.getDiagnostics().records.at(-1)?.outcome).toBe("interrupted");
+    expect(replacement.getDiagnostics().lastSuccessAt).toBeUndefined();
+    expect(replacement.getDiagnostics().acceptedCommit).toBe("initial");
+    replacement.onunload();
+  }, 20_000);
+
+  it("uploads the complete latest disk content after a real loopback 503 and more edits", async () => {
+    const {plugin, remote, edit, hooks, wire, localText} = await setup(true, ".obsidian", undefined, true);
+    hooks.headFailure = "network";
+    edit("A draft started before the service failure.");
+    await plugin.togglePause();
+    expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({errorCategory: "service", httpStatus: 503, outcome: "retrying"});
+    edit("The completed article 中文段落.\n".repeat(300) + "FINAL PARAGRAPH");
+    hooks.headFailure = undefined;
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => {
+      expect(plugin.getStatusText()).toMatch(/^Idle:/);
+      expect(plugin.getDiagnostics().queued).toBe(false);
+    });
+    const head = (await remote.readHead())!;
+    const snapshot = await remote.readSnapshot(head.value);
+    const entry = snapshot.entries["entry-1"];
+    if (entry?.kind !== "live") throw new Error("Expected live article");
+    expect(new TextDecoder().decode(await remote.readBlob(entry.revision.blobId))).toBe(localText());
+    expect(wire.headPublications).toBe(2); // Initialization plus the complete article, no partial version.
+    const exported = plugin.exportDiagnostics();
+    for (const excluded of ["FINAL PARAGRAPH", "notes/example.md", "test-key", "test-secret", "127.0.0.1", "test-bucket"]) {
+      expect(exported).not.toContain(excluded);
+    }
+  }, 20_000);
+
+  it("times out an actual held loopback response then recovers through a fresh request", async () => {
+    const {plugin, hooks, wire} = await setup(true, ".obsidian", undefined, true);
+    hooks.wireFault = "hang-read";
+    const first = plugin.togglePause();
+    await vi.waitFor(() => expect(wire.faults).toBe(1));
+    // Accelerate the plugin clock; the HTTP connection itself is real and remains open.
+    await vi.advanceTimersByTimeAsync(120_000);
+    await first;
+    expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({errorCategory: "timeout", outcome: "retrying"});
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    expect(plugin.getDiagnostics().acceptedCommit).toBe("initial");
+    expect(plugin.getDiagnostics().nextRetryAt).toBeUndefined();
+  }, 20_000);
+
+  it("does not republish after a loopback server accepts Head then drops the TCP response", async () => {
+    const {plugin, remote, hooks, edit, wire, localText} = await setup(true, ".obsidian", undefined, true);
+    hooks.wireFault = "drop-head-put";
+    edit("Article edited on disk, including the very last line.");
+    await plugin.togglePause();
+    const head = (await remote.readHead())!;
+    const publications = wire.headPublications;
+    expect(head.value.commitId).not.toBe("initial");
+    expect(wire.faults).toBe(1);
+    expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({outcome: "retrying", writeResultUncertain: true});
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    expect((await remote.readHead())!.value.commitId).toBe(head.value.commitId);
+    expect(wire.headPublications).toBe(publications);
+    const snapshot = await remote.readSnapshot(head.value);
+    const entry = snapshot.entries["entry-1"];
+    if (entry?.kind !== "live") throw new Error("Expected live article");
+    expect(new TextDecoder().decode(await remote.readBlob(entry.revision.blobId))).toBe(localText());
+  }, 20_000);
+
+  it("recovers an actual loopback connection reset and reloads its diagnostics from disk", async () => {
+    const {plugin, remote, hooks, edit, app, wire, localRoot, localText} = await setup(true, ".obsidian", undefined, true);
+    hooks.wireFault = "reset-read";
+    edit("Local integration article 中文 📝.\n".repeat(200) + "FINAL SENTENCE");
+    await plugin.togglePause();
+    expect(wire.faults).toBe(1);
+    expect(plugin.getDiagnostics().records.at(-1)?.errorCategory).toBe("network");
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    const head = (await remote.readHead())!;
+    const snapshot = await remote.readSnapshot(head.value);
+    const entry = snapshot.entries["entry-1"];
+    if (entry?.kind !== "live") throw new Error("Expected live article");
+    expect(new TextDecoder().decode(await remote.readBlob(entry.revision.blobId))).toBe(localText());
+    expect(wire.requests).toBeGreaterThan(10);
+    expect(wire.signedRequests).toBe(wire.requests);
+    expect(localRoot).toBeDefined();
+    await plugin.togglePause();
+    plugin.onunload();
+    const replacement = new S3VaultSyncPlugin(app, {id: "s3-vault-sync"} as PluginManifest);
+    await replacement.onload();
+    expect(replacement.getDiagnostics().records.map(record => record.outcome)).toEqual(["retrying", "complete"]);
+    expect(replacement.exportDiagnostics()).not.toContain("FINAL SENTENCE");
+    expect(replacement.exportDiagnostics()).not.toContain("test-secret");
+    replacement.onunload();
+  }, 20_000);
+
+  it("invalidates a retry queued behind an exclusive operation when its target changes", async () => {
+    const {plugin, hooks} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    hooks.headFailure = undefined;
+    const execute = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;
+    let held = false, retargetedRequests = 0;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => {release = resolve;});
+    host.requestUrl.mockImplementation(async (request: Parameters<ObsidianRequestExecutor>[0]) => {
+      const path = new URL(request.url).pathname;
+      if (path.startsWith("/queue-other-prefix/")) retargetedRequests++;
+      if (!held && request.method === "GET" && path.endsWith("/head")) {held = true; await gate;}
+      return execute(request);
+    });
+    const reading = plugin.readConflictCandidate("entry-1", "revision-1").catch(() => undefined);
+    await vi.waitFor(() => expect(held).toBe(true));
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(plugin.getDiagnostics().queued).toBe(true);
+    plugin.getSettings().prefix = "queue-other-prefix";
+    release();
+    await reading;
+    await vi.waitFor(() => {
+      expect(plugin.getDiagnostics().queued).toBe(false);
+      expect(plugin.getDiagnostics().records.at(-1)?.finishedAt).toBeDefined();
+    });
+    expect(retargetedRequests).toBe(0);
+    plugin.onunload();
+  });
+
+  it("invalidates network recovery when the target changes during the failing request", async () => {
+    const {plugin} = await setup();
+    const execute = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;
+    let fail = true;
+    host.requestUrl.mockImplementation(async (request: Parameters<ObsidianRequestExecutor>[0]) => {
+      if (fail && request.method === "GET" && new URL(request.url).pathname.endsWith("/head")) {
+        fail = false;
+        plugin.getSettings().prefix = "other-prefix";
+        throw new Error("Connection reset after target was edited");
+      }
+      return execute(request);
+    });
+    await plugin.togglePause();
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(plugin.getDiagnostics().records.at(-1)?.finishedAt).toBeDefined());
+    expect(plugin.getDiagnostics().records).toHaveLength(1);
+    expect(plugin.getDiagnostics().nextRetryAt).toBeUndefined();
+    plugin.onunload();
+  });
+
+  it.each(["success", "authentication"])("cancels obsolete retry timers when a queued follow-up ends with %s", async outcome => {
+    const {plugin} = await setup();
+    const execute = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;
+    let fail = true;
+    host.requestUrl.mockImplementation(async (request: Parameters<ObsidianRequestExecutor>[0]) => {
+      if (request.method === "GET" && new URL(request.url).pathname.endsWith("/head")) {
+        if (fail) {
+          fail = false;
+          void plugin.syncNow();
+          return {arrayBuffer: new ArrayBuffer(0), headers: {}, status: 503};
+        }
+        if (outcome === "authentication") return {arrayBuffer: new ArrayBuffer(0), headers: {}, status: 403};
+      }
+      return execute(request);
+    });
+    await plugin.togglePause();
+    expect(plugin.getDiagnostics().records).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(plugin.getDiagnostics().records).toHaveLength(2);
+    expect(plugin.getDiagnostics().nextRetryAt).toBeUndefined();
+    plugin.onunload();
+  });
+
+  it("does not access a changed S3 target after waiting for the initial diagnostic write", async () => {
+    const {plugin, app} = await setup();
+    const write = app.vault.adapter.write.bind(app.vault.adapter);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => {release = resolve;});
+    let waiting = false;
+    vi.spyOn(app.vault.adapter, "write").mockImplementation(async (path, body) => {
+      if (!waiting) {waiting = true; await gate;}
+      await write(path, body);
+    });
+    const requestCount = host.requestUrl.mock.calls.length;
+    const syncing = plugin.togglePause();
+    await vi.waitFor(() => expect(waiting).toBe(true));
+    plugin.getSettings().prefix = "different-prefix";
+    release();
+    await syncing;
+    expect(host.requestUrl.mock.calls.length).toBe(requestCount);
+    expect(plugin.getStatusText()).toContain("S3 target changed");
+    plugin.onunload();
+  });
+
+  it("does not start reading diagnostics after unloading during the existence check", async () => {
+    const {plugin, app} = await setup();
+    plugin.onunload();
+    let finish!: (exists: boolean) => void;
+    vi.spyOn(app.vault.adapter, "exists").mockImplementation(() => new Promise<boolean>(resolve => {finish = resolve;}));
+    const read = vi.spyOn(app.vault.adapter, "read");
+    const replacement = new S3VaultSyncPlugin(app, {id: "s3-vault-sync"} as PluginManifest);
+    const loading = replacement.onload().then(() => "loaded", () => "stopped");
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    replacement.onunload();
+    finish(true);
+    expect(await loading).toBe("stopped");
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("keeps a retry's accepted Head when an older timed-out PUT arrives late", async () => {
+    const {plugin, remote, edit} = await setup();
+    const execute = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => {release = resolve;});
+    let held = false, lateStatus: number | undefined;
+    host.requestUrl.mockImplementation(async (request: Parameters<ObsidianRequestExecutor>[0]) => {
+      if (!held && request.method === "PUT" && new URL(request.url).pathname.endsWith("/head")) {
+        held = true;
+        await gate;
+        const response = await execute(request);
+        lateStatus = response.status;
+        return response;
+      }
+      return execute(request);
+    });
+    edit("The full draft must survive the late request.");
+    const first = plugin.togglePause();
+    await vi.waitFor(() => expect(held).toBe(true));
+    await vi.advanceTimersByTimeAsync(120_000);
+    await first;
+    expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({outcome: "retrying", errorCategory: "timeout", writeResultUncertain: true});
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    const winner = (await remote.readHead())!.value.commitId;
+    release();
+    await vi.waitFor(() => expect(lateStatus).toBe(412));
+    expect((await remote.readHead())!.value.commitId).toBe(winner);
+    expect(plugin.getDiagnostics().acceptedCommit).toBe(winner);
+    plugin.onunload();
+  });
+
+  it("records a coalesced follow-up request separately from the active run", async () => {
+    const {plugin, hooks, edit} = await setup();
+    edit("An edited note.");
+    hooks.beforeBlobRead = () => {
+      hooks.beforeBlobRead = undefined;
+      void plugin.syncNow();
+      expect(plugin.getDiagnostics().queued).toBe(true);
+    };
+    await plugin.togglePause();
+    expect(plugin.getDiagnostics().records.map(record => record.triggers)).toEqual([["resume"], ["manual"]]);
+    expect(plugin.getDiagnostics().queued).toBe(false);
+    plugin.onunload();
+  });
+
+  it("keeps sync usable when diagnostic persistence fails and reports the logging failure safely", async () => {
+    const {plugin, app, edit, remote} = await setup();
+    vi.spyOn(app.vault.adapter, "write").mockRejectedValue(new Error("secret local path and credentials"));
+    edit("A saved paragraph.");
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toMatch(/^Idle:/);
+    expect((await remote.readHead())!.value.commitId).not.toBe("initial");
+    expect(plugin.getDiagnostics().persistenceWarning).toContain("could not be saved");
+    expect(plugin.exportDiagnostics()).not.toContain("secret local path");
+    plugin.onunload();
+  });
+
+  it("bounds persisted history, marks interrupted runs, and strips injected fields on reload", async () => {
+    const {plugin, app, diagnosticFiles} = await setup();
+    await plugin.togglePause();
+    const sample = plugin.getDiagnostics().records.at(-1)!;
+    await plugin.togglePause();
+    plugin.onunload();
+    const records = Array.from({length: 1_005}, (_, index) => ({...sample, id: `run-${index}`,
+      privateField: "INJECTED SECRET", triggers: ["manual", "INJECTED SECRET"],
+      outcome: index === 1_004 ? "running" : "complete", counts: {...sample.counts, path: "PRIVATE PATH"}}));
+    diagnosticFiles.set(".obsidian/plugins/s3-vault-sync/diagnostics.json", JSON.stringify({version: 1, records}));
+    const replacement = new S3VaultSyncPlugin(app, {id: "s3-vault-sync"} as PluginManifest);
+    await replacement.onload();
+    const exported = replacement.exportDiagnostics();
+    const parsed = JSON.parse(exported) as {records: Array<{id: string; outcome: string}>};
+    expect(parsed.records).toHaveLength(1_000);
+    expect(parsed.records[0]?.id).toBe("run-5");
+    expect(parsed.records.at(-1)?.outcome).toBe("interrupted");
+    expect(exported).not.toContain("INJECTED SECRET");
+    expect(exported).not.toContain("PRIVATE PATH");
+    vi.setSystemTime(Date.now() + 8 * 24 * 60 * 60 * 1_000);
+    expect(replacement.getDiagnostics().records).toEqual([]);
+    replacement.onunload();
+  });
+
+  it("does not show another Vault's past diagnostic history", async () => {
+    const {plugin} = await setup();
+    await plugin.togglePause();
+    await plugin.togglePause();
+    plugin.getSettings().vaultId = "different-vault";
+    expect(plugin.getDiagnostics().records).toEqual([]);
+    expect(plugin.getDiagnostics().acceptedCommit).toBeUndefined();
+    plugin.onunload();
+  });
+
+  it("reports run reasons, transfer counts, phases, request totals and the last accepted version", async () => {
+    const {plugin, edit} = await setup();
+    edit("A changed article.");
+    await plugin.togglePause();
+    const view = plugin.getDiagnostics(), record = view.records.at(-1)!;
+    expect(record).toMatchObject({triggers: ["resume"], vaultId: "vault-1", outcome: "complete",
+      counts: {uploaded: 1, downloaded: 0, deleted: 0, deferred: 0, unsynced: 0}, phase: "saving"});
+    expect(record.requests).toBeGreaterThan(0);
+    expect(record.sentBytes).toBeGreaterThan(0);
+    expect(record.receivedBytes).toBeGreaterThan(0);
+    expect(record.phaseDurations?.hashing).toBeDefined();
+    expect(view.acceptedCommit).toBe(record.acceptedAfter);
+    expect(view.lastSuccessAt).toBe(record.finishedAt);
+    expect(view.queued).toBe(false);
+    expect(view.pendingLocalChanges).toBe(0);
+    expect(record.remoteCheckedAt).toBeDefined();
+    plugin.onunload();
+  });
+
+  it("bounds fast network retries and lets an explicit manual sync recover later", async () => {
+    const {plugin, hooks} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    for (let count = 2; count <= 4; count++) {
+      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.waitFor(() => expect(plugin.getDiagnostics().records.at(count - 1)?.finishedAt).toBeDefined());
+    }
+    expect(plugin.getDiagnostics().records).toHaveLength(4);
+    expect(plugin.getStatusText()).toMatch(/^Error:/);
+    expect(host.notices).toHaveLength(1);
+    hooks.headFailure = undefined;
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^Idle:/);
+    plugin.onunload();
+  });
+
+  it.each(["pause", "unload"])("cancels a pending network retry on %s", async action => {
+    const {plugin, hooks} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    const requests = host.requestUrl.mock.calls.length;
+    if (action === "pause") await plugin.togglePause(); else plugin.onunload();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(host.requestUrl.mock.calls.length).toBe(requests);
+    expect(plugin.getDiagnostics().records).toHaveLength(1);
+    plugin.onunload();
+  });
+
+  it("does not fast-retry permissions or authenticated-metadata failures", async () => {
+    const {plugin, hooks} = await setup();
+    for (const failure of ["forbidden", "corrupt"] as const) {
+      hooks.headFailure = failure;
+      if (plugin.isPaused()) await plugin.togglePause(); else await plugin.syncNow();
+      const requests = host.requestUrl.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(host.requestUrl.mock.calls.length).toBe(requests);
+    }
+    plugin.onunload();
+  });
+
+  it("reconciles an accepted Head after losing its PUT response instead of publishing again", async () => {
+    const {plugin, remote, hooks, edit, localText} = await setup();
+    let publications = 0;
+    hooks.afterHeadPut = () => { if (++publications === 1) throw new Error("Connection reset after PUT"); };
+    edit("Saved article including its final sentence.");
+    await plugin.togglePause();
+    const acceptedHead = (await remote.readHead())!.value.commitId;
+    expect(plugin.getStatusText()).toContain("Retrying automatically");
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    expect((await remote.readHead())!.value.commitId).toBe(acceptedHead);
+    expect(publications).toBe(1);
+    const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+    const entry = snapshot.entries["entry-1"];
+    if (entry?.kind !== "live") throw new Error("Expected live file");
+    expect(new TextDecoder().decode(await remote.readBlob(entry.revision.blobId))).toBe(localText());
+    plugin.onunload();
+  });
+
+  it("uses a connectivity event to recover without waiting for a scheduled retry", async () => {
+    const {plugin, hooks} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    hooks.headFailure = undefined;
+    for (const listener of host.domEvents.get("online") ?? []) {listener(); listener();}
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    expect(plugin.getDiagnostics().records).toHaveLength(2);
+    plugin.onunload();
+  });
+
+  it("automatically recovers from a temporary 503 using a fresh sync without a failure notice", async () => {
+    const {plugin, hooks, remote} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toContain("Retrying automatically");
+    expect(host.notices).toEqual([]);
+    hooks.headFailure = undefined;
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/u));
+    expect((await remote.readHead())?.value.commitId).toBe("initial");
+    expect(plugin.getDiagnostics().records.map(record => record.outcome)).toEqual(["retrying", "complete"]);
+    plugin.onunload();
+  });
+
+  it("records a published Head even when accepting the local cache subsequently fails", async () => {
+    const {plugin, remote, hooks, edit} = await setup();
+    edit("An unpublished draft.");
+    hooks.afterHeadPut = () => {
+      hooks.afterHeadPut = undefined;
+      host.beforeSave = async () => {host.beforeSave = undefined; throw new Error("Private local filesystem failure");};
+    };
+    await plugin.togglePause();
+    const head = (await remote.readHead())!;
+    expect(head.value.commitId).not.toBe("initial");
+    expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({outcome: "error", publishedCommit: head.value.commitId});
+    expect(plugin.getDiagnostics().records.at(-1)?.acceptedAfter).not.toBe(head.value.commitId);
+    expect(plugin.exportDiagnostics()).not.toContain("Private local filesystem failure");
+    plugin.onunload();
+  });
+
+  it("retains an accepted sync record across reload without exporting content or credentials", async () => {
+    const {plugin, app, edit} = await setup();
+    edit("Private article text should never enter diagnostics.");
+    await plugin.togglePause();
+    const before = plugin.getDiagnostics();
+    expect(before.records.at(-1)).toMatchObject({outcome: "complete", acceptedBefore: "initial", observedRemote: "initial"});
+    expect(before.records.at(-1)?.acceptedAfter).not.toBe("initial");
+    expect(before.records.at(-1)?.publishedCommit).toBe(before.records.at(-1)?.acceptedAfter);
+    await plugin.togglePause();
+    plugin.onunload();
+    const replacement = new S3VaultSyncPlugin(app, {id: "s3-vault-sync"} as PluginManifest);
+    await replacement.onload();
+    expect(replacement.getDiagnostics().records).toEqual(before.records);
+    const exported = replacement.exportDiagnostics();
+    for (const secret of ["test-key", "test-secret", "test-bucket", "test-prefix", "notes/example.md", "Private article text"]) {
+      expect(exported).not.toContain(secret);
+    }
+    replacement.onunload();
+  });
   it.each([
     {device: "Android Wi-Fi", mobile: true, android: true, network: "wifi", mib: 51},
     {device: "iOS Wi-Fi", mobile: true, android: false, network: "wifi", mib: 51},

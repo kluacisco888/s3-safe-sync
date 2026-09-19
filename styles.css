@@ -221,3 +221,12 @@
 .is-mobile .s3-vault-sync-secret-setting button {
   min-height: 44px;
 }
+.s3-vault-sync-diagnostics {
+  overflow-wrap: anywhere;
+}
+
+.s3-vault-sync-diagnostic-export {
+  width: 100%;
+  min-height: 16rem;
+  user-select: text;
+}

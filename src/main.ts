@@ -17,6 +17,7 @@ import { SerializedDataWriter } from "./plugin/serialized-data-writer";
 import { SyncSession, SyncStoppedError } from "./plugin/sync-session";
 import { formatSyncProgress } from "./plugin/sync-progress";
 import { SyncProgressThrottle } from "./plugin/sync-progress-throttle";
+import { SyncDiagnostics, type SyncDiagnosticsView, type SyncRunRecord, type SyncTrigger } from "./plugin/sync-diagnostics";
 import {
   DEFAULT_SETTINGS,
   S3VaultSyncSettingsTab,
@@ -62,9 +63,10 @@ import {
   type SyncRequestOptions,
   type SyncRunOptions,
 } from "./sync/sync-request-queue";
-import { AwsS3ObjectStore } from "./storage/aws-s3-object-store";
+import { AwsS3ObjectStore, S3RequestError } from "./storage/aws-s3-object-store";
 import { BootstrapStore } from "./storage/bootstrap-store";
 import { executeObsidianHttpRequest } from "./storage/obsidian-http";
+import { S3TransportError } from "./storage/obsidian-request-adapter";
 import { isProbeObjectKey, probeObjectStore } from "./storage/object-store-probe";
 import {
   HeadChangedError,
@@ -128,9 +130,19 @@ export default class S3VaultSyncPlugin
   private readonly dirtyPaths = new DirtyPathTracker();
   private headRetryAttempt = 0;
   private headRetryTimer: number | undefined;
+  private headRetryAt: number | undefined;
+  private networkRetryAttempt = 0;
+  private networkRetryTimer: number | undefined;
+  private networkRetryAt: number | undefined;
+  private networkFailureTarget: string | undefined;
   private pathRenames = new PathRenameTracker();
   private credentials!: CredentialStore;
   private data!: PersistedPluginData;
+  private diagnostics!: SyncDiagnostics;
+  private activeRun: SyncRunRecord | undefined;
+  private acceptedCommit: string | undefined;
+  private readonly pendingTriggers = new Set<SyncTrigger>();
+  private pendingSyncTarget: string | undefined;
   private pendingBulkDeletion:
     | BulkDeletionPlan
     | undefined;
@@ -163,6 +175,20 @@ export default class S3VaultSyncPlugin
     await this.session.ready;
     this.session.assertActive();
     await this.session.run(() => this.loadPluginData());
+    this.session.assertActive();
+    const diagnosticPath = `${this.app.vault.configDir}/plugins/${this.manifest.id}/diagnostics.json`;
+    this.diagnostics = new SyncDiagnostics({
+      read: async () => {
+        const exists = await this.app.vault.adapter.exists(diagnosticPath);
+        this.session.assertActive();
+        if (!exists) return undefined;
+        const body = await this.app.vault.adapter.read(diagnosticPath);
+        this.session.assertActive();
+        return JSON.parse(body) as unknown;
+      },
+      write: value => this.session.run(() => this.app.vault.adapter.write(diagnosticPath, JSON.stringify(value))),
+    });
+    await this.session.run(() => this.diagnostics.load());
     this.session.assertActive();
     this.credentials = new CredentialStore(this.app.secretStorage);
     this.addSettingTab(new S3VaultSyncSettingsTab(this.app, this));
@@ -225,7 +251,7 @@ export default class S3VaultSyncPlugin
       if (this.session.signal.aborted) return;
       this.registerVaultEvents();
       if (!this.data.settings.paused) {
-        void this.requestAutomaticSync();
+        void this.requestAutomaticSync("startup");
       }
     });
     this.registerInterval(
@@ -240,13 +266,19 @@ export default class S3VaultSyncPlugin
         return;
       }
       if (document.visibilityState === "visible") {
-        void this.requestPeriodicSync();
+        void this.requestPeriodicSync("foreground");
       } else {
         this.requestFinalSync();
       }
     });
     this.registerDomEvent(window, "pagehide", () => {
       this.requestFinalSync();
+    });
+    this.registerDomEvent(window, "online", () => {
+      if (this.session.signal.aborted || this.data.settings.paused || this.syncRequests.isRunning ||
+        this.networkFailureTarget !== this.integrityTarget()) return;
+      this.networkFailureTarget = undefined;
+      void this.requestSync({}, "online");
     });
     this.registerDomEvent(window, "beforeunload", () => {
       this.requestFinalSync();
@@ -259,6 +291,7 @@ export default class S3VaultSyncPlugin
       window.clearTimeout(this.changeTimer);
     }
     this.clearHeadRetryTimer();
+    this.clearNetworkRetryTimer();
   }
 
   getSettings(): S3VaultSyncSettings {
@@ -281,6 +314,17 @@ export default class S3VaultSyncPlugin
 
   getStatusText(): string {
     return `${this.status}: ${this.statusDetail}`;
+  }
+
+  getDiagnostics(limit = 20): SyncDiagnosticsView {
+    const snapshot = this.diagnostics.snapshot(this.data.settings.vaultId ?? "", limit);
+    return {...snapshot, acceptedCommit: this.data.cache?.snapshot.vaultId === this.data.settings.vaultId ? this.acceptedCommit : undefined,
+      nextRetryAt: this.networkRetryAt ?? this.headRetryAt, queued: this.pendingTriggers.size > 0,
+      pendingLocalChanges: this.dirtyPaths.capture().size};
+  }
+
+  exportDiagnostics(): string {
+    return JSON.stringify({version: 1, ...this.getDiagnostics(1_000)}, null, 2);
   }
 
   getProgressLabel(): string | undefined {
@@ -738,11 +782,13 @@ export default class S3VaultSyncPlugin
   }
 
   async syncNow(): Promise<void> {
+    this.networkRetryAttempt = 0;
     return this.requestSync();
   }
 
   async verifyAllFiles(): Promise<void> {
-    return this.requestSync({ fullHashVerification: true });
+    this.networkRetryAttempt = 0;
+    return this.requestSync({ fullHashVerification: true }, "integrity-check");
   }
 
   async togglePause(): Promise<void> {
@@ -750,10 +796,12 @@ export default class S3VaultSyncPlugin
     await this.savePluginData();
     if (this.data.settings.paused) {
       this.clearHeadRetryTimer();
+      this.clearNetworkRetryTimer();
       this.setStatus("Paused", "Automatic sync is paused on this device.");
     } else {
+      this.networkRetryAttempt = 0;
       this.setStatus("Checking", "Automatic sync resumed.");
-      await this.requestAutomaticSync();
+      await this.requestAutomaticSync("resume");
     }
   }
 
@@ -776,7 +824,10 @@ export default class S3VaultSyncPlugin
       execute: async (request) => {
         this.session.assertActive();
         assertTarget();
+        const diagnostic = this.activeRun;
+        if (diagnostic) {diagnostic.requests += 1; diagnostic.sentBytes += request.body?.byteLength ?? 0;}
         const response = await executeObsidianHttpRequest(request, this.session.signal);
+        if (diagnostic) diagnostic.receivedBytes += response.body.byteLength;
         this.session.assertActive();
         assertTarget();
         return response;
@@ -793,13 +844,17 @@ export default class S3VaultSyncPlugin
   ): SyncService {
     const assertTarget = this.captureTargetGuard();
     const integrityTarget = this.integrityTarget();
+    const diagnostic = this.activeRun;
     const cache: SyncCachePort = {
       load: () => Promise.resolve(this.data.cache),
       save: async (state) => {
         this.session.assertActive();
         assertTarget();
         this.data.cache = state;
+        if (diagnostic) this.diagnostics.phase(diagnostic, "saving");
         await this.savePluginData();
+        this.acceptedCommit = state.snapshot.commitId;
+        if (diagnostic) diagnostic.acceptedAfter = state.snapshot.commitId;
       },
     };
     return new SyncService({
@@ -810,6 +865,8 @@ export default class S3VaultSyncPlugin
       }),
       remote,
       onProgress: (progress) => this.updateSyncProgress(progress),
+      onRemoteHead: commitId => { if (diagnostic) {diagnostic.observedRemote = commitId; diagnostic.remoteCheckedAt = Date.now();} },
+      onRemotePublished: commitId => { if (diagnostic) diagnostic.publishedCommit = commitId; },
       onIntegrityVerified: check => this.clearVerifiedIntegrityIssue(integrityTarget, check),
       replicaId: this.data.settings.replicaId,
       yieldDuringHashing: this.yieldDuringHashing,
@@ -865,6 +922,7 @@ export default class S3VaultSyncPlugin
       pendingProbes: stored?.pendingProbes ?? [],
       settings,
     };
+    this.acceptedCommit = this.data.cache?.snapshot.commitId;
     const pendingRenames = Object.entries(this.data.pendingPathRenames ?? {});
     const userRenames = pendingRenames.filter(([fromPath, rename]) =>
       typeof rename?.toPath !== "string" ||
@@ -924,8 +982,26 @@ export default class S3VaultSyncPlugin
     allowBulkDeletion,
     fullHashVerification: requestedFullHashVerification,
   }: SyncRunOptions): Promise<void> {
+    const triggers = [...this.pendingTriggers];
+    this.pendingTriggers.clear();
+    const requestedTarget = this.pendingSyncTarget;
+    this.pendingSyncTarget = undefined;
+    // A queued/manual run consumes any recovery timer created by the preceding run.
+    this.clearNetworkRetryTimer();
+    if (triggers.some(trigger => trigger === "manual" || trigger === "resume" || trigger === "integrity-check")) this.networkRetryAttempt = 0;
     const integrityTarget = this.integrityTarget();
     const assertIntegrityTarget = this.captureTargetGuard();
+    if (requestedTarget !== undefined && requestedTarget !== integrityTarget) {
+      this.networkRetryAttempt = 0;
+      this.networkFailureTarget = undefined;
+      this.setStatus("Error", "S3 target changed while synchronization was queued. Check settings and sync again.");
+      return;
+    }
+    if (this.networkFailureTarget !== undefined && this.networkFailureTarget !== integrityTarget) {
+      this.clearNetworkRetryTimer();
+      this.networkRetryAttempt = 0;
+      this.networkFailureTarget = undefined;
+    }
     if (this.data.settings.paused) {
       this.setStatus("Paused", "Automatic sync is paused on this device.");
       return;
@@ -938,25 +1014,29 @@ export default class S3VaultSyncPlugin
     if (this.headRetryTimer !== undefined) {
       this.clearHeadRetryTimer();
     }
-    try { await this.recoverCollisionRename(); }
-    catch (error) { this.showError(error); return; }
-    const dirtySnapshot = this.dirtyPaths.capture();
-    const pathRenameSnapshot = this.pathRenames.capture();
-    const fullHashVerification =
-      requestedFullHashVerification ||
-      (document.visibilityState === "visible" &&
-        isFullHashVerificationDue(
-          this.data.lastFullHashVerificationAt,
-          this.data.cache !== undefined,
-          Date.now(),
-          this.data.fullHashVerificationRequired === true,
-          this.data.settings.fullHashVerificationIntervalDays *
-            24 *
-            60 *
-            60 *
-            1_000,
-        ));
+    const diagnostic = await this.diagnostics.start(this.acceptedCommit, this.data.settings.vaultId, triggers);
+    this.activeRun = diagnostic;
+    let fullHashVerification = false;
     try {
+      this.session.assertActive();
+      assertIntegrityTarget();
+      await this.recoverCollisionRename();
+      const dirtySnapshot = this.dirtyPaths.capture();
+      const pathRenameSnapshot = this.pathRenames.capture();
+      fullHashVerification =
+        requestedFullHashVerification ||
+        (document.visibilityState === "visible" &&
+          isFullHashVerificationDue(
+            this.data.lastFullHashVerificationAt,
+            this.data.cache !== undefined,
+            Date.now(),
+            this.data.fullHashVerificationRequired === true,
+            this.data.settings.fullHashVerificationIntervalDays *
+              24 *
+              60 *
+              60 *
+              1_000,
+          ));
       if (
         fullHashVerification &&
         this.data.fullHashVerificationRequired !== true
@@ -965,6 +1045,7 @@ export default class S3VaultSyncPlugin
         await this.savePluginData();
       }
       this.setStatus("Checking", "Reading encrypted remote Head.");
+      this.diagnostics.phase(diagnostic, "remote");
       const objects = this.createObjectStore();
       const remote = await RemoteStore.open({
         objects,
@@ -972,6 +1053,8 @@ export default class S3VaultSyncPlugin
         vaultKey,
       });
       const boundHead = await remote.readHead();
+      diagnostic.observedRemote = boundHead?.value.commitId;
+      diagnostic.remoteCheckedAt = Date.now();
       if (
         !boundHead ||
         boundHead.value.vaultId !== this.data.settings.vaultId
@@ -1023,9 +1106,15 @@ export default class S3VaultSyncPlugin
       );
       this.clearHeadRetryTimer();
       this.headRetryAttempt = 0;
+      this.networkRetryAttempt = 0;
+      this.networkFailureTarget = undefined;
       this.pendingBulkDeletion = result.bulkDeletion;
       this.pendingLocalIssues = result.localIssues;
       this.pendingDeferredDownloads = result.deferredDownloadEntries;
+      diagnostic.outcome = result.status;
+      diagnostic.counts = {uploaded: result.uploaded, downloaded: result.downloaded, deleted: result.deleted,
+        deferred: result.deferredDownloads, unsynced: result.unsyncedLocalEntries};
+      if (result.cacheUpdated) {diagnostic.pendingUploads = 0; diagnostic.pendingDownloads = 0;}
       if (result.cacheUpdated) {
         this.approvedRenameResolution = undefined;
         const unverifiedLocalPaths = new Set(
@@ -1074,22 +1163,41 @@ export default class S3VaultSyncPlugin
         );
       }
     } catch (error) {
+      const retryableNetwork = error instanceof S3TransportError ||
+        (error instanceof S3RequestError && [408, 429, 500, 502, 503, 504].includes(error.status));
+      if (!retryableNetwork) {this.networkFailureTarget = undefined; this.networkRetryAttempt = 0;}
+      diagnostic.errorCategory = error instanceof S3TransportError ? error.kind
+        : error instanceof S3RequestError ? ([401, 403].includes(error.status) ? "authentication" : "service")
+        : error instanceof RemoteStateError || error instanceof RepairModeError ? "remote-integrity"
+        : error instanceof HeadChangedError ? "head-race" : error instanceof LocalStateChangedError ? "local-change"
+        : error instanceof SyncStoppedError ? "cancelled" : "unknown";
+      if (error instanceof S3RequestError) diagnostic.httpStatus = error.status;
+      if (error instanceof S3TransportError) diagnostic.writeResultUncertain = error.writeMayHaveSucceeded;
       this.approvedRenameResolution = undefined;
-      if (error instanceof SyncStoppedError) return;
+      if (error instanceof SyncStoppedError) { diagnostic.outcome = "interrupted"; return; }
       if (error instanceof HeadChangedError) {
+        diagnostic.outcome = "retrying";
         this.scheduleHeadRetry(fullHashVerification);
       } else if (error instanceof LocalStateChangedError) {
+        diagnostic.outcome = "retrying";
         this.dirtyPaths.mark(error.path);
         this.setStatus(
           "Checking",
           "A local file changed during synchronization. Retrying after edits settle.",
         );
         this.scheduleAfterLocalChange();
+      } else if (retryableNetwork && this.scheduleNetworkRetry(integrityTarget)) {
+        diagnostic.outcome = "retrying";
       } else {
+        diagnostic.outcome = "error";
         await this.rememberIntegrityFailure(error, integrityTarget);
         this.showError(error);
       }
     } finally {
+      diagnostic.nextRetryAt = this.networkRetryAt ?? this.headRetryAt;
+      this.activeRun = undefined;
+      await this.diagnostics.finish(diagnostic);
+      this.emitStatus();
       if (
         !this.session.signal.aborted &&
         this.data.settings.paused &&
@@ -1106,6 +1214,37 @@ export default class S3VaultSyncPlugin
       window.clearTimeout(this.headRetryTimer);
       this.headRetryTimer = undefined;
     }
+    this.headRetryAt = undefined;
+  }
+
+  private clearNetworkRetryTimer(): void {
+    if (this.networkRetryTimer !== undefined) window.clearTimeout(this.networkRetryTimer);
+    this.networkRetryTimer = undefined;
+    this.networkRetryAt = undefined;
+  }
+
+  private scheduleNetworkRetry(target: string): boolean {
+    if (this.integrityTarget() !== target) {
+      this.networkFailureTarget = undefined;
+      this.networkRetryAttempt = 0;
+      return false;
+    }
+    this.networkFailureTarget = target;
+    const delays = [2_000, 5_000, 15_000];
+    const baseDelay = delays[this.networkRetryAttempt];
+    if (this.session.signal.aborted || this.data.settings.paused || baseDelay === undefined) return false;
+    const delay = baseDelay + Math.floor(Math.random() * baseDelay / 4);
+    this.networkRetryAttempt += 1;
+    this.networkRetryAt = Date.now() + delay;
+    this.setStatus(this.currentIntegrityChecks().length ? "Error" : "Checking",
+      `Temporary network failure. Retrying automatically in ${Math.ceil(delay / 1_000)} seconds (${this.networkRetryAttempt}/3).`);
+    this.networkRetryTimer = window.setTimeout(() => {
+      this.networkRetryTimer = undefined;
+      this.networkRetryAt = undefined;
+      if (this.session.signal.aborted || this.data.settings.paused || this.integrityTarget() !== target) return;
+      void this.requestSync({}, "network-retry");
+    }, delay);
+    return true;
   }
 
   private scheduleHeadRetry(fullHashVerification = false): void {
@@ -1117,17 +1256,19 @@ export default class S3VaultSyncPlugin
     const baseDelay = Math.min(30_000, 1_000 * 2 ** this.headRetryAttempt);
     const delay = baseDelay + Math.floor(Math.random() * baseDelay);
     this.headRetryAttempt += 1;
+    this.headRetryAt = Date.now() + delay;
     this.setStatus(
       "Checking",
       `Another device published first. Retrying automatically in ${Math.ceil(delay / 1_000)} seconds.`,
     );
     this.headRetryTimer = window.setTimeout(() => {
       this.headRetryTimer = undefined;
+      this.headRetryAt = undefined;
       const retryFullHashVerification =
         this.data.fullHashVerificationRequired === true;
       void this.requestSync({
         fullHashVerification: retryFullHashVerification,
-      });
+      }, "head-retry");
     }, delay);
   }
 
@@ -1236,18 +1377,22 @@ export default class S3VaultSyncPlugin
 
   private requestFinalSync(): void {
     if (!this.session.signal.aborted && this.data && !this.data.settings.paused) {
-      void this.requestAutomaticSync();
+      void this.requestAutomaticSync("shutdown");
     }
   }
 
-  private requestAutomaticSync(): Promise<void> {
-    return this.requestSync();
+  private requestAutomaticSync(trigger: SyncTrigger = "edit"): Promise<void> {
+    return this.requestSync({}, trigger);
   }
 
-  private requestPeriodicSync(): Promise<void> {
+  private requestPeriodicSync(trigger: SyncTrigger = "periodic"): Promise<void> {
     if (this.session.signal.aborted) return Promise.resolve();
+    if (!this.syncRequests.isRunning && this.headRetryTimer === undefined && this.networkRetryTimer === undefined) {
+      this.pendingTriggers.add(trigger);
+      this.pendingSyncTarget = this.integrityTarget();
+    }
     return this.syncRequests.requestPeriodic(
-      this.headRetryTimer !== undefined,
+      this.headRetryTimer !== undefined || this.networkRetryTimer !== undefined,
     ).catch((error: unknown) => {
       if (!(error instanceof SyncStoppedError)) throw error;
     });
@@ -1255,9 +1400,13 @@ export default class S3VaultSyncPlugin
 
   private requestSync(
     options: SyncRequestOptions = {},
+    trigger: SyncTrigger = "manual",
   ): Promise<void> {
     if (this.session.signal.aborted) return Promise.resolve();
+    this.pendingTriggers.add(trigger);
+    this.pendingSyncTarget = this.integrityTarget();
     this.clearHeadRetryTimer();
+    this.clearNetworkRetryTimer();
     return this.syncRequests.request(options).catch((error: unknown) => {
       if (!(error instanceof SyncStoppedError)) throw error;
     });
@@ -1289,8 +1438,13 @@ export default class S3VaultSyncPlugin
       "s3-vault-sync-error",
       status === "Action required" || status === "Error",
     );
+    this.emitStatus();
+  }
+
+  private emitStatus(): void {
+    if (this.session.signal.aborted) return;
     const display: SyncStatusDisplay = {
-      ...(progressLabel ? { progressLabel } : {}),
+      ...(this.progressLabel ? { progressLabel: this.progressLabel } : {}),
       text: this.getStatusText(),
     };
     for (const listener of this.statusListeners) {
@@ -1299,6 +1453,11 @@ export default class S3VaultSyncPlugin
   }
 
   private updateSyncProgress(progress: SyncProgress): void {
+    if (this.activeRun) {
+      this.diagnostics.phase(this.activeRun, progress.phase);
+      if (progress.phase === "uploading") this.activeRun.pendingUploads = Math.max(0, progress.total - progress.completed);
+      if (progress.phase === "downloading") this.activeRun.pendingDownloads = Math.max(0, progress.total - progress.completed);
+    }
     if (!this.syncProgressThrottle.shouldRender(progress, performance.now())) {
       return;
     }
