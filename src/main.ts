@@ -54,6 +54,7 @@ import type {
 } from "./sync/sync-engine";
 import { retryHeadChanges } from "./sync/head-change-retry";
 import {
+  isInternalStagingRename,
   PathRenameTracker,
   type PersistedPathRenames,
 } from "./sync/path-rename-tracker";
@@ -876,9 +877,15 @@ export default class S3VaultSyncPlugin
       pendingProbes: stored?.pendingProbes ?? [],
       settings,
     };
+    const pendingRenames = Object.entries(this.data.pendingPathRenames ?? {});
+    const userRenames = pendingRenames.filter(([fromPath, rename]) =>
+      typeof rename?.toPath !== "string" ||
+      !isInternalStagingRename(fromPath, rename.toPath, this.app.vault.configDir),
+    );
+    this.data.pendingPathRenames = Object.fromEntries(userRenames);
     this.pathRenames = new PathRenameTracker(this.data.pendingPathRenames);
-    if (!this.data.settings.replicaId) {
-      this.data.settings.replicaId = crypto.randomUUID();
+    if (!this.data.settings.replicaId || userRenames.length !== pendingRenames.length) {
+      this.data.settings.replicaId ||= crypto.randomUUID();
       await this.savePluginData();
     }
   }
@@ -1200,6 +1207,7 @@ export default class S3VaultSyncPlugin
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
         if (this.session.signal.aborted) return;
+        if (isInternalStagingRename(oldPath, file.path, this.app.vault.configDir)) return;
         const dirtyRenamePaths = this.pathRenames.record(
           Object.values(this.data.cache?.files ?? {}),
           oldPath,

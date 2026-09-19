@@ -48,6 +48,7 @@ export interface LocalHashOptions {
 }
 
 export interface LocalVaultPort {
+  cleanupEmptyDirectories?(retiredPaths: readonly string[]): Promise<void>;
   delete(
     path: string,
     expectedContentHash?: string | null,
@@ -1343,6 +1344,7 @@ export class SyncService {
       observation.files.map((file) => [file.path, file.contentHash] as const),
     );
     const locallyMutatedPaths = new Set<string>();
+    const retiredLocalPaths = new Set<string>();
     const reconciliationBase = this.buildReconciliationBase(cached);
     let plan = this.engine.reconcile({
       base: reconciliationBase,
@@ -1515,19 +1517,26 @@ export class SyncService {
           expectedLocalContentByPath.get(action.path) ?? null;
         await this.options.local.delete(action.path, expectedContentHash);
         locallyMutatedPaths.add(action.path);
+        retiredLocalPaths.add(action.path);
         expectedLocalContentByPath.delete(action.path);
         deleted += 1;
       } else if (action.kind === "move-local") {
         const expectedContentHash =
           expectedLocalContentByPath.get(action.fromPath) ?? null;
+        const expectedTargetHash = expectedLocalContentByPath.get(action.toPath) ?? null;
+        if (expectedTargetHash !== null) {
+          await this.assertRemoteRecoveryForLocalContent(remote, action.entryId, expectedContentHash);
+          await this.assertLocalContent(action.toPath, expectedTargetHash);
+        }
         await this.assertLocalContent(action.fromPath, expectedContentHash);
         await this.options.local.move(
           action.fromPath,
           action.toPath,
           expectedContentHash ?? undefined,
-          null,
+          expectedTargetHash,
         );
         locallyMutatedPaths.add(action.fromPath);
+        retiredLocalPaths.add(action.fromPath);
         locallyMutatedPaths.add(action.toPath);
         expectedLocalContentByPath.delete(action.fromPath);
         if (expectedContentHash) {
@@ -1944,6 +1953,7 @@ export class SyncService {
           pendingDelete.expectedContentHash,
         );
         locallyMutatedPaths.add(pendingDelete.path);
+        retiredLocalPaths.add(pendingDelete.path);
       }
       for (const pendingWrite of writeAfterCommit) {
         await this.assertLocalContent(
@@ -1970,6 +1980,13 @@ export class SyncService {
         },
       ),
     );
+    const status: SyncResult["status"] =
+      unresolvedConflicts > 0 || scan.unsyncedLocalEntries > 0 || deferredLocalEditPaths.length > 0 ||
+      deferredDownloadEntries.some(entry => entry.reason === "unsupported-path")
+        ? "action-required" : "complete";
+    if (status === "complete" && retiredLocalPaths.size) {
+      await this.options.local.cleanupEmptyDirectories?.([...retiredLocalPaths]);
+    }
     return {
       bulkDeletion: plan.bulkDeletion,
       cacheUpdated: true,
@@ -1978,15 +1995,7 @@ export class SyncService {
       deleted,
       downloaded,
       localIssues,
-      status:
-        unresolvedConflicts > 0 ||
-        scan.unsyncedLocalEntries > 0 ||
-        deferredLocalEditPaths.length > 0 ||
-        deferredDownloadEntries.some(
-          (entry) => entry.reason === "unsupported-path",
-        )
-          ? "action-required"
-          : "complete",
+      status,
       unsyncedLocalEntries: scan.unsyncedLocalEntries,
       uploaded: publishedChanges,
     };

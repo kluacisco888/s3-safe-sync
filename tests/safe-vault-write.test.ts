@@ -24,6 +24,7 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
   readonly directories = new Set<string>([STAGING]);
   readonly files = new Map<string, Uint8Array>();
   readonly trashed: Uint8Array[] = [];
+  readonly reportedSizes = new Map<string, number>();
   failPromotion = false;
   beforeCopy: ((fromPath: string, toPath: string) => void) | undefined;
   beforeRename: ((fromPath: string, toPath: string) => void) | undefined;
@@ -49,7 +50,7 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
     if (!body) {
       throw new Error(`Missing ${fromPath}`);
     }
-    this.files.set(toPath, body.slice());
+    this.files.set(toPath, body.slice(0, this.reportedSizes.get(fromPath) ?? body.byteLength));
     return Promise.resolve();
   }
 
@@ -107,13 +108,13 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
     return Promise.resolve();
   }
 
-  stat(path: string): Promise<{ type: string } | null> {
+  stat(path: string): Promise<{ type: string; size: number } | null> {
     this.calls.push(`stat:${path}`);
     if (this.files.has(path)) {
-      return Promise.resolve({ type: "file" });
+      return Promise.resolve({ type: "file", size: this.reportedSizes.get(path) ?? this.files.get(path)!.byteLength });
     }
     if (this.directories.has(path)) {
-      return Promise.resolve({ type: "folder" });
+      return Promise.resolve({ type: "folder", size: 0 });
     }
     return Promise.resolve(null);
   }
@@ -142,6 +143,43 @@ class MemorySafeWriteAdapter implements SafeWriteAdapter {
 }
 
 describe("safeReplaceVaultFile", () => {
+  it("does not create an empty destination when staged bytes are readable but file size reports zero", async () => {
+    const adapter = new MemorySafeWriteAdapter();
+    adapter.onWriteBinary = path => { adapter.reportedSizes.set(path, 0); };
+
+    await expect(safeReplaceVaultFile(adapter, "notes/download.md", bytes("remote content"), null, () => "stale-size"))
+      .rejects.toThrow();
+
+    expect(adapter.files.has("notes/download.md")).toBe(false);
+    expect([...adapter.files.keys()]).toEqual([]);
+    expect(adapter.trashed).toEqual([]);
+
+    adapter.onWriteBinary = undefined;
+    await safeReplaceVaultFile(adapter, "notes/download.md", bytes("remote content"), null, () => "retry");
+    expect(new TextDecoder().decode(adapter.files.get("notes/download.md"))).toBe("remote content");
+  });
+
+  it.each([0, 3])("keeps the original file untouched when staging reports the wrong size %s", async reportedSize => {
+    const adapter = new MemorySafeWriteAdapter();
+    adapter.files.set("notes/download.md", bytes("original local content"));
+    adapter.onWriteBinary = path => { adapter.reportedSizes.set(path, reportedSize); };
+
+    await expect(safeReplaceVaultFile(adapter, "notes/download.md", bytes("remote content"),
+      await hash(bytes("original local content")), () => "wrong-size"))
+      .rejects.toThrow("Staged file size is inconsistent");
+
+    expect(new TextDecoder().decode(adapter.files.get("notes/download.md"))).toBe("original local content");
+    expect([...adapter.files.keys()]).toEqual(["notes/download.md"]);
+    expect(adapter.trashed).toEqual([]);
+  });
+
+  it("still synchronizes an intentionally empty remote file", async () => {
+    const adapter = new MemorySafeWriteAdapter();
+    await safeReplaceVaultFile(adapter, "notes/empty.md", bytes(""), null, () => "empty");
+    expect(adapter.files.get("notes/empty.md")).toEqual(bytes(""));
+    expect([...adapter.files.keys()]).toEqual(["notes/empty.md"]);
+  });
+
   it("does not overwrite a target recreated while recovery verifies the backup", async () => {
     const adapter = new MemorySafeWriteAdapter();
     const journalPath = `${STAGING}/recovery-race.json`;
