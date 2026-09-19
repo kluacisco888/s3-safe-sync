@@ -163,6 +163,8 @@ npm run build
 npm run lint
 ```
 
+The lifecycle tests include a loopback HTTP fixture with real TCP resets/held responses and temporary note/diagnostic files. Run just these checks with `npm test -- tests/plugin-sync-lifecycle.test.ts -t loopback`. The fixture binds only to `127.0.0.1`, uses dummy credentials and emulated S3 conditional-write semantics, and cleans up its server and files. Timeout/backoff clocks are accelerated. This validates the plugin's network recovery and disk diagnostic flow without a phone or AWS account; it is not a real Obsidian-host, AWS-service, or mobile lifecycle test.
+
 Release builds produce `main.js`. A GitHub release must attach `main.js`, `manifest.json`, and `styles.css` as individual assets, and its tag must exactly match the version in `manifest.json`.
 
 ## License

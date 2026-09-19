@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { App, PluginManifest } from "obsidian";
+import { createServer, request as httpRequest } from "node:http";
+import { access, mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
+import { readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
 const host = vi.hoisted((): {
   data: unknown;
@@ -70,7 +75,9 @@ import { RemoteStore } from "../src/storage/remote-store";
 import { ObsidianVaultPort } from "../src/plugin/obsidian-vault-port";
 import { withVaultMutationLock } from "../src/plugin/safe-vault-write";
 
-const setup = async (initialized = true, configDir = ".obsidian", initialFile = {path: "notes/example.md", text: "Original article."}) => {
+const cleanups: Array<() => Promise<void>> = [];
+
+const setup = async (initialized = true, configDir = ".obsidian", initialFile = {path: "notes/example.md", text: "Original article."}, loopback = false) => {
   vi.useFakeTimers();
   vi.stubGlobal("window", globalThis);
   vi.stubGlobal("document", { visibilityState: "visible" });
@@ -89,7 +96,9 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
     failNextBlobPut?: boolean;
     afterProbePut?: () => void;
     afterHeadPut?: () => void;
+    wireFault?: "reset-read" | "hang-read" | "drop-head-put";
   } = {};
+  const wire = {requests: 0, headPublications: 0, faults: 0, signedRequests: 0};
   host.requestUrl.mockImplementation(async (request: {
     url: string; method: string; body?: ArrayBuffer; headers: Record<string, string>;
   }) => {
@@ -139,6 +148,59 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
       status,
     };
   });
+  let localRoot: string | undefined;
+  if (loopback) {
+    localRoot = await mkdtemp(join(tmpdir(), "s3-sync-loopback-"));
+    const ownedRoot = localRoot;
+    cleanups.push(() => rm(ownedRoot, {recursive: true, force: true}));
+    await mkdir(dirname(join(localRoot, initialFile.path)), {recursive: true});
+    await writeFile(join(localRoot, initialFile.path), initialFile.text);
+    const protocol = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;
+    const server = createServer((request, response) => {
+      void (async () => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of request) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array));
+        const body = Buffer.concat(chunks);
+        const url = new URL(request.url ?? "/", "http://127.0.0.1");
+        wire.requests++;
+        if (request.headers.authorization?.startsWith("AWS4-HMAC-SHA256")) wire.signedRequests++;
+        const fault = hooks.wireFault;
+        if (request.method === "GET" && url.pathname.endsWith("/head") && (fault === "reset-read" || fault === "hang-read")) {
+          hooks.wireFault = undefined;
+          wire.faults++;
+          if (fault === "reset-read") response.destroy();
+          return;
+        }
+        const result = await protocol({url: url.toString(), method: request.method,
+          headers: Object.fromEntries(Object.entries(request.headers).flatMap(([key, value]) => value === undefined ? [] : [[key, Array.isArray(value) ? value.join(",") : value]])),
+          body: Uint8Array.from(body).buffer});
+        if (request.method === "PUT" && url.pathname.endsWith("/head") && result.status === 200) {
+          wire.headPublications++;
+          if (fault === "drop-head-put") {hooks.wireFault = undefined; wire.faults++; response.destroy(); return;}
+        }
+        response.writeHead(result.status, result.headers);
+        response.end(Buffer.from(result.arrayBuffer));
+      })().catch(() => response.destroy());
+    });
+    cleanups.push(async () => {server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));});
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Expected a loopback port");
+    host.requestUrl.mockImplementation((request: Parameters<ObsidianRequestExecutor>[0]) => new Promise<Awaited<ReturnType<ObsidianRequestExecutor>>>((resolve, reject) => {
+      const original = new URL(request.url);
+      const connection = httpRequest({hostname: "127.0.0.1", port: address.port, path: original.pathname + original.search,
+        method: request.method, headers: request.headers, agent: false}, response => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("error", reject);
+        response.on("aborted", () => reject(new Error("Response connection closed")));
+        response.on("end", () => resolve({status: response.statusCode ?? 0, arrayBuffer: Uint8Array.from(Buffer.concat(chunks)).buffer,
+          headers: Object.fromEntries(Object.entries(response.headers).flatMap(([key, value]) => value === undefined ? [] : [[key, Array.isArray(value) ? value.join(",") : value]]))}));
+      });
+      connection.on("error", reject);
+      connection.end(typeof request.body === "string" ? request.body : request.body ? Buffer.from(request.body) : undefined);
+    }));
+  }
   const secrets = new Map<string, string>();
   const secretStorage = {
     getSecret: (id: string) => secrets.get(id) ?? null,
@@ -178,6 +240,7 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
   const events = new Map<string, Array<(file: TFile, oldPath?: string) => void>>();
   const edit = (value: string) => {
     text = value;
+    if (localRoot) writeFileSync(join(localRoot, initialFile.path), text);
     file.stat = { ...file.stat, mtime: file.stat.mtime + 1, size: new TextEncoder().encode(text).length };
     for (const listener of events.get("modify") ?? []) listener(file);
   };
@@ -192,13 +255,13 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
     vault: {
       configDir,
       adapter: {
-        exists: (path: string) => Promise.resolve(diagnosticFiles.has(path)),
-        read: async (path: string) => { const body = diagnosticFiles.get(path); if (body === undefined) throw new Error("Missing file"); return body; },
-        write: async (path: string, body: string) => { diagnosticFiles.set(path, body); },
+        exists: (path: string) => localRoot ? access(join(localRoot, path)).then(() => true, () => false) : Promise.resolve(diagnosticFiles.has(path)),
+        read: async (path: string) => { if (localRoot) return readFile(join(localRoot, path), "utf8"); const body = diagnosticFiles.get(path); if (body === undefined) throw new Error("Missing file"); return body; },
+        write: async (path: string, body: string) => { if (localRoot) {await mkdir(dirname(join(localRoot, path)), {recursive: true}); await writeFile(join(localRoot, path), body);} else diagnosticFiles.set(path, body); },
       },
       getFiles: () => [file],
       getAbstractFileByPath: (path: string) => path === file.path ? file : null,
-      readBinary: () => Promise.resolve(new TextEncoder().encode(text).buffer),
+      readBinary: () => localRoot ? readFile(join(localRoot, initialFile.path)).then(body => Uint8Array.from(body).buffer) : Promise.resolve(new TextEncoder().encode(text).buffer),
       on: (name: string, listener: (file: TFile, oldPath?: string) => void) => {
         const listeners = events.get(name) ?? [];
         listeners.push(listener);
@@ -226,10 +289,12 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
   }
   const plugin = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
   await plugin.onload();
-  return { plugin, remote, hooks, edit, rename, localText: () => text, app, objects, diagnosticFiles };
+  if (loopback) cleanups.push(() => {plugin.onunload(); return Promise.resolve();});
+  return { plugin, remote, hooks, edit, rename, localText: () => localRoot ? readFileSync(join(localRoot, initialFile.path), "utf8") : text, app, objects, diagnosticFiles, wire, localRoot };
 };
 
-afterEach(() => {
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   host.mobile = false;
   host.android = false;
   host.requestUrl.mockClear();
@@ -239,6 +304,112 @@ afterEach(() => {
 });
 
 describe("plugin synchronization lifecycle", () => {
+  it("cancels a held loopback request on unload and recognizes the unfinished disk record on reload", async () => {
+    const {plugin, app, hooks, wire} = await setup(true, ".obsidian", undefined, true);
+    hooks.wireFault = "hang-read";
+    const syncing = plugin.togglePause();
+    await vi.waitFor(() => expect(wire.faults).toBe(1));
+    await plugin.togglePause();
+    plugin.onunload();
+    await syncing;
+    const requests = wire.requests;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(wire.requests).toBe(requests);
+    const replacement = new S3VaultSyncPlugin(app, {id: "s3-vault-sync"} as PluginManifest);
+    await replacement.onload();
+    expect(replacement.getDiagnostics().records.at(-1)?.outcome).toBe("interrupted");
+    expect(replacement.getDiagnostics().lastSuccessAt).toBeUndefined();
+    expect(replacement.getDiagnostics().acceptedCommit).toBe("initial");
+    replacement.onunload();
+  }, 20_000);
+
+  it("uploads the complete latest disk content after a real loopback 503 and more edits", async () => {
+    const {plugin, remote, edit, hooks, wire, localText} = await setup(true, ".obsidian", undefined, true);
+    hooks.headFailure = "network";
+    edit("A draft started before the service failure.");
+    await plugin.togglePause();
+    expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({errorCategory: "service", httpStatus: 503, outcome: "retrying"});
+    edit("The completed article 中文段落.\n".repeat(300) + "FINAL PARAGRAPH");
+    hooks.headFailure = undefined;
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => {
+      expect(plugin.getStatusText()).toMatch(/^Idle:/);
+      expect(plugin.getDiagnostics().queued).toBe(false);
+    });
+    const head = (await remote.readHead())!;
+    const snapshot = await remote.readSnapshot(head.value);
+    const entry = snapshot.entries["entry-1"];
+    if (entry?.kind !== "live") throw new Error("Expected live article");
+    expect(new TextDecoder().decode(await remote.readBlob(entry.revision.blobId))).toBe(localText());
+    expect(wire.headPublications).toBe(2); // Initialization plus the complete article, no partial version.
+    const exported = plugin.exportDiagnostics();
+    for (const excluded of ["FINAL PARAGRAPH", "notes/example.md", "test-key", "test-secret", "127.0.0.1", "test-bucket"]) {
+      expect(exported).not.toContain(excluded);
+    }
+  }, 20_000);
+
+  it("times out an actual held loopback response then recovers through a fresh request", async () => {
+    const {plugin, hooks, wire} = await setup(true, ".obsidian", undefined, true);
+    hooks.wireFault = "hang-read";
+    const first = plugin.togglePause();
+    await vi.waitFor(() => expect(wire.faults).toBe(1));
+    // Accelerate the plugin clock; the HTTP connection itself is real and remains open.
+    await vi.advanceTimersByTimeAsync(120_000);
+    await first;
+    expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({errorCategory: "timeout", outcome: "retrying"});
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    expect(plugin.getDiagnostics().acceptedCommit).toBe("initial");
+    expect(plugin.getDiagnostics().nextRetryAt).toBeUndefined();
+  }, 20_000);
+
+  it("does not republish after a loopback server accepts Head then drops the TCP response", async () => {
+    const {plugin, remote, hooks, edit, wire, localText} = await setup(true, ".obsidian", undefined, true);
+    hooks.wireFault = "drop-head-put";
+    edit("Article edited on disk, including the very last line.");
+    await plugin.togglePause();
+    const head = (await remote.readHead())!;
+    const publications = wire.headPublications;
+    expect(head.value.commitId).not.toBe("initial");
+    expect(wire.faults).toBe(1);
+    expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({outcome: "retrying", writeResultUncertain: true});
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    expect((await remote.readHead())!.value.commitId).toBe(head.value.commitId);
+    expect(wire.headPublications).toBe(publications);
+    const snapshot = await remote.readSnapshot(head.value);
+    const entry = snapshot.entries["entry-1"];
+    if (entry?.kind !== "live") throw new Error("Expected live article");
+    expect(new TextDecoder().decode(await remote.readBlob(entry.revision.blobId))).toBe(localText());
+  }, 20_000);
+
+  it("recovers an actual loopback connection reset and reloads its diagnostics from disk", async () => {
+    const {plugin, remote, hooks, edit, app, wire, localRoot, localText} = await setup(true, ".obsidian", undefined, true);
+    hooks.wireFault = "reset-read";
+    edit("Local integration article 中文 📝.\n".repeat(200) + "FINAL SENTENCE");
+    await plugin.togglePause();
+    expect(wire.faults).toBe(1);
+    expect(plugin.getDiagnostics().records.at(-1)?.errorCategory).toBe("network");
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    const head = (await remote.readHead())!;
+    const snapshot = await remote.readSnapshot(head.value);
+    const entry = snapshot.entries["entry-1"];
+    if (entry?.kind !== "live") throw new Error("Expected live article");
+    expect(new TextDecoder().decode(await remote.readBlob(entry.revision.blobId))).toBe(localText());
+    expect(wire.requests).toBeGreaterThan(10);
+    expect(wire.signedRequests).toBe(wire.requests);
+    expect(localRoot).toBeDefined();
+    await plugin.togglePause();
+    plugin.onunload();
+    const replacement = new S3VaultSyncPlugin(app, {id: "s3-vault-sync"} as PluginManifest);
+    await replacement.onload();
+    expect(replacement.getDiagnostics().records.map(record => record.outcome)).toEqual(["retrying", "complete"]);
+    expect(replacement.exportDiagnostics()).not.toContain("FINAL SENTENCE");
+    expect(replacement.exportDiagnostics()).not.toContain("test-secret");
+    replacement.onunload();
+  }, 20_000);
+
   it("invalidates a retry queued behind an exclusive operation when its target changes", async () => {
     const {plugin, hooks} = await setup();
     hooks.headFailure = "network";
