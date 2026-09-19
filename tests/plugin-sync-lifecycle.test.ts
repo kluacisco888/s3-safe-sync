@@ -61,7 +61,7 @@ import { RemoteStore } from "../src/storage/remote-store";
 import { ObsidianVaultPort } from "../src/plugin/obsidian-vault-port";
 import { withVaultMutationLock } from "../src/plugin/safe-vault-write";
 
-const setup = async (initialized = true) => {
+const setup = async (initialized = true, configDir = ".obsidian") => {
   vi.useFakeTimers();
   vi.stubGlobal("window", globalThis);
   vi.stubGlobal("document", { visibilityState: "visible" });
@@ -161,20 +161,27 @@ const setup = async (initialized = true) => {
   });
   let text = "Original article.";
   const file = Object.assign(new TFile(), { path: entry.path, stat: { mtime: 1, size: 17 } });
-  const events = new Map<string, Array<(file: TFile) => void>>();
+  const events = new Map<string, Array<(file: TFile, oldPath?: string) => void>>();
   const edit = (value: string) => {
     text = value;
     file.stat = { ...file.stat, mtime: file.stat.mtime + 1, size: new TextEncoder().encode(text).length };
     for (const listener of events.get("modify") ?? []) listener(file);
   };
+  const rename = (oldPath: string, path: string) => {
+    if (file.path === oldPath) file.path = path;
+    for (const listener of events.get("rename") ?? []) {
+      listener(Object.assign(new TFile(), {path, stat: file.stat}), oldPath);
+    }
+  };
   const app = {
     secretStorage,
     vault: {
+      configDir,
       adapter: { exists: () => Promise.resolve(false) },
       getFiles: () => [file],
       getAbstractFileByPath: (path: string) => path === file.path ? file : null,
       readBinary: () => Promise.resolve(new TextEncoder().encode(text).buffer),
-      on: (name: string, listener: (file: TFile) => void) => {
+      on: (name: string, listener: (file: TFile, oldPath?: string) => void) => {
         const listeners = events.get(name) ?? [];
         listeners.push(listener);
         events.set(name, listeners);
@@ -201,7 +208,7 @@ const setup = async (initialized = true) => {
   }
   const plugin = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
   await plugin.onload();
-  return { plugin, remote, hooks, edit, localText: () => text, app, objects };
+  return { plugin, remote, hooks, edit, rename, localText: () => text, app, objects };
 };
 
 afterEach(() => {
@@ -211,6 +218,86 @@ afterEach(() => {
 });
 
 describe("plugin synchronization lifecycle", () => {
+  it.each([".obsidian", ".custom-config"])("does not persist a staging backup as a user rename with configDir=%s", async configDir => {
+    const {plugin, rename} = await setup(true, configDir);
+    rename("notes/example.md", `${configDir}/plugins/s3-vault-sync/staging/write-1.backup`);
+    await plugin.saveSettings();
+    expect((host.data as {pendingPathRenames: unknown}).pendingPathRenames).toEqual({});
+    plugin.onunload();
+  });
+
+  it.each([".obsidian", ".custom-config"])("removes persisted staging renames across restart with configDir=%s", async configDir => {
+    const {plugin, app, edit, localText} = await setup(true, configDir);
+    edit("A newer user edit must survive cleanup.");
+    await plugin.saveSettings();
+    plugin.onunload();
+    const previous = host.data as Record<string, unknown>;
+    const userRenames = {
+      "notes/user.md": {entryId: "user", toPath: "notes/user-renamed.md"},
+      "notes/hidden.md": {entryId: "hidden", toPath: "_private/hidden.md"},
+      "_private/returned.md": {entryId: "returned", toPath: "notes/returned.md"},
+    };
+    host.data = {...previous, pendingPathRenames: {
+      ...userRenames,
+      "notes/example.md": {entryId: "entry-1", toPath: `${configDir}/plugins/s3-vault-sync/staging/old-write.backup`},
+      "notes/legacy.md": {entryId: "legacy", toPath: ".obsidian/plugins/s3-vault-sync/staging/legacy.backup"},
+      [`${configDir}/plugins/s3-vault-sync/staging/old-write.new`]: {entryId: "internal", toPath: "notes/restored.md"},
+    }};
+
+    const replacement = new S3VaultSyncPlugin(app, {id: "s3-vault-sync"} as PluginManifest);
+    await replacement.onload();
+    expect((host.data as {pendingPathRenames: unknown}).pendingPathRenames).toEqual(userRenames);
+    expect((host.data as {cache: unknown}).cache).toEqual(previous.cache);
+    expect(localText()).toBe("A newer user edit must survive cleanup.");
+    replacement.onunload();
+    const restarted = new S3VaultSyncPlugin(app, {id: "s3-vault-sync"} as PluginManifest);
+    await restarted.onload();
+    expect((host.data as {pendingPathRenames: unknown}).pendingPathRenames).toEqual(userRenames);
+    restarted.onunload();
+  });
+
+  it("keeps user rename chains through excluded paths when staging events occur between them", async () => {
+    const {plugin, rename} = await setup();
+    rename("notes/example.md", "notes/renamed.md");
+    rename("notes/renamed.md", ".obsidian/plugins/s3-vault-sync/staging/internal.backup");
+    await plugin.saveSettings();
+    expect((host.data as {pendingPathRenames: unknown}).pendingPathRenames).toEqual({
+      "notes/example.md": {entryId: "entry-1", toPath: "notes/renamed.md"},
+    });
+    rename(".obsidian/plugins/s3-vault-sync/staging/internal.backup", "notes/renamed.md");
+    rename("notes/renamed.md", "_private/renamed.md");
+    await plugin.saveSettings();
+    expect((host.data as {pendingPathRenames: unknown}).pendingPathRenames).toEqual({
+      "notes/example.md": {entryId: "entry-1", toPath: "_private/renamed.md"},
+    });
+    rename("_private/renamed.md", ".obsidian/plugins/s3-vault-sync/staging-archive/renamed.md");
+    await plugin.saveSettings();
+    expect((host.data as {pendingPathRenames: unknown}).pendingPathRenames).toEqual({
+      "notes/example.md": {entryId: "entry-1", toPath: ".obsidian/plugins/s3-vault-sync/staging-archive/renamed.md"},
+    });
+    rename(".obsidian/plugins/s3-vault-sync/staging-archive/renamed.md", "notes/final.md");
+    await plugin.saveSettings();
+    expect((host.data as {pendingPathRenames: unknown}).pendingPathRenames).toEqual({
+      "notes/example.md": {entryId: "entry-1", toPath: "notes/final.md"},
+    });
+    plugin.onunload();
+  });
+
+  it("persists a user rename received while synchronization is running", async () => {
+    const {plugin, hooks, edit, rename} = await setup();
+    edit("A user edit ready to upload.");
+    hooks.beforeBlobRead = () => {
+      hooks.beforeBlobRead = undefined;
+      rename("notes/example.md", "notes/renamed-during-sync.md");
+    };
+    await plugin.togglePause();
+    await plugin.saveSettings();
+    expect((host.data as {pendingPathRenames: unknown}).pendingPathRenames).toEqual({
+      "notes/example.md": {entryId: "entry-1", toPath: "notes/renamed-during-sync.md"},
+    });
+    plugin.onunload();
+  });
+
   it("does not delete after its session stops while waiting for a mutation lock", async () => {
     const { app } = await setup();
     const trash = vi.fn(async () => {});

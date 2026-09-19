@@ -20,6 +20,7 @@ import {
   type DesktopHashDependencies,
 } from "./desktop-streaming-hash";
 import { deleteVaultPath } from "./vault-delete";
+import { cleanupEmptyParents, type EmptyDirectoryCleanupOptions } from "./empty-directory-cleanup";
 import {
   recoverPendingVaultWrites,
   isSafeTargetPath,
@@ -60,6 +61,36 @@ export class ObsidianVaultPort implements LocalVaultPort {
     private readonly vault: Vault,
     private readonly assertActive: () => void = () => undefined,
   ) {}
+
+  async cleanupEmptyDirectories(retiredPaths: readonly string[]): Promise<void> {
+    this.assertActive();
+    const adapter = this.vault.adapter;
+    // The mobile adapter currently forces recursive deletion even when passed false.
+    // Desktop also needs the directory-only Node primitive, not adapter.rmdir / fs.rm.
+    if (!Platform.isDesktopApp || !(adapter instanceof FileSystemAdapter)) return;
+    const host = adapter as FileSystemAdapter & {
+      queue?: (action: () => Promise<void>) => Promise<void>;
+      reconcileInternalFile?: (path: string) => Promise<void>;
+    };
+    if (!host.queue || !host.reconcileInternalFile) return;
+    const nodeRequire = (window as Window & {require?: (id: string) => unknown}).require;
+    if (!nodeRequire) return;
+    const fs = nodeRequire("node:fs/promises") as EmptyDirectoryCleanupOptions["fs"];
+    if (!fs.lstat || !fs.readdir || !fs.rmdir) return;
+    await withVaultMutationLock(adapter, () => host.queue!(async () => {
+      const removed = await cleanupEmptyParents(retiredPaths, {
+        fullPath: path => adapter.getFullPath(path),
+        configDir: this.vault.configDir,
+        isInSyncScope,
+        fs,
+        assertActive: this.assertActive,
+      });
+      for (const path of removed) {
+        this.assertActive();
+        await host.reconcileInternalFile!(path);
+      }
+    }));
+  }
 
   async delete(
     path: string,
@@ -161,7 +192,8 @@ export class ObsidianVaultPort implements LocalVaultPort {
       const normalizedTarget = normalizePath(toPath);
       if (
         !isSafeTargetPath(normalizedSource) ||
-        !isSafeTargetPath(normalizedTarget)
+        !isSafeTargetPath(normalizedTarget) ||
+        canonicalVaultPath(normalizedSource) === canonicalVaultPath(normalizedTarget)
       ) {
         throw new Error(`Refusing to move an unsafe Vault path: ${toPath}`);
       }
@@ -185,13 +217,20 @@ export class ObsidianVaultPort implements LocalVaultPort {
       if (parent) {
         await this.ensureFolder(parent);
       }
-      try {
-        await this.vault.adapter.copy(normalizedSource, normalizedTarget);
-      } catch (error) {
-        if (await this.vault.adapter.exists(normalizedTarget)) {
+      if (targetHash !== undefined) {
+        // Only a caller-verified, unchanged copy may finish an interrupted move.
+        if (!expectedSourceHash || expectedTargetHash !== expectedSourceHash || targetHash !== expectedSourceHash) {
           throw new LocalStateChangedError(toPath);
         }
-        throw error;
+      } else {
+        try {
+          await this.vault.adapter.copy(normalizedSource, normalizedTarget);
+        } catch (error) {
+          if (await this.vault.adapter.exists(normalizedTarget)) {
+            throw new LocalStateChangedError(toPath);
+          }
+          throw error;
+        }
       }
       const copiedHash = await this.readAdapterHash(normalizedTarget);
       const sourceHash = expectedSourceHash ?? (await this.readAdapterHash(normalizedSource));

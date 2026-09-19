@@ -13,6 +13,14 @@ export type PersistedPathRenames = Record<string, PersistedPathRename>;
 const pathIsWithin = (path: string, parent: string): boolean =>
   path === parent || path.startsWith(`${parent}/`);
 
+export const isInternalStagingRename = (
+  oldPath: string,
+  newPath: string,
+  configDir = ".obsidian",
+): boolean => [".obsidian", configDir].some(directory =>
+  [oldPath, newPath].some(path => pathIsWithin(path, `${directory}/plugins/s3-vault-sync/staging`)),
+);
+
 export class PathRenameTracker {
   private nextVersion = 0;
   private readonly renames = new Map<string, PathRenameVersion>();
