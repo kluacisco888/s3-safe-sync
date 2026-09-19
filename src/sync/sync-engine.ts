@@ -224,7 +224,7 @@ export class SyncEngine {
   constructor(private readonly createId: () => string = () => crypto.randomUUID()) {}
 
   reconcile({ base, local, remote, allowIndependentCreatesAndDeletes = false }: ReconcileInput): SyncPlan {
-    // Resume only an unchanged, identity-proven remote move whose copy already exists.
+    // Resume only identity-proven remote moves whose verified target already exists.
     // Equal hashes alone never establish identity for unrelated local files.
     if (base && !local.bootstrapPending) {
       const byPath = new Map(local.files.map(file => [file.path, file]));
@@ -248,6 +248,7 @@ export class SyncEngine {
       }
       const deferred = new Set([...(local.deferredEntryIds ?? []), ...(local.unmaterializedEntryIds ?? [])]);
       const copiedTargets = new Set<ObservedFile>();
+      const completedTargets = new Map<ObservedFile, string>();
       for (const entry of Object.values(remote.entries)) {
         const prior = base.entries[entry.entryId];
         if (entry.kind !== "live" || prior?.kind !== "live" || deferred.has(entry.entryId) ||
@@ -255,15 +256,24 @@ export class SyncEngine {
         const sources = byId.get(entry.entryId), target = byPath.get(entry.path);
         const source = sources?.length === 1 ? sources[0] : undefined;
         const path = canonicalVaultPath(entry.path);
-        if (!source || source.path !== prior.path || !target || target.entryId !== undefined ||
-          localPathCounts.get(path) !== 1 || localPathCounts.get(canonicalVaultPath(source.path)) !== 1 ||
-          remoteOwners.get(path) !== 1 || [...(baseOwners.get(path) ?? [])].some(id => id !== entry.entryId) ||
+        if (!target || target.entryId !== undefined || localPathCounts.get(path) !== 1 ||
+          remoteOwners.get(path) !== 1 || [...(baseOwners.get(path) ?? [])].some(id => id !== entry.entryId)) continue;
+        // A previous run may have finished moving and downloading before its cache save.
+        // Accept only the exact current remote bytes, with no remaining source claimant.
+        if (!sources && !localPathCounts.has(canonicalVaultPath(prior.path)) &&
+          target.contentHash === entry.revision.contentHash && target.size === entry.revision.size) {
+          completedTargets.set(target, entry.entryId);
+          continue;
+        }
+        if (!source || source.path !== prior.path || localPathCounts.get(canonicalVaultPath(source.path)) !== 1 ||
           source.contentHash !== prior.revision.contentHash || target.contentHash !== source.contentHash ||
           entry.revision.contentHash !== source.contentHash || source.size !== prior.revision.size ||
           target.size !== source.size || entry.revision.size !== source.size) continue;
         copiedTargets.add(target);
       }
-      if (copiedTargets.size) local = {...local, files: local.files.filter(file => !copiedTargets.has(file))};
+      if (copiedTargets.size || completedTargets.size) local = {...local,
+        files: local.files.filter(file => !copiedTargets.has(file)).map(file =>
+          completedTargets.has(file) ? {...file, entryId: completedTargets.get(file)!} : file)};
     }
     const pathsByCanonicalForm = new Map<string, string[]>();
     const localFilesByCanonicalPath = new Map<string, ObservedFile[]>();

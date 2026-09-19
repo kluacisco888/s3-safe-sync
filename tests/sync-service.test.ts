@@ -4559,6 +4559,76 @@ describe("SyncService", () => {
     expect((await phone.synchronize()).status).toBe("complete");
   });
 
+  it("resumes after a remote rename and content update finished before a later download failed", async () => {
+    const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "completed-move", vaultKey: new Uint8Array(32)});
+    class InterruptedVault extends MemoryVault {
+      interrupt = false;
+      override async write(path: string, body: Uint8Array): Promise<void> {
+        if (this.interrupt && path === "Raycloud/remaining.md") {
+          this.interrupt = false;
+          throw new Error("Later download interrupted");
+        }
+        return super.write(path, body);
+      }
+    }
+    const source = new MemoryVault(), local = new InterruptedVault(), cache = new MemorySyncCache();
+    const desktop = new SyncService({remote, local: source, cache: new MemorySyncCache(), replicaId: "desktop"});
+    const phone = new SyncService({remote, local, cache, replicaId: "phone"});
+    await source.write("old/note.md", new TextEncoder().encode("old content"));
+    await desktop.initializeNew("vault");
+    await phone.synchronize();
+    const base = cache.state!.snapshot.commitId;
+    const id = cache.state!.files["old/note.md"]!.entryId;
+    await source.move("old/note.md", "new/note.md");
+    await source.write("new/note.md", new TextEncoder().encode("updated remote content"));
+    await source.write("Raycloud/remaining.md", new TextEncoder().encode("remaining document"));
+    await desktop.synchronize([], {pathRenames: new Map([["old/note.md", {entryId: id, toPath: "new/note.md"}]])});
+    const head = (await remote.readHead())!.value.commitId;
+    local.interrupt = true;
+    await expect(phone.synchronize()).rejects.toThrow("Later download interrupted");
+    expect(local.readText("old/note.md")).toBeUndefined();
+    expect(local.readText("new/note.md")).toBe("updated remote content");
+    expect(cache.state!.snapshot.commitId).toBe(base);
+
+    const resumed = await phone.synchronize();
+
+    expect(resumed.status).toBe("complete");
+    expect(resumed.uploaded).toBe(0);
+    expect(local.readText("new/note.md")).toBe("updated remote content");
+    expect(local.readText("Raycloud/remaining.md")).toBe("remaining document");
+    expect(cache.state!.files["new/note.md"]!.entryId).toBe(id);
+    expect(cache.state!.snapshot.commitId).toBe(head);
+    expect((await remote.readHead())!.value.commitId).toBe(head);
+    expect((await phone.synchronize()).status).toBe("complete");
+  });
+
+  it.each(["edited target", "recreated source"])("keeps a completed-move recovery blocked for %s", async change => {
+    const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "ambiguous-completed-move", vaultKey: new Uint8Array(32)});
+    const source = new MemoryVault(), local = new MemoryVault(), cache = new MemorySyncCache();
+    const desktop = new SyncService({remote, local: source, cache: new MemorySyncCache(), replicaId: "desktop"});
+    const phone = new SyncService({remote, local, cache, replicaId: "phone"});
+    await source.write("old.md", new TextEncoder().encode("original"));
+    await desktop.initializeNew("vault");
+    await phone.synchronize();
+    const base = cache.state!.snapshot.commitId, id = cache.state!.files["old.md"]!.entryId;
+    await source.move("old.md", "new.md");
+    await source.write("new.md", new TextEncoder().encode("updated remote"));
+    await desktop.synchronize([], {pathRenames: new Map([["old.md", {entryId: id, toPath: "new.md"}]])});
+    const head = (await remote.readHead())!.value.commitId;
+    await local.move("old.md", "new.md");
+    await local.write("new.md", new TextEncoder().encode(change === "edited target" ? "new phone draft" : "updated remote"));
+    if (change === "recreated source") await local.write("old.md", new TextEncoder().encode("new old-path draft"));
+
+    const result = await phone.synchronize();
+
+    expect(result.status).toBe("action-required");
+    expect(result.cacheUpdated).toBe(false);
+    expect(local.readText("new.md")).toBe(change === "edited target" ? "new phone draft" : "updated remote");
+    expect(local.readText("old.md")).toBe(change === "recreated source" ? "new old-path draft" : undefined);
+    expect(cache.state!.snapshot.commitId).toBe(base);
+    expect((await remote.readHead())!.value.commitId).toBe(head);
+  });
+
   it("cleans only retired parent paths after the new state is accepted, never while a collision blocks sync", async () => {
     const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "cleanup-order", vaultKey: new Uint8Array(32)});
     const source = new MemoryVault(), cache = new MemorySyncCache();
