@@ -97,6 +97,8 @@ export interface SyncServiceOptions {
   local: LocalVaultPort;
   maxAutomaticFileBytes?: number | ((path: string) => number | undefined);
   onProgress?: (progress: SyncProgress) => void;
+  onRemoteHead?: (commitId: string) => void;
+  onRemotePublished?: (commitId: string) => void;
   onIntegrityVerified?: (check: RemoteIntegrityCheck) => Promise<void>;
   remote: RemoteStore;
   replicaId: string;
@@ -1155,6 +1157,7 @@ export class SyncService {
     if (!versionedHead) {
       throw new Error("Remote Store is not initialized");
     }
+    this.options.onRemoteHead?.(versionedHead.value.commitId);
     let remote = await this.options.remote.readSnapshot(versionedHead.value);
     const cached = await this.options.cache.load();
     const scan = await this.scanFiles(cached, true, syncOptions);
@@ -1937,6 +1940,7 @@ export class SyncService {
         expectedHeadEtag: versionedHead.etag,
         head,
       });
+      this.options.onRemotePublished?.(commitId);
       remote = {
         commitId,
         entries: nextEntries,

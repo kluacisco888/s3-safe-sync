@@ -9,12 +9,14 @@ const host = vi.hoisted((): {
   beforeSave?: () => Promise<void>;
   beforeLoad?: () => Promise<void>;
   registrationCount: number;
+  domEvents: Map<string, Array<() => void>>;
 } => ({
   data: undefined,
   notices: [],
   noticeActions: [],
   requestUrl: vi.fn(),
   registrationCount: 0,
+  domEvents: new Map(),
 }));
 
 vi.mock("obsidian", () => ({
@@ -38,7 +40,9 @@ vi.mock("obsidian", () => ({
     addCommand() { host.registrationCount += 1; }
     addRibbonIcon() {}
     addSettingTab() {}
-    registerDomEvent() {}
+    registerDomEvent(_target: unknown, name: string, listener: () => void) {
+      host.domEvents.set(name, [...(host.domEvents.get(name) ?? []), listener]);
+    }
     registerEvent() {}
     registerInterval() {}
   },
@@ -57,6 +61,7 @@ import { CredentialStore } from "../src/plugin/credential-store";
 import { DEFAULT_SETTINGS } from "../src/plugin/settings";
 import { AwsS3ObjectStore } from "../src/storage/aws-s3-object-store";
 import { executeObsidianHttpRequest } from "../src/storage/obsidian-http";
+import type { ObsidianRequestExecutor } from "../src/storage/obsidian-request-adapter";
 import { RemoteStore } from "../src/storage/remote-store";
 import { ObsidianVaultPort } from "../src/plugin/obsidian-vault-port";
 import { withVaultMutationLock } from "../src/plugin/safe-vault-write";
@@ -70,13 +75,16 @@ const setup = async (initialized = true, configDir = ".obsidian") => {
   host.beforeSave = undefined;
   host.beforeLoad = undefined;
   host.registrationCount = 0;
+  host.domEvents.clear();
   const objects = new Map<string, { body: Uint8Array; etag: string }>();
+  const diagnosticFiles = new Map<string, string>();
   let sequence = 0;
   const hooks: {
     beforeBlobRead?: () => void;
-    headFailure?: "network" | "corrupt";
+    headFailure?: "network" | "corrupt" | "forbidden";
     failNextBlobPut?: boolean;
     afterProbePut?: () => void;
+    afterHeadPut?: () => void;
   } = {};
   host.requestUrl.mockImplementation(async (request: {
     url: string; method: string; body?: ArrayBuffer; headers: Record<string, string>;
@@ -98,7 +106,7 @@ const setup = async (initialized = true, configDir = ".obsidian") => {
       body = stored?.body ?? body;
       etag = stored?.etag;
       if (key.endsWith("/head") && hooks.headFailure) {
-        status = hooks.headFailure === "network" ? 503 : 200;
+        status = hooks.headFailure === "network" ? 503 : hooks.headFailure === "forbidden" ? 403 : 200;
         body = new TextEncoder().encode("invalid remote response");
       }
     } else if (request.method === "PUT") {
@@ -120,6 +128,7 @@ const setup = async (initialized = true, configDir = ".obsidian") => {
       throw new Error(`Unexpected request method: ${request.method}`);
     }
     if (request.method === "PUT" && key.includes(".s3-vault-sync-probe-")) hooks.afterProbePut?.();
+    if (request.method === "PUT" && key.endsWith("/head") && status === 200) hooks.afterHeadPut?.();
     return {
       arrayBuffer: body.slice().buffer,
       headers: { date: new Date().toUTCString(), "last-modified": new Date().toUTCString(), ...(etag ? { etag } : {}) },
@@ -177,7 +186,11 @@ const setup = async (initialized = true, configDir = ".obsidian") => {
     secretStorage,
     vault: {
       configDir,
-      adapter: { exists: () => Promise.resolve(false) },
+      adapter: {
+        exists: (path: string) => Promise.resolve(diagnosticFiles.has(path)),
+        read: async (path: string) => { const body = diagnosticFiles.get(path); if (body === undefined) throw new Error("Missing file"); return body; },
+        write: async (path: string, body: string) => { diagnosticFiles.set(path, body); },
+      },
       getFiles: () => [file],
       getAbstractFileByPath: (path: string) => path === file.path ? file : null,
       readBinary: () => Promise.resolve(new TextEncoder().encode(text).buffer),
@@ -208,7 +221,7 @@ const setup = async (initialized = true, configDir = ".obsidian") => {
   }
   const plugin = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
   await plugin.onload();
-  return { plugin, remote, hooks, edit, rename, localText: () => text, app, objects };
+  return { plugin, remote, hooks, edit, rename, localText: () => text, app, objects, diagnosticFiles };
 };
 
 afterEach(() => {
@@ -218,6 +231,238 @@ afterEach(() => {
 });
 
 describe("plugin synchronization lifecycle", () => {
+  it("keeps a retry's accepted Head when an older timed-out PUT arrives late", async () => {
+    const {plugin, remote, edit} = await setup();
+    const execute = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => {release = resolve;});
+    let held = false, lateStatus: number | undefined;
+    host.requestUrl.mockImplementation(async (request: Parameters<ObsidianRequestExecutor>[0]) => {
+      if (!held && request.method === "PUT" && new URL(request.url).pathname.endsWith("/head")) {
+        held = true;
+        await gate;
+        const response = await execute(request);
+        lateStatus = response.status;
+        return response;
+      }
+      return execute(request);
+    });
+    edit("The full draft must survive the late request.");
+    const first = plugin.togglePause();
+    await vi.waitFor(() => expect(held).toBe(true));
+    await vi.advanceTimersByTimeAsync(120_000);
+    await first;
+    expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({outcome: "retrying", errorCategory: "timeout", writeResultUncertain: true});
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    const winner = (await remote.readHead())!.value.commitId;
+    release();
+    await vi.waitFor(() => expect(lateStatus).toBe(412));
+    expect((await remote.readHead())!.value.commitId).toBe(winner);
+    expect(plugin.getDiagnostics().acceptedCommit).toBe(winner);
+    plugin.onunload();
+  });
+
+  it("records a coalesced follow-up request separately from the active run", async () => {
+    const {plugin, hooks, edit} = await setup();
+    edit("An edited note.");
+    hooks.beforeBlobRead = () => {
+      hooks.beforeBlobRead = undefined;
+      void plugin.syncNow();
+      expect(plugin.getDiagnostics().queued).toBe(true);
+    };
+    await plugin.togglePause();
+    expect(plugin.getDiagnostics().records.map(record => record.triggers)).toEqual([["resume"], ["manual"]]);
+    expect(plugin.getDiagnostics().queued).toBe(false);
+    plugin.onunload();
+  });
+
+  it("keeps sync usable when diagnostic persistence fails and reports the logging failure safely", async () => {
+    const {plugin, app, edit, remote} = await setup();
+    vi.spyOn(app.vault.adapter, "write").mockRejectedValue(new Error("secret local path and credentials"));
+    edit("A saved paragraph.");
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toMatch(/^Idle:/);
+    expect((await remote.readHead())!.value.commitId).not.toBe("initial");
+    expect(plugin.getDiagnostics().persistenceWarning).toContain("could not be saved");
+    expect(plugin.exportDiagnostics()).not.toContain("secret local path");
+    plugin.onunload();
+  });
+
+  it("bounds persisted history, marks interrupted runs, and strips injected fields on reload", async () => {
+    const {plugin, app, diagnosticFiles} = await setup();
+    await plugin.togglePause();
+    const sample = plugin.getDiagnostics().records.at(-1)!;
+    await plugin.togglePause();
+    plugin.onunload();
+    const records = Array.from({length: 1_005}, (_, index) => ({...sample, id: `run-${index}`,
+      privateField: "INJECTED SECRET", triggers: ["manual", "INJECTED SECRET"],
+      outcome: index === 1_004 ? "running" : "complete", counts: {...sample.counts, path: "PRIVATE PATH"}}));
+    diagnosticFiles.set(".obsidian/plugins/s3-vault-sync/diagnostics.json", JSON.stringify({version: 1, records}));
+    const replacement = new S3VaultSyncPlugin(app, {id: "s3-vault-sync"} as PluginManifest);
+    await replacement.onload();
+    const exported = replacement.exportDiagnostics();
+    const parsed = JSON.parse(exported) as {records: Array<{id: string; outcome: string}>};
+    expect(parsed.records).toHaveLength(1_000);
+    expect(parsed.records[0]?.id).toBe("run-5");
+    expect(parsed.records.at(-1)?.outcome).toBe("interrupted");
+    expect(exported).not.toContain("INJECTED SECRET");
+    expect(exported).not.toContain("PRIVATE PATH");
+    vi.setSystemTime(Date.now() + 8 * 24 * 60 * 60 * 1_000);
+    expect(replacement.getDiagnostics().records).toEqual([]);
+    replacement.onunload();
+  });
+
+  it("does not show another Vault's past diagnostic history", async () => {
+    const {plugin} = await setup();
+    await plugin.togglePause();
+    await plugin.togglePause();
+    plugin.getSettings().vaultId = "different-vault";
+    expect(plugin.getDiagnostics().records).toEqual([]);
+    expect(plugin.getDiagnostics().acceptedCommit).toBeUndefined();
+    plugin.onunload();
+  });
+
+  it("reports run reasons, transfer counts, phases, request totals and the last accepted version", async () => {
+    const {plugin, edit} = await setup();
+    edit("A changed article.");
+    await plugin.togglePause();
+    const view = plugin.getDiagnostics(), record = view.records.at(-1)!;
+    expect(record).toMatchObject({triggers: ["resume"], vaultId: "vault-1", outcome: "complete",
+      counts: {uploaded: 1, downloaded: 0, deleted: 0, deferred: 0, unsynced: 0}, phase: "saving"});
+    expect(record.requests).toBeGreaterThan(0);
+    expect(record.sentBytes).toBeGreaterThan(0);
+    expect(record.receivedBytes).toBeGreaterThan(0);
+    expect(record.phaseDurations?.hashing).toBeDefined();
+    expect(view.acceptedCommit).toBe(record.acceptedAfter);
+    expect(view.lastSuccessAt).toBe(record.finishedAt);
+    expect(view.queued).toBe(false);
+    expect(view.pendingLocalChanges).toBe(0);
+    expect(record.remoteCheckedAt).toBeDefined();
+    plugin.onunload();
+  });
+
+  it("bounds fast network retries and lets an explicit manual sync recover later", async () => {
+    const {plugin, hooks} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    for (let count = 2; count <= 4; count++) {
+      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.waitFor(() => expect(plugin.getDiagnostics().records.at(count - 1)?.finishedAt).toBeDefined());
+    }
+    expect(plugin.getDiagnostics().records).toHaveLength(4);
+    expect(plugin.getStatusText()).toMatch(/^Error:/);
+    expect(host.notices).toHaveLength(1);
+    hooks.headFailure = undefined;
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^Idle:/);
+    plugin.onunload();
+  });
+
+  it.each(["pause", "unload"])("cancels a pending network retry on %s", async action => {
+    const {plugin, hooks} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    const requests = host.requestUrl.mock.calls.length;
+    if (action === "pause") await plugin.togglePause(); else plugin.onunload();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(host.requestUrl.mock.calls.length).toBe(requests);
+    expect(plugin.getDiagnostics().records).toHaveLength(1);
+    plugin.onunload();
+  });
+
+  it("does not fast-retry permissions or authenticated-metadata failures", async () => {
+    const {plugin, hooks} = await setup();
+    for (const failure of ["forbidden", "corrupt"] as const) {
+      hooks.headFailure = failure;
+      if (plugin.isPaused()) await plugin.togglePause(); else await plugin.syncNow();
+      const requests = host.requestUrl.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(host.requestUrl.mock.calls.length).toBe(requests);
+    }
+    plugin.onunload();
+  });
+
+  it("reconciles an accepted Head after losing its PUT response instead of publishing again", async () => {
+    const {plugin, remote, hooks, edit, localText} = await setup();
+    let publications = 0;
+    hooks.afterHeadPut = () => { if (++publications === 1) throw new Error("Connection reset after PUT"); };
+    edit("Saved article including its final sentence.");
+    await plugin.togglePause();
+    const acceptedHead = (await remote.readHead())!.value.commitId;
+    expect(plugin.getStatusText()).toContain("Retrying automatically");
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    expect((await remote.readHead())!.value.commitId).toBe(acceptedHead);
+    expect(publications).toBe(1);
+    const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+    const entry = snapshot.entries["entry-1"];
+    if (entry?.kind !== "live") throw new Error("Expected live file");
+    expect(new TextDecoder().decode(await remote.readBlob(entry.revision.blobId))).toBe(localText());
+    plugin.onunload();
+  });
+
+  it("uses a connectivity event to recover without waiting for a scheduled retry", async () => {
+    const {plugin, hooks} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    hooks.headFailure = undefined;
+    for (const listener of host.domEvents.get("online") ?? []) {listener(); listener();}
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    expect(plugin.getDiagnostics().records).toHaveLength(2);
+    plugin.onunload();
+  });
+
+  it("automatically recovers from a temporary 503 using a fresh sync without a failure notice", async () => {
+    const {plugin, hooks, remote} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toContain("Retrying automatically");
+    expect(host.notices).toEqual([]);
+    hooks.headFailure = undefined;
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/u));
+    expect((await remote.readHead())?.value.commitId).toBe("initial");
+    expect(plugin.getDiagnostics().records.map(record => record.outcome)).toEqual(["retrying", "complete"]);
+    plugin.onunload();
+  });
+
+  it("records a published Head even when accepting the local cache subsequently fails", async () => {
+    const {plugin, remote, hooks, edit} = await setup();
+    edit("An unpublished draft.");
+    hooks.afterHeadPut = () => {
+      hooks.afterHeadPut = undefined;
+      host.beforeSave = async () => {host.beforeSave = undefined; throw new Error("Private local filesystem failure");};
+    };
+    await plugin.togglePause();
+    const head = (await remote.readHead())!;
+    expect(head.value.commitId).not.toBe("initial");
+    expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({outcome: "error", publishedCommit: head.value.commitId});
+    expect(plugin.getDiagnostics().records.at(-1)?.acceptedAfter).not.toBe(head.value.commitId);
+    expect(plugin.exportDiagnostics()).not.toContain("Private local filesystem failure");
+    plugin.onunload();
+  });
+
+  it("retains an accepted sync record across reload without exporting content or credentials", async () => {
+    const {plugin, app, edit} = await setup();
+    edit("Private article text should never enter diagnostics.");
+    await plugin.togglePause();
+    const before = plugin.getDiagnostics();
+    expect(before.records.at(-1)).toMatchObject({outcome: "complete", acceptedBefore: "initial", observedRemote: "initial"});
+    expect(before.records.at(-1)?.acceptedAfter).not.toBe("initial");
+    expect(before.records.at(-1)?.publishedCommit).toBe(before.records.at(-1)?.acceptedAfter);
+    await plugin.togglePause();
+    plugin.onunload();
+    const replacement = new S3VaultSyncPlugin(app, {id: "s3-vault-sync"} as PluginManifest);
+    await replacement.onload();
+    expect(replacement.getDiagnostics().records).toEqual(before.records);
+    const exported = replacement.exportDiagnostics();
+    for (const secret of ["test-key", "test-secret", "test-bucket", "test-prefix", "notes/example.md", "Private article text"]) {
+      expect(exported).not.toContain(secret);
+    }
+    replacement.onunload();
+  });
+
   it.each([".obsidian", ".custom-config"])("does not persist a staging backup as a user rename with configDir=%s", async configDir => {
     const {plugin, rename} = await setup(true, configDir);
     rename("notes/example.md", `${configDir}/plugins/s3-vault-sync/staging/write-1.backup`);

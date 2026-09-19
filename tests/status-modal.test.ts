@@ -64,6 +64,44 @@ const reviewActions = {
 };
 
 describe("StatusModal", () => {
+  it.each([true, false])("exports the diagnostic payload when clipboard availability is %s", async available => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", available ? {clipboard: {writeText}} : {});
+    try {
+      const payload = '{"version":1,"records":[]}';
+      const controller = {...issueController([]), exportDiagnostics: () => payload};
+      const modal = new StatusModal({} as App, controller);
+      modal.onOpen();
+      type FakeElement = InstanceType<typeof Element>;
+      const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
+      all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Copy diagnostics")!.events.get("click")!();
+      if (available) await vi.waitFor(() => expect(writeText).toHaveBeenCalledWith(payload));
+      else await vi.waitFor(() => expect(all(opened.at(-1)!.contentEl).some(node => node.tag === "textarea" && node.value === payload)).toBe(true));
+    } finally {vi.unstubAllGlobals();}
+  });
+
+  it("shows accepted versus observed versions, pending counts and a diagnostics export action", () => {
+    const controller = {...issueController([]), exportDiagnostics: () => '{"version":1}', getDiagnostics: () => ({
+      acceptedCommit: "accepted-version", lastSuccessAt: 1_700_000_000_000, nextRetryAt: 1_700_000_003_000,
+      queued: false, pendingLocalChanges: 2,
+      records: [{id: "run", vaultId: "vault", startedAt: 1_700_000_001_000, finishedAt: 1_700_000_002_000,
+        outcome: "retrying" as const, triggers: ["manual" as const], phase: "downloading" as const,
+        phaseDurations: {downloading: 1000}, observedRemote: "remote-version", remoteCheckedAt: 1_700_000_001_000,
+        requests: 3, sentBytes: 0, receivedBytes: 42, pendingDownloads: 4, pendingUploads: 1,
+        errorCategory: "service" as const, httpStatus: 503}],
+    })};
+    const modal = new StatusModal({} as App, controller);
+    modal.onOpen();
+    type FakeElement = InstanceType<typeof Element>;
+    const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
+    const texts = all(modal.contentEl as unknown as FakeElement).map(node => node.text);
+    expect(texts).toContain("Local accepted Commit: accepted-version");
+    expect(texts.some(text => text.includes("Last checked S3 Head: remote-version"))).toBe(true);
+    expect(texts.some(text => text.includes("Pending uploads: 1") && text.includes("Pending downloads: 4"))).toBe(true);
+    expect(texts.some(text => text.includes("service") && text.includes("503"))).toBe(true);
+    expect(texts).toContain("Copy diagnostics");
+  });
+
   it("offers a real review action for a collision that lists only one path", () => {
     const modal = new StatusModal({} as App, issueController([{kind: "path-collision", paths: ["weekly.md"]}]));
     modal.onOpen();

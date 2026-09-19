@@ -5,6 +5,17 @@ import { createObsidianHttpExecutor } from "../src/storage/obsidian-request-adap
 describe("createObsidianHttpExecutor", () => {
   afterEach(() => vi.useRealTimers());
 
+  it("classifies a lost PUT response without exposing request secrets or retrying the write", async () => {
+    const requestUrl = vi.fn().mockRejectedValue(new Error("network failed: secret-key in private-url"));
+    const execute = createObsidianHttpExecutor(requestUrl);
+    const error = await execute({url: "https://private.invalid/head", method: "PUT", headers: {authorization: "secret-key"}})
+      .catch((error: unknown) => error);
+    expect(error).toMatchObject({name: "S3TransportError", kind: "network", writeMayHaveSucceeded: true});
+    expect(String(error)).not.toContain("secret-key");
+    expect(String(error)).not.toContain("private-url");
+    expect(requestUrl).toHaveBeenCalledTimes(1);
+  });
+
   it("cancels a waiting request and ignores its late response", async () => {
     vi.useFakeTimers();
     const controller = new AbortController();

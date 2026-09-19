@@ -21,6 +21,14 @@ export type ObsidianRequestExecutor = (
   request: ObsidianRequestInput,
 ) => Promise<ObsidianResponseOutput>;
 
+export class S3TransportError extends Error {
+  constructor(readonly kind: "network" | "timeout", readonly writeMayHaveSucceeded: boolean) {
+    super(kind === "timeout" ? "S3 request timed out after 120 seconds. Check the connection and retry sync."
+      : "S3 network request failed. Check the connection and retry sync.");
+    this.name = "S3TransportError";
+  }
+}
+
 const forbiddenRequestHeaders = new Set(["content-length", "host"]);
 
 const toArrayBuffer = (body: Uint8Array): ArrayBuffer =>
@@ -45,6 +53,7 @@ export const createObsidianHttpExecutor = (
 ): HttpExecutor =>
   async (request: HttpRequestInput) => {
     const method = request.method.toUpperCase();
+    const writeMayHaveSucceeded = method !== "GET" && method !== "HEAD";
     const abortError = (): Error => signal?.reason instanceof Error
       ? signal.reason
       : new Error("S3 request was cancelled");
@@ -52,14 +61,12 @@ export const createObsidianHttpExecutor = (
     let timer: ReturnType<typeof setTimeout> | undefined;
     let onAbort: (() => void) | undefined;
     const interrupted = new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => reject(new Error(
-        "S3 request timed out after 120 seconds. Check the connection and retry sync.",
-      )), 120_000);
+      timer = setTimeout(() => reject(new S3TransportError("timeout", writeMayHaveSucceeded)), 120_000);
       onAbort = () => reject(abortError());
       signal?.addEventListener("abort", onAbort, { once: true });
     });
     try {
-      const response = await Promise.race([execute({
+      const delivered = (async () => { try { return await execute({
         body:
           request.body && method !== "GET" && method !== "HEAD"
             ? toArrayBuffer(request.body)
@@ -68,7 +75,11 @@ export const createObsidianHttpExecutor = (
         method: request.method,
         throw: false,
         url: request.url,
-      }), interrupted]);
+      }); } catch {
+        if (signal?.aborted) throw abortError();
+        throw new S3TransportError("network", writeMayHaveSucceeded);
+      } })();
+      const response = await Promise.race([delivered, interrupted]);
       return {
         body: new Uint8Array(response.arrayBuffer),
         headers: response.headers,

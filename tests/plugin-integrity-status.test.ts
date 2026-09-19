@@ -134,7 +134,7 @@ it("preserves integrity attention across pause, settings, reload, and a network 
   host.request.mockRejectedValueOnce(new Error("Network offline"));
   await restarted.togglePause();
   expect(restarted.getStatusText()).toMatch(/^Action required:/);
-  expect(restarted.getStatusText()).toContain("Network offline");
+  expect(restarted.getStatusText()).toContain("Temporary network failure");
   expect(host.stored.pendingIntegrityChecks).toHaveLength(1);
   await restarted.syncNow();
   expect(restarted.getStatusText()).toMatch(/^Action required:/); // Import still needs its own decision.

@@ -24,8 +24,11 @@ import { actionButton } from "./modal-actions";
 import { LocalContentReviewModal } from "./content-review-modal";
 import { PathCollisionModal } from "./path-collision-modal";
 import type { PathCollisionReview, PathCollisionResolution } from "../sync/path-collision-review";
+import type { SyncDiagnosticsView } from "./sync-diagnostics";
 
 export interface StatusModalController {
+  getDiagnostics?(limit?: number): SyncDiagnosticsView;
+  exportDiagnostics?(): string;
   reviewPathCollision(paths: string[]): Promise<PathCollisionReview>;
   resolvePathCollision(request: PathCollisionResolution): Promise<string>;
   confirmInterruptedCollisionRename(paths: string[], reviewToken: string, side: "source" | "target"): Promise<void>;
@@ -302,11 +305,15 @@ export class StatusModal extends Modal {
     this.contentEl.createEl("h2", { text: "S3 Vault Sync" });
     const status = this.contentEl.createEl("p", { text: this.controller.getStatusText() });
     const controls = this.contentEl.createDiv();
+    const diagnostics = this.contentEl.createDiv({cls: "s3-vault-sync-diagnostics"});
     const details = this.contentEl.createDiv();
+    const history = this.contentEl.createDiv({cls: "s3-vault-sync-diagnostics"});
     const render = (): void => {
       controls.empty();
       details.empty();
       this.renderActions(controls);
+      this.renderDiagnostics(diagnostics);
+      this.renderDiagnosticHistory(history);
       this.renderBulkDeletion(details);
       this.renderConflicts(details);
       this.renderLocalIssues(details);
@@ -318,6 +325,7 @@ export class StatusModal extends Modal {
       status.setText(display.text);
       this.pauseButton?.setText(this.controller.isPaused() ? "Resume" : "Pause");
       if (/^(Idle|Action required|Error|Not configured|Paused):/.test(display.text)) render();
+      else this.renderDiagnostics(diagnostics);
     });
   }
 
@@ -341,6 +349,17 @@ export class StatusModal extends Modal {
     actionButton(actions, "Copy status", async () => {
       if (!await copyText(this.controller.getStatusText())) throw new Error("Clipboard unavailable; select the displayed status to copy it.");
     });
+    if (this.controller.exportDiagnostics) actionButton(actions, "Copy diagnostics", async () => {
+      const text = this.controller.exportDiagnostics!();
+      if (await copyText(text)) return;
+      const dialog = new Modal(this.app);
+      dialog.contentEl.createEl("h2", {text: "Copy diagnostic data"});
+      dialog.contentEl.createEl("p", {text: "Clipboard unavailable. Select and copy the data below. It contains no note content, paths or credentials."});
+      const output = dialog.contentEl.createEl("textarea", {cls: "s3-vault-sync-diagnostic-export"});
+      output.value = text;
+      output.readOnly = true;
+      dialog.open();
+    });
     if (this.controller.getStatusText().includes("Repair Mode")) {
       actions.createEl("button", {text: "Recovery guidance"}).addEventListener("click", () => {
         showGuidance(this.app, "Remote recovery required",
@@ -350,6 +369,40 @@ export class StatusModal extends Modal {
     if (this.controller.getPendingBulkDeletion()) {
       actionButton(actions, "Confirm bulk deletion", async () => { await this.controller.confirmBulkDeletion(); this.onOpen(); })
         .addClass("mod-warning");
+    }
+  }
+
+  private renderDiagnostics(container: HTMLElement): void {
+    container.empty();
+    const view = this.controller.getDiagnostics?.(20);
+    if (!view) return;
+    const last = view.records.at(-1);
+    const result = [...view.records].reverse().find(record => record.counts)?.counts;
+    const observed = [...view.records].reverse().find(record => record.observedRemote);
+    const date = (time?: number): string => time === undefined ? "Not recorded" : new Date(time).toLocaleString();
+    container.createEl("h3", {text: "Sync diagnostics"});
+    container.createEl("p", {text: `Last recorded successful sync: ${date(view.lastSuccessAt)}`});
+    container.createEl("p", {text: `Local accepted Commit: ${view.acceptedCommit ?? "Not yet accepted"}`});
+    container.createEl("p", {text: `Last checked S3 Head: ${observed?.observedRemote ?? "Not yet checked"} · ${date(observed?.remoteCheckedAt)}`});
+    container.createEl("p", {text: `Queued check: ${view.queued ? "Yes" : "No"} · Local paths awaiting check: ${view.pendingLocalChanges}`});
+    container.createEl("p", {text: `Last known plan — Pending uploads: ${last?.pendingUploads ?? "Not yet planned"} · Pending downloads: ${last?.pendingDownloads ?? "Not yet planned"}`});
+    if (result) container.createEl("p", {text: `Last result — Published changes: ${result.uploaded} · Downloaded: ${result.downloaded} · Deferred: ${result.deferred} · Unsynced local: ${result.unsynced}`});
+    if (last) container.createEl("p", {text: `Phase: ${last.phase} · HTTP requests: ${last.requests} · Payload bytes sent/received: ${last.sentBytes}/${last.receivedBytes}`});
+    container.createEl("p", {text: `Next scheduled retry: ${view.nextRetryAt === undefined ? "None" : date(view.nextRetryAt)}`});
+    if (last?.errorCategory) container.createEl("p", {text: `Last run error: ${last.errorCategory}${last.httpStatus ? ` (HTTP ${last.httpStatus})` : ""}${last.writeResultUncertain ? ". A remote write may have completed; retry rechecks Head." : ""}`});
+    if (view.persistenceWarning) container.createEl("p", {text: view.persistenceWarning, cls: "s3-vault-sync-error"});
+    container.createEl("small", {text: "These records describe this device. Publishing to S3 does not confirm that another device has received the files. Deferred files can remain even when Commit IDs match."});
+  }
+
+  private renderDiagnosticHistory(container: HTMLElement): void {
+    container.empty();
+    const view = this.controller.getDiagnostics?.(20);
+    if (!view?.records.length) return;
+    const details = container.createEl("details");
+    details.createEl("summary", {text: "Recent sync runs (up to 20)"});
+    for (const record of [...view.records].reverse()) {
+      const elapsed = record.finishedAt === undefined ? "unfinished" : `${Math.max(0, record.finishedAt - record.startedAt)} ms`;
+      details.createEl("p", {text: `${new Date(record.startedAt).toLocaleString()} · ${record.triggers.join(", ")} · ${record.outcome} · ${record.phase} · ${elapsed} · ${record.requests} requests${record.errorCategory ? ` · ${record.errorCategory}` : ""}`});
     }
   }
 
