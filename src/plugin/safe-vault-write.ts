@@ -15,7 +15,7 @@ export interface SafeWriteAdapter {
   readBinary(path: string): Promise<ArrayBuffer>;
   remove(path: string): Promise<void>;
   rename(fromPath: string, toPath: string): Promise<void>;
-  stat(path: string): Promise<{ type: string } | null>;
+  stat(path: string): Promise<{ type: string; size: number } | null>;
   trashLocal(path: string): Promise<void>;
   write(path: string, body: string): Promise<void>;
   writeBinary(path: string, body: ArrayBuffer): Promise<void>;
@@ -265,6 +265,11 @@ export const safeReplaceVaultFile = async (
         (await readHash(adapter, journal.temporaryPath)) !== journal.expectedHash
       ) {
         throw new Error(`Staged file failed verification: ${targetPath}`);
+      }
+      // Some mobile filesystems expose readable bytes before a correct file size.
+      // Native copy may trust that size and silently produce an empty/truncated file.
+      if ((await adapter.stat(journal.temporaryPath))?.size !== body.byteLength) {
+        throw new Error(`Staged file size is inconsistent; retry synchronization: ${targetPath}`);
       }
       if ((await readHash(adapter, targetPath)) !== currentHash) {
         throw new LocalStateChangedError(targetPath);
