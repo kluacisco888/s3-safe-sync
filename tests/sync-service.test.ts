@@ -3174,6 +3174,48 @@ describe("SyncService", () => {
     );
   });
 
+  it("accepts legacy Try anyway downloads after upgrading to unrestricted synchronization", async () => {
+    const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "legacy-limit", vaultKey: new Uint8Array(32)});
+    const source = new MemoryVault(), local = new MemoryVault(), cache = new MemorySyncCache();
+    const desktop = new SyncService({remote, local: source, cache: new MemorySyncCache(), replicaId: "desktop"});
+    await source.write("attachment.bin", new TextEncoder().encode("verified content above old limit"));
+    await desktop.initializeNew("vault");
+    const limited = new SyncService({remote, local, cache, replicaId: "phone", maxAutomaticFileBytes: 10});
+    const before = await limited.synchronize();
+    const entryId = before.deferredDownloadEntries[0]!.entryId;
+    await limited.downloadDeferred(entryId);
+    expect((await limited.synchronize()).unsyncedLocalEntries).toBe(1);
+    const head = (await remote.readHead())!.value.commitId;
+
+    const upgraded = new SyncService({remote, local, cache, replicaId: "phone"});
+    for (let attempt = 0; attempt < 2; attempt++) {
+      expect(await upgraded.synchronize()).toMatchObject({status: "complete", uploaded: 0, downloaded: 0,
+        deferredDownloads: 0, unsyncedLocalEntries: 0, localIssues: []});
+    }
+    expect(local.readText("attachment.bin")).toBe("verified content above old limit");
+    expect(cache.state!.files["attachment.bin"]!.entryId).toBe(entryId);
+    expect((await remote.readHead())!.value.commitId).toBe(head);
+  });
+
+  it("uploads and receives an attachment above 50 MiB without a device policy", async () => {
+    const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "unrestricted-large", vaultKey: new Uint8Array(32)});
+    const source = new MemoryVault(), local = new MemoryVault();
+    const desktop = new SyncService({remote, local: source, cache: new MemorySyncCache(), replicaId: "desktop"});
+    const phone = new SyncService({remote, local, cache: new MemorySyncCache(), replicaId: "phone"});
+    await desktop.initializeNew("vault");
+    await phone.synchronize();
+    const body = new Uint8Array(51 * 1024 * 1024);
+    body[0] = 31; body[body.length - 1] = 79;
+    const expectedHash = await sha256Content(body);
+    await local.write("large.bin", body);
+    expect(await phone.synchronize()).toMatchObject({status: "complete", uploaded: 1, unsyncedLocalEntries: 0});
+    expect(await desktop.synchronize()).toMatchObject({status: "complete", downloaded: 1, deferredDownloads: 0});
+    const received = await source.read("large.bin");
+    expect(received.byteLength).toBe(51 * 1024 * 1024);
+    expect(await sha256Content(received)).toBe(expectedHash);
+    expect(await phone.synchronize()).toMatchObject({status: "complete", uploaded: 0, downloaded: 0, localIssues: []});
+  }, 120_000);
+
   it("applies a lower cellular limit only to attachments", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);

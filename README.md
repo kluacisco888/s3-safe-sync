@@ -25,7 +25,7 @@ It uses stable entry identities, permanent deletion records, immutable encrypted
 - Conditional Head publication so concurrent devices cannot silently overwrite each other.
 - Incremental scans with streamed desktop hashing.
 - Android ranged downloads and multipart uploads.
-- Per-device pause and mobile transfer limits.
+- Per-device pause and consistent file-size policy across desktop and mobile.
 - Remotely Save Rclone Crypt migration comparison.
 
 ## Installation with BRAT
@@ -119,7 +119,7 @@ When both local and S3 files exist, the actions above the previews offer three e
 
 None of these choices merges contents. **Decide later** closes the review without resolving it. Local filesystem modification time and the S3 version-recording time are shown separately in the device's locale; neither timestamp nor file size determines which version wins. The completion view links to **Open version history**, with authenticated previews, expiry dates and restoration. It remains accessible by opening the file and running **S3 Safe Sync: Open version history for the current file** from the command palette.
 
-Other unreviewed files keep their previous synchronization bases. Existing remote conflicts or deletion records still use the separate-local-copy preservation flow rather than the three live-file choices. The decision expires if either side changes; all replacement choices require authenticated backup content and conditional Head publication before local replacement. Large files and unsupported paths show the device restriction instead of bypassing it. Each local issue has inline, expandable **Why this needs attention** guidance, distinct from its actual action buttons; affected paths can be opened or copied. A missing common version can result from first connection or reinstalling, not only cache loss.
+Other unreviewed files keep their previous synchronization bases. Existing remote conflicts or deletion records still use the separate-local-copy preservation flow rather than the three live-file choices. The decision expires if either side changes; all replacement choices require authenticated backup content and conditional Head publication before local replacement. Unsupported paths still require a supported name; text-preview limits do not impose a transfer-size limit. Each local issue has inline, expandable **Why this needs attention** guidance, distinct from its actual action buttons; affected paths can be opened or copied. A missing common version can result from first connection or reinstalling, not only cache loss.
 
 **Upload as new file** (previously **Import**) explicitly adds an unknown local path to S3. It does not restore an old file identity after a move; check for the note at its old remote path before importing a moved file.
 
@@ -127,16 +127,16 @@ Manual review, import, download, and restore actions accept only their selected 
 
 Error notices, the desktop status bar, and the settings page link to sync status. Its actions and issue lists update after background checks; bulk-delete confirmation and recovery guidance do not require reopening the window. A successful manual import, download, restore, or conflict resolution keeps **Action required** while known issues remain, respects pause, and does not replace an active sync's status. Downloads deferred only by device size limits remain informational, with their count shown. Status includes settings, troubleshooting, and copy-status actions. Conflict candidates have authenticated text previews before selection. Failed restore, import, or transfer actions retain an error and can be retried; failed unlocks keep the typed password only in the current input so it can be corrected or retried. Repair Mode and filesystem restrictions provide guidance for the necessary external action, not an automatic overwrite or reset.
 
-Reported remote integrity and Repair Mode failures are saved on this device, bound to the bucket, region, normalized prefix, and Vault ID. Unrelated manual success, pause, or plugin reload does not dismiss them. After repairing the reported remote state, resume if paused and use **Sync now**: before writing, the plugin rechecks the authenticated metadata and only the affected content or recovery copies, not every file in S3. Each verified issue is cleared separately; network failures retain the issue. Automatic rechecks respect device transfer limits; an explicitly requested oversized download can also clear its corresponding issue after authenticating and verifying that content. A rejected upload's Blob can stop blocking when the authenticated current state no longer references it.
+Reported remote integrity and Repair Mode failures are saved on this device, bound to the bucket, region, normalized prefix, and Vault ID. Unrelated manual success, pause, or plugin reload does not dismiss them. After repairing the reported remote state, resume if paused and use **Sync now**: before writing, the plugin rechecks the authenticated metadata and only the affected content or recovery copies, not every file in S3. Each verified issue is cleared separately; network failures retain the issue. Automatic rechecks use the same file-size policy on every platform; manual downloads can also clear their corresponding issue after authenticating and verifying that content. A rejected upload's Blob can stop blocking when the authenticated current state no longer references it.
 
 ## Scope and limits
 
 The plugin synchronizes ordinary Vault files. It excludes Obsidian configuration, dot-prefixed and underscore-prefixed path segments, version-control directories, `node_modules`, and temporary Office files.
 
-- Mobile automatic file limit: 50 MiB.
-- Mobile attachment limit away from confirmed Wi-Fi: 10 MiB.
+- No plugin-imposed automatic file-size limit on desktop, Android, or iOS, including cellular and unknown networks. Large transfers can use mobile data; pause sync when needed.
+- Existing size-deferred files are reconsidered on the next sync. Already verified manual downloads are not reported as unsynced solely because of their size.
 - Network transfer is not resumable across app restarts.
-- Encryption and decryption can still hold a complete file in memory.
+- Encryption and decryption can still hold a complete file in memory. Removing the policy limit does not guarantee arbitrary file sizes: very large files may exhaust memory or available storage. Android's ranged downloads and multipart uploads remain enabled.
 - Shutdown synchronization is best effort; the next startup scan is the recovery path.
 - A scheduled full integrity scan runs every seven days by default.
 
