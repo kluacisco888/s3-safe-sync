@@ -379,10 +379,12 @@ export class StatusModal extends Modal {
     const last = view.records.at(-1);
     const result = [...view.records].reverse().find(record => record.counts)?.counts;
     const observed = [...view.records].reverse().find(record => record.observedRemote);
+    const publication = [...view.records].reverse().find(record => record.publishedCommit);
     const date = (time?: number): string => time === undefined ? "Not recorded" : new Date(time).toLocaleString();
     container.createEl("h3", {text: "Sync diagnostics"});
     container.createEl("p", {text: `Last recorded successful sync: ${date(view.lastSuccessAt)}`});
     container.createEl("p", {text: `Local accepted Commit: ${view.acceptedCommit ?? "Not yet accepted"}`});
+    container.createEl("p", {text: `Last acknowledged publication from this device: ${publication?.publishedCommit ?? "None recorded"}`});
     container.createEl("p", {text: `Last checked S3 Head: ${observed?.observedRemote ?? "Not yet checked"} · ${date(observed?.remoteCheckedAt)}`});
     container.createEl("p", {text: `Queued check: ${view.queued ? "Yes" : "No"} · Local paths awaiting check: ${view.pendingLocalChanges}`});
     container.createEl("p", {text: `Last known plan — Pending uploads: ${last?.pendingUploads ?? "Not yet planned"} · Pending downloads: ${last?.pendingDownloads ?? "Not yet planned"}`});

@@ -86,7 +86,7 @@ describe("StatusModal", () => {
       queued: false, pendingLocalChanges: 2,
       records: [{id: "run", vaultId: "vault", startedAt: 1_700_000_001_000, finishedAt: 1_700_000_002_000,
         outcome: "retrying" as const, triggers: ["manual" as const], phase: "downloading" as const,
-        phaseDurations: {downloading: 1000}, observedRemote: "remote-version", remoteCheckedAt: 1_700_000_001_000,
+        phaseDurations: {downloading: 1000}, observedRemote: "remote-version", publishedCommit: "published-version", remoteCheckedAt: 1_700_000_001_000,
         requests: 3, sentBytes: 0, receivedBytes: 42, pendingDownloads: 4, pendingUploads: 1,
         errorCategory: "service" as const, httpStatus: 503}],
     })};
@@ -96,6 +96,7 @@ describe("StatusModal", () => {
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
     const texts = all(modal.contentEl as unknown as FakeElement).map(node => node.text);
     expect(texts).toContain("Local accepted Commit: accepted-version");
+    expect(texts).toContain("Last acknowledged publication from this device: published-version");
     expect(texts.some(text => text.includes("Last checked S3 Head: remote-version"))).toBe(true);
     expect(texts.some(text => text.includes("Pending uploads: 1") && text.includes("Pending downloads: 4"))).toBe(true);
     expect(texts.some(text => text.includes("service") && text.includes("503"))).toBe(true);
