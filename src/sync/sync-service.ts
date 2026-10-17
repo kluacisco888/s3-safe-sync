@@ -1,6 +1,7 @@
 import { diff3Merge } from "node-diff3";
 
 import {
+  fileType,
   SyncEngine,
   type BulkDeletionPlan,
   type DeletedEntry,
@@ -1405,22 +1406,26 @@ export class SyncService {
         throw new Error("Files or remote state changed since the rename review. Sync again and review the new plan.");
       }
       if (resolution.kind === "moves") {
+        // 部分配对：每个消失路径、每个新路径至多出现一次；没列出的消失 Entry 按删除处理，没被选中的新文件按新文件上传
         const sources = new Map(possibleRename.deletedEntries.map(entry => [entry.path, entry.entryId]));
         const targets = new Set(renameIssue.newPaths);
         const assignments = new Map<string, string>();
         for (const pair of resolution.pairs) {
           const entryId = sources.get(pair.fromPath);
           if (!entryId || !targets.delete(pair.toPath)) throw new Error("Rename mapping is not one-to-one.");
+          if (fileType(pair.fromPath) !== fileType(pair.toPath)) {
+            throw new Error("A missing file can only move to a new file of the same file type.");
+          }
           sources.delete(pair.fromPath);
           assignments.set(pair.toPath, entryId);
         }
-        if (sources.size || targets.size) throw new Error("Review every missing and new file before confirming a move.");
         observation.files = observation.files.map(file => assignments.has(file.path)
           ? { ...file, entryId: assignments.get(file.path)! } : file);
       }
+      // 配对之外剩下的消失与新增都已由用户审查过，按独立的删除和新增执行
       plan = this.engine.reconcile({
         base: reconciliationBase, local: observation, remote,
-        allowIndependentCreatesAndDeletes: resolution.kind === "separate",
+        allowIndependentCreatesAndDeletes: true,
       });
     }
     const localIssues: LocalSyncIssue[] = [

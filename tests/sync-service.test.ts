@@ -5513,6 +5513,56 @@ describe("SyncService", () => {
       expect(entry.history?.[0]?.contentHash).toBe(oldHash);
     });
 
+    const setupPartialReview = async () => {
+      const vault = await setupVault({"a.pdf": "a v1", "b.pdf": "b v1", ...notesVault(10)});
+      const aEntry = vault.cache.state!.files["a.pdf"]!;
+      const bEntryId = vault.cache.state!.files["b.pdf"]!.entryId;
+      await vault.local.delete("a.pdf");
+      await vault.local.delete("b.pdf");
+      await vault.local.write("new/x.pdf", encode("x"));
+      await vault.local.write("new/y.pdf", encode("y"));
+      await vault.local.write("new/z.pdf", encode("z"));
+      const issue = (await vault.service.synchronize()).localIssues.find(issue => issue.kind === "possible-rename")!;
+      expect(issue).toMatchObject({oldPaths: ["a.pdf", "b.pdf"], newPaths: ["new/x.pdf", "new/y.pdf", "new/z.pdf"]});
+      return {...vault, aEntry, bEntryId, issue};
+    };
+
+    it("moves only the paired missing Entry, deletes the unpaired one and uploads unchosen new files", async () => {
+      const {remote, service, aEntry, bEntryId, issue} = await setupPartialReview();
+
+      const result = await service.synchronize([], {renameResolution: {kind: "moves", reviewToken: issue.reviewToken,
+        pairs: [{fromPath: "a.pdf", toPath: "new/x.pdf"}]}});
+
+      expect(result.status).toBe("complete");
+      expect(result.localIssues).toEqual([]);
+      const entries = await entriesById(remote);
+      expect(entries[aEntry.entryId]).toMatchObject({kind: "live", path: "new/x.pdf"});
+      expect(entries[aEntry.entryId]!.history?.[0]?.contentHash).toBe(aEntry.contentHash);
+      expect(entries[bEntryId]).toMatchObject({
+        kind: "deleted", path: "b.pdf", recovery: expect.objectContaining({contentHash: expect.any(String)}),
+      });
+      const live = await liveByPath(remote);
+      for (const path of ["new/y.pdf", "new/z.pdf"]) {
+        expect(live.get(path)?.entryId).toBeDefined();
+        expect([aEntry.entryId, bEntryId]).not.toContain(live.get(path)!.entryId);
+      }
+    });
+
+    it("rejects a move between a missing Entry and a held new file of another type", async () => {
+      const {remote, local, service} = await setupVault({"plan.pdf": "plan", "memo.md": "memo", ...notesVault(10)});
+      await local.delete("plan.pdf");
+      await local.delete("memo.md");
+      await local.write("archive/plan v2.pdf", encode("plan v2"));
+      await local.write("archive/memo v2.md", encode("memo v2"));
+      const issue = (await service.synchronize()).localIssues.find(issue => issue.kind === "possible-rename")!;
+      const before = (await remote.readHead())!.value.commitId;
+
+      await expect(service.synchronize([], {renameResolution: {kind: "moves", reviewToken: issue.reviewToken,
+        pairs: [{fromPath: "plan.pdf", toPath: "archive/memo v2.md"}]}})).rejects.toThrow("same file type");
+
+      expect((await remote.readHead())!.value.commitId).toBe(before);
+    });
+
     it("counts held missing Entries toward the bulk deletion threshold", async () => {
       const {remote, local, cache, service} = await setupVault({"drawing.pdf": "drawing", ...notesVault(10)});
       const pdfEntryId = cache.state!.files["drawing.pdf"]!.entryId;

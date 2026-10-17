@@ -221,7 +221,7 @@ export interface ReconcileInput {
 }
 
 // 文件类型 = 路径最后一段的扩展名（不区分大小写）；没有扩展名的（含点开头的隐藏文件）算同一类
-function fileType(path: string): string {
+export function fileType(path: string): string {
   const name = path.slice(path.lastIndexOf("/") + 1);
   const dot = name.lastIndexOf(".");
   return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
