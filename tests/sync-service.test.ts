@@ -5791,6 +5791,56 @@ describe("SyncService", () => {
     });
   });
 
+  describe("one-to-one move inference beside a Pending Path Rename", () => {
+    const encode = (text: string) => new TextEncoder().encode(text);
+    const setupRenamed = async () => {
+      const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "one-to-one", vaultKey: new Uint8Array(32)});
+      const local = new MemoryVault();
+      await local.write("notes/a.md", encode("original a"));
+      await local.write("notes/d.md", encode("original d"));
+      for (let index = 0; index < 10; index += 1) await local.write(`keep/${index}.md`, encode(`keep ${index}`));
+      const cache = new MemorySyncCache();
+      const service = new SyncService({cache, local, remote, replicaId: "desktop"});
+      await service.initializeNew("vault");
+      const idA = cache.state!.files["notes/a.md"]!.entryId;
+      const idD = cache.state!.files["notes/d.md"]!.entryId;
+      const readSnapshot = async () => remote.readSnapshot((await remote.readHead())!.value);
+      return {remote, local, cache, service, idA, idD, readSnapshot};
+    };
+
+    it("does not infer a renamed source Entry onto another new file with its old content", async () => {
+      const {local, service, idA, readSnapshot} = await setupRenamed();
+      await local.move("notes/a.md", "notes/b.md");
+      await local.write("notes/b.md", encode("edited after rename"));
+      await local.write("copy/c.md", encode("original a"));
+
+      const result = await service.synchronize([], {pathRenames: new Map([["notes/a.md", {entryId: idA, toPath: "notes/b.md"}]])});
+
+      // 修复前：copy/c.md 也被推断为 idA，同一 Entry ID 落到两个路径，同步停在 Path Collision
+      expect(result.localIssues).toEqual([]);
+      expect(result.status).toBe("complete");
+      const live = Object.values((await readSnapshot()).entries).filter(entry => entry.kind === "live");
+      expect(live.filter(entry => entry.entryId === idA).map(entry => entry.path)).toEqual(["notes/b.md"]);
+      const copy = live.find(entry => entry.path === "copy/c.md");
+      expect(copy?.entryId).toBeDefined();
+      expect(copy?.entryId).not.toBe(idA);
+    });
+
+    it("does not infer a missing Entry onto a rename target with its content", async () => {
+      const {local, service, idA, idD, readSnapshot} = await setupRenamed();
+      await local.move("notes/a.md", "notes/b.md");
+      await local.write("notes/b.md", encode("original d"));
+      await local.delete("notes/d.md");
+
+      await service.synchronize([], {pathRenames: new Map([["notes/a.md", {entryId: idA, toPath: "notes/b.md"}]])});
+
+      const entries = (await readSnapshot()).entries;
+      expect(entries[idA]).toMatchObject({kind: "live", path: "notes/b.md"});
+      expect(Object.values(entries).filter(entry => entry.kind === "live" && entry.path === "notes/b.md")).toHaveLength(1);
+      expect(entries[idD]?.kind).not.toBe("live");
+    });
+  });
+
   it("publishes a rename and edit as one updated live Entry", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);

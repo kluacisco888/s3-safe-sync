@@ -1261,7 +1261,9 @@ export class SyncService {
         `${file.size}:${file.contentHash}`,
       );
       const inferredEntryId =
-        renameCandidates?.length === 1 && renameCandidates[0] && newClaimants?.length === 1
+        renameCandidates?.length === 1 && renameCandidates[0] && newClaimants?.length === 1 &&
+        // 与同名配对一致：已由 Pending Path Rename 认领的源和目标不参与一对一推断，避免同一 Entry ID 落到两个路径
+        !renamedSourcePaths.has(renameCandidates[0].path) && !renameSourcesByTarget.has(file.path)
           ? renameCandidates[0].entryId
           : sameNameEntryIdByPath.get(file.path);
       if (
