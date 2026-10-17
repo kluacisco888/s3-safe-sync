@@ -1,11 +1,11 @@
 import type { SyncProgress } from "../sync/sync-service";
 
 const phaseLabels: Record<SyncProgress["phase"], string> = {
-  downloading: "Downloading",
-  hashing: "Hashing content",
-  publishing: "Publishing encrypted snapshot",
-  scanning: "Checking metadata",
-  uploading: "Uploading",
+  downloading: "正在下载",
+  hashing: "正在计算内容哈希",
+  publishing: "正在发布加密快照",
+  scanning: "正在检查元数据",
+  uploading: "正在上传",
 };
 
 const formatBytes = (bytes: number): string => {

@@ -581,7 +581,7 @@ describe("plugin synchronization lifecycle", () => {
     await plugin.togglePause();
     expect(plugin.getStatusText()).toMatch(/^空闲：/);
     expect((await remote.readHead())!.value.commitId).not.toBe("initial");
-    expect(plugin.getDiagnostics().persistenceWarning).toContain("could not be saved");
+    expect(plugin.getDiagnostics().persistenceWarning).toContain("无法保存");
     expect(plugin.exportDiagnostics()).not.toContain("secret local path");
     plugin.onunload();
   });
@@ -900,7 +900,7 @@ describe("plugin synchronization lifecycle", () => {
       hooks.afterProbePut = undefined;
       plugin.onunload();
     };
-    await expect(plugin.initializeOrUnlock("test-password")).rejects.toThrow("stopped");
+    await expect(plugin.initializeOrUnlock("test-password")).rejects.toThrow("插件已停止运行");
     expect([...objects.keys()].some(key => key.includes(".s3-vault-sync-probe-"))).toBe(true);
     const replacement = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
     await replacement.onload();
@@ -944,7 +944,7 @@ describe("plugin synchronization lifecycle", () => {
   it("keeps the active sync status when an unrelated setting is saved", async () => {
     const { plugin } = await setup();
     const stop = plugin.onStatusChange(status => {
-      if (status.text.includes("Checking metadata")) {
+      if (status.text.includes("正在检查元数据")) {
         stop();
         plugin.getSettings().deviceName = "Renamed device";
         void plugin.saveSettings();
@@ -1003,7 +1003,7 @@ describe("plugin synchronization lifecycle", () => {
     expect(replacement.getSettings().deviceName).toBe("old setting");
     replacement.getSettings().deviceName = "new setting";
     await replacement.saveSettings();
-    await expect(plugin.saveSettings()).rejects.toThrow("stopped");
+    await expect(plugin.saveSettings()).rejects.toThrow("插件已停止运行");
     expect(host.data).toMatchObject({ settings: { deviceName: "new setting" } });
   });
 
@@ -1053,7 +1053,7 @@ describe("plugin synchronization lifecycle", () => {
   it("still displays Paused when an active synchronization finishes after pausing", async () => {
     const { plugin } = await setup();
     const stop = plugin.onStatusChange(status => {
-      if (status.text.includes("Checking metadata")) {
+      if (status.text.includes("正在检查元数据")) {
         stop();
         void plugin.togglePause();
       }

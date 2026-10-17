@@ -343,7 +343,7 @@ describe("StatusModal", () => {
     const review = opened.at(-1)!;
     await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "− remote edit")).toBe(true));
     expect(all(review.contentEl).some(node => node.text === "+ local edit")).toBe(true);
-    expect(all(review.contentEl).some(node => node.text === "1 remote-only line · 1 local-only line")).toBe(true);
+    expect(all(review.contentEl).some(node => node.text === "仅远端有 1 行 · 仅本地有 1 行")).toBe(true);
     const fullVersions = all(review.contentEl).filter(node => node.tag === "details");
     expect(fullVersions).toHaveLength(2);
     expect(fullVersions.every(node => !node.open)).toBe(true);
