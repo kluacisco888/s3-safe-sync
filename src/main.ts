@@ -1164,6 +1164,8 @@ export default class S3VaultSyncPlugin
         );
       } else {
         this.pendingBulkDeletion = undefined;
+        // 同步成功一次后清空弹窗记录，同一问题再出现时会再弹
+        this.shownStopFingerprints.clear();
         this.setStatus(
           "Idle",
           `Downloaded ${result.downloaded}, uploaded ${result.uploaded}, deleted ${result.deleted}, deferred ${result.deferredDownloads}, unsynced ${result.unsyncedLocalEntries}.`,

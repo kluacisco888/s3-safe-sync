@@ -1109,6 +1109,46 @@ describe("opening sync status when synchronization stops", () => {
     plugin.onunload();
   });
 
+  it("opens sync status once per problem until it changes or a sync succeeds", async () => {
+    const {plugin, hooks, setLocalPresent} = await setup();
+    setLocalPresent(false);
+    await plugin.togglePause();
+    expect(host.openedModals).toHaveLength(1);
+    host.openedModals[0]!.close();
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^Action required:/u);
+    expect(host.openedModals).toHaveLength(1);
+    hooks.headFailure = "forbidden";
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^Error:/u);
+    expect(host.openedModals).toHaveLength(2);
+    host.openedModals[1]!.close();
+    hooks.headFailure = undefined;
+    setLocalPresent(true);
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^Idle:/u);
+    setLocalPresent(false);
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^Action required:/u);
+    expect(host.openedModals).toHaveLength(3);
+    plugin.onunload();
+  });
+
+  it("does not open another sync status window while one is open", async () => {
+    const {plugin, hooks, setLocalPresent} = await setup();
+    setLocalPresent(false);
+    await plugin.togglePause();
+    expect(host.openedModals).toHaveLength(1);
+    hooks.headFailure = "forbidden";
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^Error:/u);
+    expect(host.openedModals).toHaveLength(1);
+    host.openedModals[0]!.close();
+    await plugin.syncNow();
+    expect(host.openedModals).toHaveLength(1);
+    plugin.onunload();
+  });
+
   const settle = async (plugin: S3VaultSyncPlugin, ms: number) => {
     await vi.advanceTimersByTimeAsync(ms);
     await vi.waitFor(() => expect(plugin.getDiagnostics().records.at(-1)?.finishedAt).toBeDefined());
