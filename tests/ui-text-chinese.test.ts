@@ -126,7 +126,7 @@ const findEnglishUiText = (files = UI_FILES): string[] => {
   for (const file of files) {
     const source = readFileSync(file, "utf8");
     for (const match of source.matchAll(UI_CALL)) {
-      const start = match.index! + match[0].length;
+      const start = match.index + match[0].length;
       for (const text of literals(readArgument(source, start))) {
         if (!containsEnglish(text)) continue;
         const line = source.slice(0, match.index).split("\n").length;
