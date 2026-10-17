@@ -120,6 +120,8 @@ const normalizePrefix = (prefix: string): string =>
 
 const ANDROID_DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const ANDROID_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
+// 网络类可重试错误从这一轮第一次失败起连续满这么久仍未成功，才自动弹出同步状态窗口
+const NETWORK_FAILURE_POPUP_DELAY_MS = 30 * 60_000;
 
 export default class S3VaultSyncPlugin
   extends Plugin
@@ -135,6 +137,8 @@ export default class S3VaultSyncPlugin
   private networkRetryTimer: number | undefined;
   private networkRetryAt: number | undefined;
   private networkFailureTarget: string | undefined;
+  // 这一轮网络类可重试错误第一次失败的时间；同步成功或出现非网络错误时清空
+  private networkFailureSince: number | undefined;
   private pathRenames = new PathRenameTracker();
   private credentials!: CredentialStore;
   private data!: PersistedPluginData;
@@ -1110,6 +1114,7 @@ export default class S3VaultSyncPlugin
       this.headRetryAttempt = 0;
       this.networkRetryAttempt = 0;
       this.networkFailureTarget = undefined;
+      this.networkFailureSince = undefined;
       this.pendingBulkDeletion = result.bulkDeletion;
       this.pendingLocalIssues = result.localIssues;
       this.pendingDeferredDownloads = result.deferredDownloadEntries;
@@ -1168,6 +1173,8 @@ export default class S3VaultSyncPlugin
       const retryableNetwork = error instanceof S3TransportError ||
         (error instanceof S3RequestError && [408, 429, 500, 502, 503, 504].includes(error.status));
       if (!retryableNetwork) {this.networkFailureTarget = undefined; this.networkRetryAttempt = 0;}
+      if (retryableNetwork) this.networkFailureSince ??= Date.now();
+      else this.networkFailureSince = undefined;
       diagnostic.errorCategory = error instanceof S3TransportError ? error.kind
         : error instanceof S3RequestError ? ([401, 403].includes(error.status) ? "authentication" : "service")
         : error instanceof RemoteStateError || error instanceof RepairModeError ? "remote-integrity"
@@ -1193,7 +1200,9 @@ export default class S3VaultSyncPlugin
       } else {
         diagnostic.outcome = "error";
         await this.rememberIntegrityFailure(error, integrityTarget);
-        this.showError(error);
+        // 网络类可重试错误未连续满 30 分钟时，只显示状态栏和通知，不自动弹窗
+        this.showError(error, retryableNetwork &&
+          Date.now() - (this.networkFailureSince ?? Date.now()) < NETWORK_FAILURE_POPUP_DELAY_MS);
       }
     } finally {
       diagnostic.nextRetryAt = this.networkRetryAt ?? this.headRetryAt;
@@ -1418,6 +1427,7 @@ export default class S3VaultSyncPlugin
     status: PluginStatus,
     detail: string,
     progressLabel?: string,
+    holdErrorPopup = false,
   ): void {
     const integrityChecks = this.data ? this.currentIntegrityChecks() : [];
     if (integrityChecks.length && status !== "Checking" && status !== "Syncing") {
@@ -1441,12 +1451,13 @@ export default class S3VaultSyncPlugin
       status === "Action required" || status === "Error",
     );
     this.emitStatus();
-    this.openStatusWhenStopped(status, detail);
+    if (status === "Action required" || (status === "Error" && !holdErrorPopup)) {
+      this.openStatusWhenStopped(status, detail);
+    }
   }
 
   // 停住就弹窗：状态进入「需要处理」或「出错」时自动打开同步状态窗口；同一问题指纹只弹一次
   private openStatusWhenStopped(status: PluginStatus, detail: string): void {
-    if (status !== "Action required" && status !== "Error") return;
     const fingerprint = this.stopFingerprint(status, detail);
     if (this.shownStopFingerprints.has(fingerprint)) return;
     this.shownStopFingerprints.add(fingerprint);
@@ -1501,7 +1512,7 @@ export default class S3VaultSyncPlugin
     this.setStatus("Syncing", formatted.detail, formatted.label);
   }
 
-  private showError(error: unknown): void {
+  private showError(error: unknown, holdErrorPopup = false): void {
     if (this.session.signal.aborted || error instanceof SyncStoppedError) return;
     const message = error instanceof Error ? error.message : "Unknown sync error";
     this.setStatus(
@@ -1511,6 +1522,8 @@ export default class S3VaultSyncPlugin
       error instanceof RepairModeError || error instanceof RemoteStateError
         ? `Repair Mode: ${message}`
         : message,
+      undefined,
+      holdErrorPopup,
     );
     const notice = new Notice(`S3 Vault Sync: ${message}`, 12_000);
     notice.messageEl.createEl("button", {text: "Open sync status", cls: "s3-vault-sync-notice-action"}).addEventListener("click", event => {

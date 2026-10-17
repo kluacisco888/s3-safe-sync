@@ -1108,4 +1108,42 @@ describe("opening sync status when synchronization stops", () => {
     expect(host.openedModals).toHaveLength(1);
     plugin.onunload();
   });
+
+  const settle = async (plugin: S3VaultSyncPlugin, ms: number) => {
+    await vi.advanceTimersByTimeAsync(ms);
+    await vi.waitFor(() => expect(plugin.getDiagnostics().records.at(-1)?.finishedAt).toBeDefined());
+  };
+
+  it("opens sync status only after network failures continue for 30 minutes", async () => {
+    const {plugin, hooks} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    await settle(plugin, 29 * 60_000);
+    expect(plugin.getStatusText()).toMatch(/^Error:/u);
+    expect(host.notices.length).toBeGreaterThan(0);
+    expect(host.openedModals).toHaveLength(0);
+    await settle(plugin, 2 * 60_000);
+    expect(host.openedModals).toHaveLength(1);
+    await settle(plugin, 10 * 60_000);
+    expect(host.openedModals).toHaveLength(1);
+    plugin.onunload();
+  });
+
+  it("restarts the 30 minute network wait after one successful sync", async () => {
+    const {plugin, hooks} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    await settle(plugin, 20 * 60_000);
+    hooks.headFailure = undefined;
+    await settle(plugin, 2 * 60_000);
+    expect(plugin.getStatusText()).toMatch(/^Idle:/u);
+    hooks.headFailure = "network";
+    await settle(plugin, 2 * 60_000);
+    await settle(plugin, 16 * 60_000);
+    expect(plugin.getStatusText()).toMatch(/^Error:/u);
+    expect(host.openedModals).toHaveLength(0);
+    await settle(plugin, 16 * 60_000);
+    expect(host.openedModals).toHaveLength(1);
+    plugin.onunload();
+  });
 });
