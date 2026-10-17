@@ -5548,6 +5548,19 @@ describe("SyncService", () => {
       }
     });
 
+    it("treats a review that maps no missing file like separate deletions and additions", async () => {
+      const {remote, service, aEntry, bEntryId, issue} = await setupPartialReview();
+
+      const result = await service.synchronize([], {renameResolution: {kind: "moves", reviewToken: issue.reviewToken, pairs: []}});
+
+      expect(result.status).toBe("complete");
+      const entries = await entriesById(remote);
+      expect(entries[aEntry.entryId]).toMatchObject({kind: "deleted", path: "a.pdf"});
+      expect(entries[bEntryId]).toMatchObject({kind: "deleted", path: "b.pdf"});
+      const live = await liveByPath(remote);
+      for (const path of ["new/x.pdf", "new/y.pdf", "new/z.pdf"]) expect(live.has(path)).toBe(true);
+    });
+
     it("rejects a move between a missing Entry and a held new file of another type", async () => {
       const {remote, local, service} = await setupVault({"plan.pdf": "plan", "memo.md": "memo", ...notesVault(10)});
       await local.delete("plan.pdf");
