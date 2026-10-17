@@ -1222,6 +1222,28 @@ describe("opening sync status when synchronization stops", () => {
     plugin.onunload();
   });
 
+  it("opens sync status once for one network outage that fails different operations", async () => {
+    const {plugin, hooks, edit} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    await settle(plugin, 31 * 60_000);
+    expect(host.openedModals).toHaveLength(1);
+    host.openedModals[0]!.close();
+    const headFailure = plugin.getStatusText();
+    const protocol = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;
+    host.requestUrl.mockImplementation((request: Parameters<ObsidianRequestExecutor>[0]) =>
+      request.method === "PUT" && request.url.includes("/blobs/")
+        ? Promise.resolve({status: 503, arrayBuffer: new ArrayBuffer(0), headers: {}})
+        : protocol(request));
+    hooks.headFailure = undefined;
+    edit("An edit made while the network is still failing.");
+    await settle(plugin, 10 * 60_000);
+    expect(plugin.getStatusText()).toMatch(/^出错：/u);
+    expect(plugin.getStatusText()).not.toBe(headFailure);
+    expect(host.openedModals).toHaveLength(1);
+    plugin.onunload();
+  });
+
   it("restarts the 30 minute network wait after one successful sync", async () => {
     const {plugin, hooks} = await setup();
     hooks.headFailure = "network";

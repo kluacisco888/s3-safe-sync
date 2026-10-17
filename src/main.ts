@@ -1223,8 +1223,9 @@ export default class S3VaultSyncPlugin
         // 网络类可重试错误未连续满 30 分钟时，只显示状态栏和通知，不自动弹窗
         if (!retryableNetwork ||
           Date.now() - (this.networkFailureSince ?? Date.now()) >= NETWORK_FAILURE_POPUP_DELAY_MS) {
-          this.openStatusWhenStopped(this.repairFingerprint() ??
-            `error:${error instanceof Error ? error.message : String(error)}`);
+          // 网络类可重试错误用固定指纹：S3 错误信息含操作名，一次断网里不同操作失败也只弹一次
+          this.openStatusWhenStopped(this.repairFingerprint() ?? (retryableNetwork ? "error:network"
+            : `error:${error instanceof Error ? error.message : String(error)}`));
         }
       }
     } finally {
