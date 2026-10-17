@@ -5433,6 +5433,112 @@ describe("SyncService", () => {
       expect(live.get("TM/archive/8799-D R1 old.pdf")?.entryId).toBe(pdfEntryId);
       expect(live.has("TM/8799-D R1.pdf")).toBe(false);
     });
+
+    const setupVault = async (files: Record<string, string>) => {
+      const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "test", vaultKey: new Uint8Array(32)});
+      const local = new MemoryVault();
+      for (const [path, text] of Object.entries(files)) await local.write(path, encode(text));
+      const cache = new MemorySyncCache();
+      const service = new SyncService({cache, local, remote, replicaId: "desktop"});
+      await service.initializeNew("vault");
+      return {remote, local, cache, service};
+    };
+    const notesVault = (count: number) =>
+      Object.fromEntries(Array.from({length: count}, (_, index) => [`note-${index}.md`, `note ${index}`]));
+    const entriesById = async (remote: RemoteStore) =>
+      (await remote.readSnapshot((await remote.readHead())!.value)).entries;
+
+    it("syncs a missing file as a deletion when only other file types are new", async () => {
+      const {remote, local, cache, service} = await setupVault({"drawing.pdf": "drawing", ...notesVault(5)});
+      const pdfEntryId = cache.state!.files["drawing.pdf"]!.entryId;
+      await local.delete("drawing.pdf");
+      await local.write("shot.png", encode("png"));
+
+      const result = await service.synchronize();
+
+      expect(result.status).toBe("complete");
+      expect(result.localIssues).toEqual([]);
+      expect((await entriesById(remote))[pdfEntryId]).toMatchObject({kind: "deleted", path: "drawing.pdf"});
+      expect((await liveByPath(remote)).has("shot.png")).toBe(true);
+    });
+
+    it("accepts the earlier review token after unrelated files publish a new Commit", async () => {
+      const {remote, local, service, pdfEntryId} = await setupDrawings();
+      const issue = (await service.synchronize()).localIssues.find(issue => issue.kind === "possible-rename")!;
+      await local.write("c.md", encode("another local edit"));
+      expect((await service.synchronize()).uploaded).toBe(1);
+
+      const result = await service.synchronize([], {renameResolution: {kind: "separate", reviewToken: issue.reviewToken}});
+
+      expect(result.status).toBe("complete");
+      expect((await entriesById(remote))[pdfEntryId]).toMatchObject({
+        kind: "deleted", path: "TM/8799-D R1.pdf", recovery: expect.objectContaining({contentHash: expect.any(String)}),
+      });
+      const live = await liveByPath(remote);
+      expect(live.has("TM/archive/8799-D R1 old.pdf")).toBe(true);
+      expect(live.has("TM/8797-D R1.pdf")).toBe(true);
+    });
+
+    it("rejects the review token after a held file changes", async () => {
+      const {remote, local, service} = await setupDrawings();
+      const issue = (await service.synchronize()).localIssues.find(issue => issue.kind === "possible-rename")!;
+      await local.write("TM/8797-D R1.pdf", encode("corrected drawing"));
+      const before = (await remote.readHead())!.value.commitId;
+
+      await expect(service.synchronize([], {renameResolution: {kind: "separate", reviewToken: issue.reviewToken}}))
+        .rejects.toThrow("changed since the rename review");
+
+      expect((await remote.readHead())!.value.commitId).toBe(before);
+      expect((await liveByPath(remote)).has("TM/8797-D R1.pdf")).toBe(false);
+    });
+
+    it("confirms a held one-to-one move after unrelated files were synced", async () => {
+      const {remote, local, cache, service} = await setupVault({"plan.pdf": "plan v1", ...notesVault(5)});
+      const pdfEntryId = cache.state!.files["plan.pdf"]!.entryId;
+      const oldHash = cache.state!.files["plan.pdf"]!.contentHash;
+      await local.delete("plan.pdf");
+      await local.write("archive/plan v2.pdf", encode("plan v2"));
+      await local.write("shot.png", encode("png"));
+      const first = await service.synchronize();
+      expect((await liveByPath(remote)).has("shot.png")).toBe(true);
+      const issue = first.localIssues.find(issue => issue.kind === "possible-rename")!;
+      expect(issue).toMatchObject({oldPaths: ["plan.pdf"], newPaths: ["archive/plan v2.pdf"]});
+
+      const result = await service.synchronize([], {renameResolution: {kind: "moves", reviewToken: issue.reviewToken,
+        pairs: [{fromPath: "plan.pdf", toPath: "archive/plan v2.pdf"}]}});
+
+      expect(result.status).toBe("complete");
+      const entry = (await entriesById(remote))[pdfEntryId]!;
+      expect(entry).toMatchObject({kind: "live", path: "archive/plan v2.pdf"});
+      expect(entry.history?.[0]?.contentHash).toBe(oldHash);
+    });
+
+    it("counts held missing Entries toward the bulk deletion threshold", async () => {
+      const {remote, local, cache, service} = await setupVault({"drawing.pdf": "drawing", ...notesVault(10)});
+      const pdfEntryId = cache.state!.files["drawing.pdf"]!.entryId;
+      await local.delete("note-0.md");
+      await local.delete("note-1.md");
+      await local.delete("drawing.pdf");
+      await local.write("archive/drawing a.pdf", encode("drawing"));
+      await local.write("archive/drawing b.pdf", encode("drawing"));
+      const before = (await remote.readHead())!.value.commitId;
+
+      const blocked = await service.synchronize();
+
+      expect(blocked.bulkDeletion?.count).toBe(3);
+      expect(blocked.bulkDeletion?.entryIds).toContain(pdfEntryId);
+      expect(blocked.cacheUpdated).toBe(false);
+      expect((await remote.readHead())!.value.commitId).toBe(before);
+
+      const approved = await service.synchronize(blocked.bulkDeletion!.entryIds);
+
+      expect(approved.status).toBe("action-required");
+      expect(approved.localIssues.some(issue => issue.kind === "possible-rename")).toBe(true);
+      const entries = await entriesById(remote);
+      expect(Object.values(entries).filter(entry => entry.kind === "deleted").map(entry => entry.path).sort())
+        .toEqual(["note-0.md", "note-1.md"]);
+      expect(entries[pdfEntryId]).toMatchObject({kind: "live", path: "drawing.pdf"});
+    });
   });
 
   it("does not assign one missing Entry identity to two identical new files", async () => {
