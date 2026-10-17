@@ -1106,6 +1106,8 @@ describe("opening sync status when synchronization stops", () => {
     await plugin.togglePause();
     expect(plugin.getStatusText()).toMatch(failure === "forbidden" ? /^Error:/u : /^Action required: Repair Mode/u);
     expect(host.openedModals).toHaveLength(1);
+    expect(host.notices).toHaveLength(1);
+    expect(host.noticeActions.map(action => action.text)).toEqual(["Open sync status"]);
     plugin.onunload();
   });
 
