@@ -96,7 +96,7 @@ describe("AwsS3ObjectStore", () => {
 
     await expect(
       store.get("chosen-prefix/v1/head", { revalidate: true }),
-    ).rejects.toThrow("strong ETag");
+    ).rejects.toThrow("强 ETag");
   });
 
   it("uploads a large S3 object through bounded multipart requests", async () => {

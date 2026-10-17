@@ -72,7 +72,7 @@ const requiredHeader = (
 ): string => {
   const value = lowerCaseHeaders(headers)[name.toLowerCase()];
   if (value === undefined) {
-    throw new Error(`AWS S3 response omitted ${name}`);
+    throw new Error(`AWS S3 的响应缺少 ${name}`);
   }
   return value;
 };
@@ -80,7 +80,7 @@ const requiredHeader = (
 const normalizeEntityTag = (rawValue: string): string => {
   const value = rawValue.trim();
   if (value.startsWith("W/")) {
-    throw new Error("AWS S3 returned a weak ETag; If-Match requires a strong ETag");
+    throw new Error("AWS S3 返回了弱 ETag，而 If-Match 需要强 ETag");
   }
   const quoted = value.startsWith('"') && value.endsWith('"');
   const opaqueTag = quoted ? value.slice(1, -1) : value;
@@ -98,7 +98,7 @@ const normalizeEntityTag = (rawValue: string): string => {
     value.startsWith('"') !== value.endsWith('"') ||
     (!quoted && opaqueTag.includes(","))
   ) {
-    throw new Error("AWS S3 returned an invalid strong ETag");
+    throw new Error("AWS S3 返回的强 ETag 无效");
   }
   return `"${opaqueTag}"`;
 };
@@ -111,7 +111,7 @@ const parseContentRange = (
 ): { end: number; start: number; total: number } => {
   const match = /^bytes (\d+)-(\d+)\/(\d+)$/u.exec(value);
   if (!match?.[1] || !match[2] || !match[3]) {
-    throw new Error(`AWS S3 returned an invalid Content-Range: ${value}`);
+    throw new Error(`AWS S3 返回的 Content-Range 无效：${value}`);
   }
   return {
     end: Number(match[2]),
@@ -127,15 +127,15 @@ const readXmlElement = (
 ): string => {
   const parsed = new XMLParser().parse(new TextDecoder().decode(body)) as unknown;
   if (typeof parsed !== "object" || parsed === null || !(rootName in parsed)) {
-    throw new Error(`AWS S3 returned an invalid ${rootName} document`);
+    throw new Error(`AWS S3 返回的 ${rootName} 文档无效`);
   }
   const root = (parsed as Record<string, unknown>)[rootName];
   if (typeof root !== "object" || root === null) {
-    throw new Error(`AWS S3 returned an invalid ${rootName} result`);
+    throw new Error(`AWS S3 返回的 ${rootName} 结果无效`);
   }
   const value = (root as Record<string, unknown>)[elementName];
   if (typeof value !== "string") {
-    throw new Error(`AWS S3 omitted ${elementName} from ${rootName}`);
+    throw new Error(`AWS S3 返回的 ${rootName} 缺少 ${elementName}`);
   }
   return value;
 };
@@ -208,7 +208,7 @@ export class AwsS3ObjectStore implements ObjectStore {
   async delete(key: string): Promise<void> {
     const response = await this.request("DELETE", encodeKeyPath(key));
     if (![200, 204, 404].includes(response.status)) {
-      this.throwResponseError(response, `delete ${key}`);
+      this.throwResponseError(response, `删除 ${key}`);
     }
   }
 
@@ -235,7 +235,7 @@ export class AwsS3ObjectStore implements ObjectStore {
         return undefined;
       }
       if (response.status !== 200) {
-        this.throwResponseError(response, `read ${key}`);
+        this.throwResponseError(response, `读取 ${key}`);
       }
       return {
         body: response.body,
@@ -266,7 +266,7 @@ export class AwsS3ObjectStore implements ObjectStore {
       };
     }
     if (first.status !== 206) {
-      this.throwResponseError(first, `read ${key}`);
+      this.throwResponseError(first, `读取 ${key}`);
     }
     const firstRange = parseContentRange(
       requiredHeader(first.headers, "content-range"),
@@ -275,7 +275,7 @@ export class AwsS3ObjectStore implements ObjectStore {
       firstRange.start !== 0 ||
       firstRange.end + 1 !== first.body.byteLength
     ) {
-      throw new Error(`AWS S3 returned an unexpected first byte range for ${key}`);
+      throw new Error(`AWS S3 为 ${key} 返回的首个字节范围不符合预期`);
     }
     const etag = requiredEntityTag(first.headers);
     const body = new Uint8Array(firstRange.total);
@@ -298,7 +298,7 @@ export class AwsS3ObjectStore implements ObjectStore {
         freshReadQuery,
       );
       if (response.status !== 206) {
-        this.throwResponseError(response, `read byte range ${offset}-${end} of ${key}`);
+        this.throwResponseError(response, `读取 ${key} 的字节范围 ${offset}-${end}`);
       }
       const received = parseContentRange(
         requiredHeader(response.headers, "content-range"),
@@ -310,7 +310,7 @@ export class AwsS3ObjectStore implements ObjectStore {
         response.body.byteLength !== end - offset + 1 ||
         requiredEntityTag(response.headers) !== etag
       ) {
-        throw new Error(`AWS S3 returned an inconsistent byte range for ${key}`);
+        throw new Error(`AWS S3 为 ${key} 返回的字节范围前后不一致`);
       }
       body.set(response.body, offset);
       offset = end + 1;
@@ -336,7 +336,7 @@ export class AwsS3ObjectStore implements ObjectStore {
       }
       const response = await this.request("GET", "/", undefined, { "cache-control": "no-cache" }, query);
       if (response.status !== 200) {
-        this.throwResponseError(response, `list ${prefix}`);
+        this.throwResponseError(response, `列出 ${prefix}`);
       }
       const parsed = new XMLParser().parse(
         new TextDecoder().decode(response.body),
@@ -368,7 +368,7 @@ export class AwsS3ObjectStore implements ObjectStore {
     );
     throwIfPreconditionFailed(response);
     if (response.status !== 200) {
-      this.throwResponseError(response, `write ${key}`);
+      this.throwResponseError(response, `写入 ${key}`);
     }
     return {
       body: new Uint8Array(),
@@ -395,7 +395,7 @@ export class AwsS3ObjectStore implements ObjectStore {
       { uploads: "" },
     );
     if (initiated.status !== 200) {
-      this.throwResponseError(initiated, `start multipart upload for ${key}`);
+      this.throwResponseError(initiated, `开始 ${key} 的分段上传`);
     }
     const uploadId = readXmlElement(
       initiated.body,
@@ -415,7 +415,7 @@ export class AwsS3ObjectStore implements ObjectStore {
           { partNumber: String(partNumber), uploadId },
         );
         if (uploaded.status !== 200) {
-          this.throwResponseError(uploaded, `upload part ${partNumber} of ${key}`);
+          this.throwResponseError(uploaded, `上传 ${key} 的第 ${partNumber} 段`);
         }
         parts.push({
           etag: requiredEntityTag(uploaded.headers),
@@ -441,7 +441,7 @@ export class AwsS3ObjectStore implements ObjectStore {
       );
       throwIfPreconditionFailed(completed);
       if (completed.status !== 200) {
-        this.throwResponseError(completed, `complete multipart upload for ${key}`);
+        this.throwResponseError(completed, `完成 ${key} 的分段上传`);
       }
       return {
         body: new Uint8Array(),
@@ -489,12 +489,12 @@ export class AwsS3ObjectStore implements ObjectStore {
     nextContinuationToken?: string;
   } {
     if (typeof value !== "object" || value === null || !("ListBucketResult" in value)) {
-      throw new Error("AWS S3 returned an invalid ListObjectsV2 document");
+      throw new Error("AWS S3 返回的 ListObjectsV2 文档无效");
     }
     const document = value as Record<string, unknown>;
     const rootValue = document["ListBucketResult"];
     if (typeof rootValue !== "object" || rootValue === null) {
-      throw new Error("AWS S3 returned an invalid ListObjectsV2 result");
+      throw new Error("AWS S3 返回的 ListObjectsV2 结果无效");
     }
     const root = rootValue as Record<string, unknown>;
     const contents = root["Contents"] ?? [];
@@ -548,7 +548,7 @@ export class AwsS3ObjectStore implements ObjectStore {
   ): never {
     throw new S3RequestError(
       response.status,
-      `AWS S3 could not ${operation} (HTTP ${response.status})`,
+      `AWS S3 无法${operation}（HTTP ${response.status}）`,
     );
   }
 }
