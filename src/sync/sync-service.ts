@@ -1359,12 +1359,14 @@ export class SyncService {
       kind: "possible-rename",
       newPaths: possibleRename.newFiles.map(file => file.path),
       oldPaths: possibleRename.deletedEntries.map(entry => entry.path),
+      // 令牌只绑定被扣住的部分：其他文件同步发布新 Commit 后仍然有效，被扣住的文件一变就失效
       reviewToken: await sha256(new TextEncoder().encode(JSON.stringify({
         vaultId: remote.vaultId,
-        head: remote.commitId,
-        base: reconciliationBase?.commitId,
-        old: possibleRename.deletedEntries.map(entry => [entry.entryId, entry.path]).sort(),
-        files: observation.files.map(file => [file.path, file.contentHash, file.size, file.entryId ?? null])
+        old: possibleRename.deletedEntries.map(entry => {
+          const accepted = reconciliationBase?.entries[entry.entryId];
+          return [entry.entryId, entry.path, accepted?.kind === "live" ? accepted.revision.contentHash : null];
+        }).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+        files: possibleRename.newFiles.map(file => [file.path, file.contentHash, file.size])
           .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
       }))),
     } : undefined;
@@ -1429,7 +1431,6 @@ export class SyncService {
         conflict.kind === "bootstrap-mismatch" ||
         conflict.kind === "import-candidate" ||
         conflict.kind === "path-collision" ||
-        conflict.kind === "possible-rename" ||
         conflict.kind === "resolution-mismatch",
     );
     if (hasBlockingConflict) {
@@ -1972,18 +1973,30 @@ export class SyncService {
         locallyMutatedPaths.add(pendingWrite.path);
       }
     }
-    await this.options.cache.save(
-      await this.buildCache(
-        remote,
-        deferredDownloadEntries.map((entry) => entry.entryId),
-        {
-          forceHashPaths: locallyMutatedPaths,
-          fullHashVerification: false,
-          hashHints: new Map(scan.files.map((file) => [file.path, file])),
-          pathRenames: syncOptions.pathRenames,
-        },
-      ),
+    const nextCache = await this.buildCache(
+      remote,
+      deferredDownloadEntries.map((entry) => entry.entryId),
+      {
+        forceHashPaths: locallyMutatedPaths,
+        fullHashVerification: false,
+        hashHints: new Map(scan.files.map((file) => [file.path, file])),
+        pathRenames: syncOptions.pathRenames,
+      },
     );
+    // 被扣住的消失 Entry 保留上一次接受的本地记录，下一次同步仍是「已知、本地缺失」，
+    // 既不会被当成删除发布，也不会被当成远端新文件下载回旧路径
+    for (const conflict of plan.conflicts) {
+      if (conflict.kind !== "possible-rename") continue;
+      for (const held of conflict.deletedEntries) {
+        const prior = cachedFilesByEntryId.get(held.entryId);
+        const entry = remote.entries[held.entryId];
+        if (prior && entry?.kind === "live" && entry.path === prior.path &&
+          entry.revision.contentHash === prior.contentHash && !nextCache.files[prior.path]) {
+          nextCache.files[prior.path] = prior;
+        }
+      }
+    }
+    await this.options.cache.save(nextCache);
     const status: SyncResult["status"] =
       unresolvedConflicts > 0 || scan.unsyncedLocalEntries > 0 || deferredLocalEditPaths.length > 0 ||
       deferredDownloadEntries.some(entry => entry.reason === "unsupported-path")

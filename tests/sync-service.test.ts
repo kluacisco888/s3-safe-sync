@@ -5300,17 +5300,17 @@ describe("SyncService", () => {
       }
     });
 
-    it.each(["local-edit", "new-file", "remote-change", "wrong-token"])(
+    it.each(["local-edit", "new-file", "remote-edit", "wrong-token"])(
       "rejects a stale review after %s without publishing or deleting files", async change => {
         const {service, issue, local, remote} = await setupReview();
         if (change === "local-edit") await local.write("new/0.md", new TextEncoder().encode("newer draft"));
         if (change === "new-file") await local.write("new/extra.md", new TextEncoder().encode("extra draft"));
-        if (change === "remote-change") {
-          const head = (await remote.readHead())!;
-          const commitId = crypto.randomUUID();
-          await remote.advance({expectedHeadEtag: head.etag, head: {...head.value, commitId, generation: head.value.generation + 1},
-            commit: {commitId, changes: [], parentIds: [head.value.commitId], createdAt: head.serverDate,
-              protocolVersion: 1, replicaId: "other", vaultId: "vault"}});
+        if (change === "remote-edit") {
+          const other = new MemoryVault();
+          const otherService = new SyncService({cache: new MemorySyncCache(), local: other, remote, replicaId: "phone"});
+          await otherService.synchronize();
+          await other.write("old/0.md", new TextEncoder().encode("remote draft"));
+          await otherService.synchronize();
         }
         const before = (await remote.readHead())!.value.commitId;
         await expect(service.synchronize([], {renameResolution: {
@@ -5342,6 +5342,96 @@ describe("SyncService", () => {
       expect(Object.values(snapshot.entries).filter(entry => entry.kind === "deleted")).toHaveLength(2);
       expect(Object.values(snapshot.entries).filter(entry => entry.kind === "live")).toHaveLength(2);
       expect(local.readText("new/0.md")).toBe("edited 0");
+    });
+  });
+
+  describe("held unobserved moves", () => {
+    const encode = (text: string) => new TextEncoder().encode(text);
+    const notes = ["a.md", "b.md", "c.md", "d.md", "e.md"];
+    // 2026-10-13 图纸场景：旧 PDF 消失，两个同内容 PDF 新增，另有截图与笔记改动
+    const setupDrawings = async () => {
+      const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "test", vaultKey: new Uint8Array(32)});
+      const local = new MemoryVault();
+      await local.write("TM/8799-D R1.pdf", encode("drawing"));
+      for (const note of notes) await local.write(note, encode(`note ${note}`));
+      const cache = new MemorySyncCache();
+      const service = new SyncService({cache, local, remote, replicaId: "desktop"});
+      await service.initializeNew("vault");
+      const pdfEntryId = cache.state!.files["TM/8799-D R1.pdf"]!.entryId;
+      const other = new MemoryVault();
+      const otherService = new SyncService({cache: new MemorySyncCache(), local: other, remote, replicaId: "phone"});
+      await otherService.synchronize();
+      await other.write("b.md", encode("remote edit"));
+      await otherService.synchronize();
+      await local.delete("TM/8799-D R1.pdf");
+      await local.write("TM/archive/8799-D R1 old.pdf", encode("drawing"));
+      await local.write("TM/8797-D R1.pdf", encode("drawing"));
+      for (let index = 0; index < 5; index += 1) await local.write(`shots/${index}.png`, encode(`png ${index}`));
+      await local.write("a.md", encode("local edit"));
+      return {remote, local, cache, service, other, otherService, pdfEntryId};
+    };
+    const liveByPath = async (remote: RemoteStore) => {
+      const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      return new Map(Object.values(snapshot.entries).flatMap(entry => entry.kind === "live" ? [[entry.path, entry] as const] : []));
+    };
+    const heldPdfIssue = {
+      kind: "possible-rename",
+      newPaths: expect.arrayContaining(["TM/archive/8799-D R1 old.pdf", "TM/8797-D R1.pdf"]),
+      oldPaths: ["TM/8799-D R1.pdf"],
+      reviewToken: expect.any(String),
+    };
+
+    it("syncs unrelated changes while holding only the same-type files of an unrecognized move", async () => {
+      const {remote, local, service, pdfEntryId} = await setupDrawings();
+
+      const result = await service.synchronize();
+
+      expect(result.status).toBe("action-required");
+      expect(result.cacheUpdated).toBe(true);
+      expect(result.localIssues).toEqual([heldPdfIssue]);
+      const live = await liveByPath(remote);
+      for (let index = 0; index < 5; index += 1) expect(live.has(`shots/${index}.png`)).toBe(true);
+      const note = live.get("a.md")!;
+      expect(new TextDecoder().decode(await remote.readBlob(note.revision.blobId))).toBe("local edit");
+      expect(local.readText("b.md")).toBe("remote edit");
+      expect(live.get("TM/8799-D R1.pdf")?.entryId).toBe(pdfEntryId);
+      expect(live.has("TM/archive/8799-D R1 old.pdf")).toBe(false);
+      expect(live.has("TM/8797-D R1.pdf")).toBe(false);
+      expect(local.readText("TM/8799-D R1.pdf")).toBeUndefined();
+    });
+
+    it("keeps the held files unchanged on the next sync without a decision", async () => {
+      const {remote, local, service, pdfEntryId} = await setupDrawings();
+      const first = await service.synchronize();
+      const firstIssue = first.localIssues.find(issue => issue.kind === "possible-rename");
+      const head = (await remote.readHead())!.value.commitId;
+
+      const second = await service.synchronize();
+
+      expect(second.status).toBe("action-required");
+      expect(second.localIssues).toEqual([firstIssue]);
+      expect(second.downloaded).toBe(0);
+      expect(second.uploaded).toBe(0);
+      expect((await remote.readHead())!.value.commitId).toBe(head);
+      expect(local.readText("TM/8799-D R1.pdf")).toBeUndefined();
+      const live = await liveByPath(remote);
+      expect(live.get("TM/8799-D R1.pdf")?.entryId).toBe(pdfEntryId);
+      expect(live.has("TM/archive/8799-D R1 old.pdf")).toBe(false);
+      expect(live.has("TM/8797-D R1.pdf")).toBe(false);
+    });
+
+    it("recognizes the held move once only one identical candidate remains", async () => {
+      const {remote, local, service, pdfEntryId} = await setupDrawings();
+      await service.synchronize();
+      await local.delete("TM/8797-D R1.pdf");
+
+      const result = await service.synchronize();
+
+      expect(result.status).toBe("complete");
+      expect(result.localIssues).toEqual([]);
+      const live = await liveByPath(remote);
+      expect(live.get("TM/archive/8799-D R1 old.pdf")?.entryId).toBe(pdfEntryId);
+      expect(live.has("TM/8799-D R1.pdf")).toBe(false);
     });
   });
 
