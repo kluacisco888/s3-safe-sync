@@ -1208,6 +1208,33 @@ export class SyncService {
       claimants.push(file);
       newFilesByFingerprint.set(fingerprint, claimants);
     }
+    // 同一内容分组里消失的 Entry 或新文件多于一个时，按文件名（含扩展名，NFC 规范化后完全相同）一一配对：
+    // 只有某个消失 Entry 恰好有一个同名新文件、且该新文件也只对应它一个时才认定为挪动。
+    // 已由 Pending Path Rename 认领的源和目标不参与，避免同一 Entry ID 落到两个路径。
+    const sameNameEntryIdByPath = new Map<string, string>();
+    const fileName = (path: string) => (path.split("/").pop() ?? path).normalize("NFC");
+    for (const [fingerprint, missingEntries] of missingCachedByFingerprint) {
+      const claimants = newFilesByFingerprint.get(fingerprint) ?? [];
+      if (missingEntries.length === 1 && claimants.length === 1) continue;
+      const missingByName = new Map<string, CachedFileState[]>();
+      for (const missing of missingEntries) {
+        if (renamedSourcePaths.has(missing.path)) continue;
+        const name = fileName(missing.path);
+        missingByName.set(name, [...(missingByName.get(name) ?? []), missing]);
+      }
+      const claimantsByName = new Map<string, LocalFileInfo[]>();
+      for (const claimant of claimants) {
+        if (renamedSourcePaths.has(claimant.path) || renameSourcesByTarget.has(claimant.path)) continue;
+        const name = fileName(claimant.path);
+        claimantsByName.set(name, [...(claimantsByName.get(name) ?? []), claimant]);
+      }
+      for (const [name, sameNameMissing] of missingByName) {
+        const sameNameClaimants = claimantsByName.get(name);
+        if (sameNameMissing.length === 1 && sameNameMissing[0] && sameNameClaimants?.length === 1 && sameNameClaimants[0]) {
+          sameNameEntryIdByPath.set(sameNameClaimants[0].path, sameNameMissing[0].entryId);
+        }
+      }
+    }
     for (const file of scanned) {
       const renameSources = renameSourcesByTarget.get(file.path);
       const renamedFile =
@@ -1232,14 +1259,16 @@ export class SyncService {
       const newClaimants = newFilesByFingerprint.get(
         `${file.size}:${file.contentHash}`,
       );
+      const inferredEntryId =
+        renameCandidates?.length === 1 && renameCandidates[0] && newClaimants?.length === 1
+          ? renameCandidates[0].entryId
+          : sameNameEntryIdByPath.get(file.path);
       if (
-        renameCandidates?.length === 1 &&
-        renameCandidates[0] &&
-        newClaimants?.length === 1 &&
+        inferredEntryId !== undefined &&
         // Equal bytes are not evidence that an already-owned path changed identity.
-        !(liveOwnersByCanonicalPath.get(canonicalVaultPath(file.path)) ?? []).some(id => id !== renameCandidates[0]!.entryId)
+        !(liveOwnersByCanonicalPath.get(canonicalVaultPath(file.path)) ?? []).some(id => id !== inferredEntryId)
       ) {
-        entryIdByPath.set(file.path, renameCandidates[0].entryId);
+        entryIdByPath.set(file.path, inferredEntryId);
       }
     }
     const deferredDownloadEntries = Object.values(remote.entries).flatMap(
