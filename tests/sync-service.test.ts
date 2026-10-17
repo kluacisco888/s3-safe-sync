@@ -5262,12 +5262,16 @@ describe("SyncService", () => {
   });
 
   describe("possible rename review", () => {
-    const setupReview = async (count = 1) => {
+    // unrelated：无关的存活文件数。被扣住的消失 Entry 计入 Bulk Deletion 门槛，补足它们才能走挪动审查而不是批量删除
+    const setupReview = async (count = 1, unrelated = 20) => {
       const objects = new MemoryObjectStore();
       const remote = await RemoteStore.open({objects, prefix: "test", vaultKey: new Uint8Array(32)});
       const local = new MemoryVault();
       for (let index = 0; index < count; index += 1) {
         await local.write(`old/${index}.md`, new TextEncoder().encode(`original ${index}`));
+      }
+      for (let index = 0; index < unrelated; index += 1) {
+        await local.write(`keep/${index}.md`, new TextEncoder().encode(`keep ${index}`));
       }
       const cache = new MemorySyncCache();
       const service = new SyncService({cache, local, remote, replicaId: "desktop"});
@@ -5277,13 +5281,15 @@ describe("SyncService", () => {
         await local.move(`old/${index}.md`, `new/${index}.md`);
         await local.write(`new/${index}.md`, new TextEncoder().encode(`edited ${index}`));
       }
-      const issue = (await service.synchronize()).localIssues.find(issue => issue.kind === "possible-rename");
+      const review = await service.synchronize();
+      const issue = review.localIssues.find(issue => issue.kind === "possible-rename");
       if (!issue) throw new Error("Expected rename review");
-      return {objects, remote, local, cache, service, original, issue};
+      return {objects, remote, local, cache, service, original, issue, review};
     };
 
     it("accepts a reviewed folder move with edits, retaining every Entry and old content", async () => {
-      const {service, issue, remote, original} = await setupReview(3);
+      const {service, issue, remote, original, review} = await setupReview(3);
+      expect(review.bulkDeletion).toBeUndefined();
       const result = await service.synchronize([], {renameResolution: {
         kind: "moves", reviewToken: issue.reviewToken,
         pairs: issue.oldPaths.map(fromPath => ({fromPath, toPath: fromPath.replace("old/", "new/")})),
@@ -5291,7 +5297,9 @@ describe("SyncService", () => {
       expect(result.status).toBe("complete");
       const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
       expect(Object.keys(snapshot.entries).sort()).toEqual(Object.keys(original.snapshot.entries).sort());
-      for (const entry of Object.values(snapshot.entries)) {
+      const moved = Object.values(snapshot.entries).filter(entry => !entry.path.startsWith("keep/"));
+      expect(moved).toHaveLength(3);
+      for (const entry of moved) {
         expect(entry.kind).toBe("live");
         expect(entry.path.startsWith("new/")).toBe(true);
         expect(entry.history?.[0]?.contentHash).toBe(
@@ -5302,7 +5310,8 @@ describe("SyncService", () => {
 
     it.each(["local-edit", "new-file", "remote-edit", "wrong-token"])(
       "rejects a stale review after %s without publishing or deleting files", async change => {
-        const {service, issue, local, remote} = await setupReview();
+        const {service, issue, local, remote, review} = await setupReview();
+        expect(review.bulkDeletion).toBeUndefined();
         if (change === "local-edit") await local.write("new/0.md", new TextEncoder().encode("newer draft"));
         if (change === "new-file") await local.write("new/extra.md", new TextEncoder().encode("extra draft"));
         if (change === "remote-edit") {
@@ -5322,14 +5331,16 @@ describe("SyncService", () => {
     );
 
     it("rejects a mapping that assigns two old Entries to the same new file", async () => {
-      const {service, issue} = await setupReview(2);
+      const {service, issue, review} = await setupReview(2);
+      expect(review.bulkDeletion).toBeUndefined();
       await expect(service.synchronize([], {renameResolution: {kind: "moves", reviewToken: issue.reviewToken,
         pairs: issue.oldPaths.map(fromPath => ({fromPath, toPath: "new/0.md"})),
       }})).rejects.toThrow("不是一对一的");
     });
 
     it("requires exact bulk-delete confirmation after separate delete/add review", async () => {
-      const {service, issue, remote, local} = await setupReview(2);
+      // 不补无关文件：分开处理后的删除集合与审查时被扣住的集合相同，要让前者成为批量删除，审查阶段也必然超过门槛
+      const {service, issue, remote, local} = await setupReview(2, 0);
       const before = (await remote.readHead())!.value.commitId;
       const resolution = {kind: "separate" as const, reviewToken: issue.reviewToken};
       const blocked = await service.synchronize([], {renameResolution: resolution});
@@ -5614,6 +5625,10 @@ describe("SyncService", () => {
     });
     const local = new MemoryVault();
     await local.write("notes/old.md", new TextEncoder().encode("same"));
+    // 补足无关的存活文件，让被扣住的消失 Entry 不触发 Bulk Deletion，走挪动审查
+    for (let index = 0; index < 5; index += 1) {
+      await local.write(`keep/${index}.md`, new TextEncoder().encode(`keep ${index}`));
+    }
     const service = new SyncService({
       cache: new MemorySyncCache(),
       local,
@@ -5629,6 +5644,7 @@ describe("SyncService", () => {
     const result = await service.synchronize();
 
     expect(result.status).toBe("action-required");
+    expect(result.bulkDeletion).toBeUndefined();
     expect(result.localIssues).toEqual([
       {
         kind: "possible-rename",
@@ -5713,8 +5729,12 @@ describe("SyncService", () => {
         .toContain("图纸/d.pdf");
     });
 
+    // 无关的存活文件：让被扣住的消失 Entry 不触发 Bulk Deletion，走挪动审查
+    const unrelated = Object.fromEntries([0, 1, 2, 3, 4].map(index =>
+      [`notes/keep-${index}.md`, new TextEncoder().encode(`keep ${index}`)]));
+
     it("still reviews the move when two identical candidates share the missing name", async () => {
-      const {remote, local, service} = await setupVault({"图纸/x.pdf": drawing});
+      const {remote, local, service} = await setupVault({"图纸/x.pdf": drawing, ...unrelated});
       const before = (await remote.readHead())!.value.commitId;
       await local.move("图纸/x.pdf", "甲/x.pdf");
       await local.write("乙/x.pdf", drawing);
@@ -5722,6 +5742,7 @@ describe("SyncService", () => {
       const result = await service.synchronize();
 
       expect(result.status).toBe("action-required");
+      expect(result.bulkDeletion).toBeUndefined();
       expect(result.localIssues).toEqual([{
         kind: "possible-rename",
         newPaths: ["甲/x.pdf", "乙/x.pdf"],
@@ -5732,7 +5753,7 @@ describe("SyncService", () => {
     });
 
     it("does not pair a same-named candidate whose path another live Entry owns", async () => {
-      const {remote, local, service, readSnapshot, entryAt} = await setupVault({"图纸/x.pdf": drawing});
+      const {remote, local, service, readSnapshot, entryAt} = await setupVault({"图纸/x.pdf": drawing, ...unrelated});
       const moved = entryAt("图纸/x.pdf");
       const phoneFiles = new MemoryVault();
       const phone = new SyncService({cache: new MemorySyncCache(), local: phoneFiles, remote, replicaId: "phone"});
@@ -5744,6 +5765,7 @@ describe("SyncService", () => {
       await local.write("图纸/y.pdf", drawing);
       const result = await service.synchronize();
 
+      expect(result.bulkDeletion).toBeUndefined();
       // 被占用的同名路径不配对：它归属另一 Entry，剩下的消失/新增照旧进入挪动审查，而不是路径冲突。
       expect(result.localIssues).toEqual([{
         kind: "possible-rename",
