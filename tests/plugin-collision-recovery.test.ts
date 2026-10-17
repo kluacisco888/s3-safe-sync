@@ -115,16 +115,16 @@ describe("plugin collision recovery persistence", () => {
     const statuses: string[] = [];
     plugin.onStatusChange(status => statuses.push(status.text));
     await plugin.syncNow();
-    expect(plugin.getStatusText()).toMatch(/^Action required:/);
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/);
     expect(plugin.getLocalIssues()).toHaveLength(2);
     if (paused) await plugin.togglePause();
     await plugin.importCandidate("first.md");
     expect(plugin.getLocalIssues()).toEqual([{kind: "import-candidate", path: "second.md"}]);
-    expect(plugin.getStatusText()).toMatch(/^Action required:/);
-    expect(statuses.at(-1)).toMatch(/^Action required:/);
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/);
+    expect(statuses.at(-1)).toMatch(/^需要处理：/);
     await plugin.importCandidate("second.md");
     expect(plugin.getLocalIssues()).toEqual([]);
-    expect(plugin.getStatusText()).toMatch(paused ? /^Paused:/ : /^Idle:/);
+    expect(plugin.getStatusText()).toMatch(paused ? /^已暂停：/ : /^空闲：/);
     if (largeAttachment) {
       expect(plugin.getDeferredDownloads()).toEqual([]);
       const write = vi.spyOn(ObsidianVaultPort.prototype, "write").mockImplementation(async (path, body) => {
@@ -132,7 +132,7 @@ describe("plugin collision recovery persistence", () => {
       });
       try {
         await plugin.syncNow();
-        expect(plugin.getStatusText()).toMatch(/^Idle:/);
+        expect(plugin.getStatusText()).toMatch(/^空闲：/);
         expect(files.get("large.bin")?.length).toBe(11 * 1024 * 1024);
         expect(plugin.getDeferredDownloads()).toEqual([]);
       } finally {write.mockRestore();}
@@ -187,8 +187,8 @@ describe("plugin collision recovery persistence", () => {
     expect(secrets.has("s3-vault-sync-vault-key")).toBe(true);
     expect(host.stored.pendingCollisionRename).toBeDefined();
     expect(host.stored.pendingProbes).toEqual(pendingProbes);
-    expect(plugin.getStatusText()).toContain("Unlocked. Open sync status");
-    await expect(plugin.resolveLocalContent("target.md", "stale", "remote")).rejects.toThrow("interrupted rename needs confirmation");
+    expect(plugin.getStatusText()).toContain("已解锁。请打开同步状态");
+    await expect(plugin.resolveLocalContent("target.md", "stale", "remote")).rejects.toThrow("有一次中断的改名需要确认");
     expect([...files]).toEqual([["target.md", "changed"]]);
     expect(host.request.mock.calls.length).toBeGreaterThan(0);
     plugin.onunload();
@@ -205,7 +205,7 @@ describe("plugin collision recovery persistence", () => {
     first.onunload();
     host.failSave = false;
     const restarted = await start(files);
-    await expect(restarted.initializeOrUnlock("")).rejects.toThrow("Enter the Vault password first");
+    await expect(restarted.initializeOrUnlock("")).rejects.toThrow("请先输入仓库密码");
     expect(host.stored.pendingCollisionRename).toBeUndefined();
     expect(host.stored.pendingPathRenames).toEqual({"source.md": {entryId: "stable", toPath: "target.md"},
       "other.md": {entryId: "other", toPath: "other-new.md"}});
@@ -217,7 +217,7 @@ describe("plugin collision recovery persistence", () => {
   it("cancels a not-started move without inventing a rename in the plugin's saved state", async () => {
     await initial();
     const plugin = await start(new Map([["source.md", "original"]]));
-    await expect(plugin.initializeOrUnlock("")).rejects.toThrow("Enter the Vault password first");
+    await expect(plugin.initializeOrUnlock("")).rejects.toThrow("请先输入仓库密码");
     expect(host.stored.pendingCollisionRename).toBeUndefined();
     expect(host.stored.pendingPathRenames).toEqual({"other.md": {entryId: "other", toPath: "other-new.md"}});
     expect(host.request).not.toHaveBeenCalled();
@@ -228,7 +228,7 @@ describe("plugin collision recovery persistence", () => {
     await initial();
     const files = new Map([["target.md", "changed"]]);
     const plugin = await start(files);
-    await expect(plugin.resolveLocalContent("target.md", "stale", "remote")).rejects.toThrow("interrupted rename needs confirmation");
+    await expect(plugin.resolveLocalContent("target.md", "stale", "remote")).rejects.toThrow("有一次中断的改名需要确认");
     expect(host.stored.pendingCollisionRename).toBeDefined();
     expect(plugin.getLocalIssues()).toContainEqual({kind: "path-collision", paths: ["source.md", "target.md"]});
     expect([...files]).toEqual([["target.md", "changed"]]);

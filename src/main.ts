@@ -84,6 +84,17 @@ type PluginStatus =
   | "Paused"
   | "Syncing";
 
+// 状态的内部取值保持英文（逻辑判断用），界面只显示这里的中文名
+const statusLabels: Record<PluginStatus, string> = {
+  "Action required": "需要处理",
+  Checking: "检查中",
+  Error: "出错",
+  Idle: "空闲",
+  "Not configured": "未配置",
+  Paused: "已暂停",
+  Syncing: "同步中",
+};
+
 class RepairModeError extends Error {
   constructor(message: string) {
     super(message);
@@ -167,7 +178,7 @@ export default class S3VaultSyncPlugin
   private readonly syncProgressThrottle = new SyncProgressThrottle();
   private readonly yieldDuringHashing = createCooperativeYield();
   private status: PluginStatus = "Not configured";
-  private statusDetail = "Enter AWS settings and a Vault password.";
+  private statusDetail = "请填写 AWS 设置和仓库密码。";
   private statusElement: HTMLElement | undefined;
   private readonly statusListeners = new Set<
     (status: SyncStatusDisplay) => void
@@ -200,34 +211,34 @@ export default class S3VaultSyncPlugin
     this.session.assertActive();
     this.credentials = new CredentialStore(this.app.secretStorage);
     this.addSettingTab(new S3VaultSyncSettingsTab(this.app, this));
-    this.addRibbonIcon("refresh-cw", "Open S3 Vault Sync", () => {
+    this.addRibbonIcon("refresh-cw", "打开 S3 Vault Sync", () => {
       this.openStatus();
     });
     this.addCommand({
       callback: () => this.openStatus(),
       id: "open-status",
-      name: "Open sync status",
+      name: "打开同步状态",
     });
     this.addCommand({
       callback: () => {
         void this.syncNow();
       },
       id: "sync-now",
-      name: "Sync now",
+      name: "立即同步",
     });
     this.addCommand({
       callback: () => {
         void this.verifyAllFiles();
       },
       id: "run-full-integrity-check",
-      name: "Run full integrity check",
+      name: "运行完整校验",
     });
     this.addCommand({
       callback: () => {
         void this.togglePause();
       },
       id: "toggle-pause",
-      name: "Pause or resume automatic sync",
+      name: "暂停或恢复自动同步",
     });
     this.addCommand({
       checkCallback: (checking) => {
@@ -242,7 +253,7 @@ export default class S3VaultSyncPlugin
         return true;
       },
       id: "open-version-history",
-      name: "Open version history for the current file",
+      name: "打开当前文件的历史版本",
     });
     if (Platform.isDesktop) {
       this.statusElement = this.addStatusBarItem();
@@ -323,7 +334,7 @@ export default class S3VaultSyncPlugin
   }
 
   getStatusText(): string {
-    return `${this.status}: ${this.statusDetail}`;
+    return `${statusLabels[this.status]}：${this.statusDetail}`;
   }
 
   getDiagnostics(limit = 20): SyncDiagnosticsView {
@@ -407,9 +418,9 @@ export default class S3VaultSyncPlugin
 
   async resolvePossibleRename(resolution: PossibleRenameResolution): Promise<void> {
     if (this.syncRequests.isRunning) {
-      throw new Error("Synchronization is running. Wait for it to finish, then review again.");
+      throw new Error("同步正在进行。请等它结束后再审查一次。");
     }
-    if (this.isPaused()) throw new Error("Resume synchronization before resolving a rename.");
+    if (this.isPaused()) throw new Error("请先恢复同步，再处理挪动。");
     this.approvedRenameResolution = resolution;
     try {
       await this.requestSync({ fullHashVerification: true });
@@ -449,12 +460,12 @@ export default class S3VaultSyncPlugin
   async confirmInterruptedCollisionRename(paths: string[], reviewToken: string, side: "source" | "target"): Promise<void> {
     await this.runExclusiveSyncService(async service => {
       const pending = this.data.pendingCollisionRename;
-      if (!pending) throw new Error("The interrupted rename has already changed. Refresh sync status.");
+      if (!pending) throw new Error("这次中断的改名已经变化。请刷新同步状态。");
       const review = await service.reviewPathCollision(paths, this.pathRenames.toPathMap(this.pathRenames.capture()));
-      if (JSON.stringify({base: review.reviewToken, pending}) !== reviewToken) throw new Error("Recovery files changed. Reload the collision review.");
+      if (JSON.stringify({base: review.reviewToken, pending}) !== reviewToken) throw new Error("用于恢复的文件有变化。请重新加载路径撞名审查。");
       const path = side === "source" ? pending.from : pending.to;
       const file = review.localFiles.find(file => file.path === path);
-      if (!file?.contentHash) throw new Error("The selected recovery file cannot be verified on this device.");
+      if (!file?.contentHash) throw new Error("所选的恢复文件无法在本设备上校验。");
       await this.collisionRenameJournal().recover({side, hash: file.contentHash});
     }, true);
     await this.requestSync();
@@ -466,13 +477,13 @@ export default class S3VaultSyncPlugin
       prepare: async intent => {
         this.session.assertActive();
         if (expectedRenames !== undefined && JSON.stringify(this.pathRenames.serialize()) !== expectedRenames) {
-          throw new Error("Local rename records changed. Reload the collision review.");
+          throw new Error("本地改名记录有变化。请重新加载路径撞名审查。");
         }
         const identitySourcePath = intent.entryId
           ? [...this.pathRenames.capture()].find(([, rename]) => rename.entryId === intent.entryId)?.[0] ??
             Object.values(this.data.cache?.files ?? {}).find(file => file.entryId === intent.entryId)?.path
           : undefined;
-        if (intent.entryId && !identitySourcePath) throw new Error("The file identity changed. Reload the collision review.");
+        if (intent.entryId && !identitySourcePath) throw new Error("文件身份有变化。请重新加载路径撞名审查。");
         this.data.pendingCollisionRename = {...intent, identitySourcePath};
         await this.savePluginData();
       },
@@ -494,18 +505,18 @@ export default class S3VaultSyncPlugin
   private async recoverCollisionRename(allowReview = false): Promise<void> {
     const pending = this.data.pendingCollisionRename;
     if (!pending) return;
-    if (!isSafeTargetPath(pending.from) || !isSafeTargetPath(pending.to)) throw new Error("An interrupted rename contains an unsafe path.");
+    if (!isSafeTargetPath(pending.from) || !isSafeTargetPath(pending.to)) throw new Error("中断的改名里包含不安全的路径。");
     if (await this.collisionRenameJournal().recover() === "needs-review") {
       if (!this.pendingLocalIssues.some(issue => issue.kind === "path-collision" && issue.paths.includes(pending.to))) {
         this.pendingLocalIssues.push({kind: "path-collision", paths: [pending.from, pending.to]});
       }
-      if (!allowReview) throw new Error("An interrupted rename needs confirmation. Open sync status and choose Review path collision.");
+      if (!allowReview) throw new Error("有一次中断的改名需要确认。请打开同步状态，选择「审查路径撞名」。");
     }
   }
 
   openVersionHistory(path: string): void {
     const entry = this.getLiveEntry(path);
-    if (!entry?.history?.length) throw new Error("No recoverable versions are available for this file. Sync to refresh its history.");
+    if (!entry?.history?.length) throw new Error("这个文件没有可恢复的版本。同步一次可刷新它的历史。");
     new VersionHistoryModal(this.app, this, entry).open();
   }
 
@@ -530,7 +541,7 @@ export default class S3VaultSyncPlugin
   async openLocalFile(path: string): Promise<void> {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) {
-      throw new Error("This file is not present on this device. Copy the path and use the device that holds it.");
+      throw new Error("本设备上没有这个文件。请复制路径，到存有它的设备上操作。");
     }
     await this.app.workspace.getLeaf(false).openFile(file);
   }
@@ -547,7 +558,7 @@ export default class S3VaultSyncPlugin
       this.pendingLocalIssues = this.pendingLocalIssues.filter(
         (issue) => issue.kind !== "import-candidate" || issue.path !== path,
       );
-      this.reportManualCompletion("Local file uploaded to S3 as a new file.");
+      this.reportManualCompletion("本地文件已作为新文件上传到 S3。");
     } catch (error) {
       this.showError(error);
       throw error;
@@ -562,7 +573,7 @@ export default class S3VaultSyncPlugin
       this.pendingDeferredDownloads = this.pendingDeferredDownloads.filter(
         (entry) => entry.entryId !== entryId,
       );
-      this.reportManualCompletion("Large file downloaded after explicit confirmation.");
+      this.reportManualCompletion("已按你的确认下载大文件。");
     } catch (error) {
       this.showError(error);
       throw error;
@@ -581,7 +592,7 @@ export default class S3VaultSyncPlugin
       await this.runExclusiveSyncService((service) =>
         service.restoreRevision(entryId, revisionId),
       );
-      this.reportManualCompletion("Historical Revision restored.");
+      this.reportManualCompletion("历史版本已恢复。");
     } catch (error) {
       this.showError(error);
       throw error;
@@ -602,7 +613,7 @@ export default class S3VaultSyncPlugin
       await this.runExclusiveSyncService((service) =>
         service.restoreDeleted(entryId, revisionId),
       );
-      this.reportManualCompletion("Deleted file restored as a new Revision.");
+      this.reportManualCompletion("已删除的文件已作为新版本恢复。");
     } catch (error) {
       this.showError(error);
       throw error;
@@ -633,9 +644,9 @@ export default class S3VaultSyncPlugin
     const integrityTarget = this.integrityTarget();
     try {
       if (!password) {
-        throw new Error("Enter the Vault password first");
+        throw new Error("请先输入仓库密码");
       }
-      this.setStatus("Checking", "Checking S3 and the encrypted Remote Store.");
+      this.setStatus("Checking", "正在检查 S3 和加密的远端存储。");
       assertTarget();
       const objects = this.createObjectStore();
       const prefix = normalizePrefix(this.data.settings.prefix);
@@ -655,16 +666,16 @@ export default class S3VaultSyncPlugin
           this.data.settings.vaultId !== existing.vaultId
         ) {
           throw new Error(
-            "This local Vault is already bound to a different Remote Store",
+            "这个本地仓库已绑定到另一个远端存储",
           );
         }
         vaultId = existing.vaultId;
         vaultKey = await VaultCrypto.unwrapKey(password, existing.envelope);
       } else {
-        if (needsRenameReview) throw new Error("Resolve the interrupted rename before initializing a new Remote Store.");
+        if (needsRenameReview) throw new Error("请先处理中断的改名，再初始化新的远端存储。");
         const existingKeys = await objects.list(prefix ? `${prefix}/` : "");
         if (existingKeys.some(key => !ownedProbeKeys.has(key))) {
-          throw new Error("The selected S3 prefix is not empty");
+          throw new Error("所选的 S3 前缀不是空的");
         }
         const legacyPrefix = normalizePrefix(
           this.data.settings.remotelySavePrefix,
@@ -672,14 +683,14 @@ export default class S3VaultSyncPlugin
         if (legacyPrefix) {
           if (!this.data.settings.confirmedRemotelySaveDisabled) {
             throw new Error(
-              "Confirm that Remotely Save is disabled before migration",
+              "迁移前请确认已停用 Remotely Save",
             );
           }
           if (!Platform.isDesktopApp) {
-            throw new Error("Remotely Save migration must run on desktop");
+            throw new Error("Remotely Save 迁移必须在桌面端运行");
           }
           if (legacyPrefix === prefix) {
-            throw new Error("The new prefix must differ from Remotely Save");
+            throw new Error("新前缀必须和 Remotely Save 的前缀不同");
           }
           const comparison = await (
             await RemotelySaveMigration.open({
@@ -694,7 +705,7 @@ export default class S3VaultSyncPlugin
               .map((difference) => `${difference.kind}: ${difference.path}`)
               .join("; ");
             throw new Error(
-              `Remotely Save differs from this Vault (${comparison.differences.length} differences). ${examples}`,
+              `Remotely Save 的内容与这个仓库不一致（${comparison.differences.length} 处差异）。${examples}`,
             );
           }
         }
@@ -723,10 +734,10 @@ export default class S3VaultSyncPlugin
       const remote = await RemoteStore.open({ objects, prefix, vaultKey });
       const currentHead = await remote.readHead();
       if (currentHead && currentHead.value.vaultId !== vaultId) {
-        throw new Error("The selected prefix belongs to a different Vault");
+        throw new Error("所选前缀属于另一个仓库");
       }
       if (!currentHead) {
-        if (needsRenameReview) throw new RepairModeError("The existing Head must be recovered before path repair can continue");
+        if (needsRenameReview) throw new RepairModeError("必须先恢复现有的 Head 指针，才能继续修复路径");
         const pending = this.data.pendingInitialization;
         const canResume = pending?.phase === "uploading" &&
           pending.vaultId === vaultId && pending.prefix === prefix &&
@@ -734,13 +745,13 @@ export default class S3VaultSyncPlugin
           (await objects.list(`${prefix ? `${prefix}/` : ""}v1/commits/`)).length === 0;
         if (!isNewRemote && !canResume) {
           throw new RepairModeError(
-            "Key Envelope exists but Head is missing; writes are disabled for repair",
+            "密钥信封存在但 Head 指针缺失；为便于修复，已禁止写入",
           );
         }
         await this.createSyncService(remote).initializeNew(vaultId, async () => {
           this.session.assertActive();
           const previous = this.data.pendingInitialization;
-          if (!previous) throw new Error("Initialization checkpoint is missing");
+          if (!previous) throw new Error("初始化检查点缺失");
           this.data.pendingInitialization = { ...previous, phase: "publishing" };
           try {
             await this.savePluginData();
@@ -765,9 +776,9 @@ export default class S3VaultSyncPlugin
       }
       await this.savePluginData();
       this.setStatus(needsRenameReview ? "Action required" : "Idle", needsRenameReview
-        ? "Unlocked. Open sync status to review the interrupted rename."
-        : "Encrypted Remote Store is ready.");
-      new Notice(needsRenameReview ? "Vault unlocked. Review the interrupted rename to resume sync." : "S3 Vault Sync is ready");
+        ? "已解锁。请打开同步状态审查中断的改名。"
+        : "加密的远端存储已就绪。");
+      new Notice(needsRenameReview ? "仓库已解锁。审查完中断的改名后即可继续同步。" : "S3 Vault Sync 已就绪");
     } catch (error) {
       await this.rememberIntegrityFailure(error, integrityTarget);
       this.showError(error);
@@ -777,13 +788,13 @@ export default class S3VaultSyncPlugin
 
   async saveAwsCredentials(credentials: AwsCredentials): Promise<void> {
     if (!credentials.accessKeyId || !credentials.secretAccessKey) {
-      const error = new Error("Enter both AWS credential fields");
+      const error = new Error("请把两项 AWS 凭证都填上");
       this.showError(error);
       throw error;
     }
     this.credentials.saveAwsCredentials(credentials);
     this.refreshConfiguredStatus();
-    new Notice("AWS credentials saved in SecretStorage");
+    new Notice("AWS 凭证已保存到 SecretStorage");
   }
 
   saveSettings(): Promise<void> {
@@ -807,10 +818,10 @@ export default class S3VaultSyncPlugin
     if (this.data.settings.paused) {
       this.clearHeadRetryTimer();
       this.clearNetworkRetryTimer();
-      this.setStatus("Paused", "Automatic sync is paused on this device.");
+      this.setStatus("Paused", "本设备已暂停自动同步。");
     } else {
       this.networkRetryAttempt = 0;
-      this.setStatus("Checking", "Automatic sync resumed.");
+      this.setStatus("Checking", "已恢复自动同步。");
       await this.requestAutomaticSync("resume");
     }
   }
@@ -820,10 +831,10 @@ export default class S3VaultSyncPlugin
     const { bucket, region } = this.data.settings;
     const credentials = this.credentials.loadAwsCredentials();
     if (!bucket || !region || !this.data.settings.prefix) {
-      throw new Error("AWS region, bucket, and prefix are required");
+      throw new Error("必须填写 AWS 区域、存储桶和前缀");
     }
     if (!credentials) {
-      throw new Error("AWS credentials are not configured");
+      throw new Error("尚未配置 AWS 凭证");
     }
     return new AwsS3ObjectStore({
       ...credentials,
@@ -892,7 +903,7 @@ export default class S3VaultSyncPlugin
       await this.recoverCollisionRename(allowCollisionReview);
       const vaultKey = this.credentials.loadVaultKey();
       if (!vaultKey) {
-        throw new Error("Unlock the encrypted Vault first");
+        throw new Error("请先解锁加密仓库");
       }
       const remote = await RemoteStore.open({
         objects: this.createObjectStore(),
@@ -903,7 +914,7 @@ export default class S3VaultSyncPlugin
         const pendingBefore = this.currentIntegrityChecks().length;
         const result = await operation(this.createSyncService(remote));
         if (this.integrityTarget() === integrityTarget && this.currentIntegrityChecks().length < pendingBefore) {
-          this.reportManualCompletion("Previously reported remote content has been verified.");
+          this.reportManualCompletion("之前报告的远端内容已通过校验。");
         }
         return result;
       } catch (error) {
@@ -952,7 +963,7 @@ export default class S3VaultSyncPlugin
       const current = this.data.settings;
       if (current.bucket !== bucket || current.region !== region ||
           normalizePrefix(current.prefix) !== normalizePrefix(prefix)) {
-        throw new Error("S3 target changed during synchronization. Check the target and retry.");
+        throw new Error("同步过程中 S3 目标被改了。请检查目标后重试。");
       }
     };
   }
@@ -969,7 +980,7 @@ export default class S3VaultSyncPlugin
 
   private async clearVerifiedIntegrityIssue(target: string, check: RemoteIntegrityCheck): Promise<void> {
     this.session.assertActive();
-    if (target !== this.integrityTarget()) throw new Error("Vault changed during integrity recheck. Retry synchronization.");
+    if (target !== this.integrityTarget()) throw new Error("重新校验期间仓库有变化。请重试同步。");
     const previous = this.data.pendingIntegrityChecks ?? [];
     const remaining = previous.filter(issue => issue.target !== target || JSON.stringify(issue.check) !== JSON.stringify(check));
     if (remaining.length === previous.length) return;
@@ -984,7 +995,7 @@ export default class S3VaultSyncPlugin
     const issues = this.data.pendingIntegrityChecks ?? [];
     this.data.pendingIntegrityChecks = issues.filter(issue => issue.target !== target || JSON.stringify(issue.check) !== JSON.stringify(check));
     this.data.pendingIntegrityChecks.push({target, check, message: error.message});
-    if (target === this.integrityTarget()) this.setStatus("Action required", `Repair Mode: ${error.message}`);
+    if (target === this.integrityTarget()) this.setStatus("Action required", `修复模式：${error.message}`);
     await this.savePluginData();
   }
 
@@ -1004,7 +1015,7 @@ export default class S3VaultSyncPlugin
     if (requestedTarget !== undefined && requestedTarget !== integrityTarget) {
       this.networkRetryAttempt = 0;
       this.networkFailureTarget = undefined;
-      this.setStatus("Error", "S3 target changed while synchronization was queued. Check settings and sync again.");
+      this.setStatus("Error", "同步排队期间 S3 目标被改了。请检查设置后再同步。");
       return;
     }
     if (this.networkFailureTarget !== undefined && this.networkFailureTarget !== integrityTarget) {
@@ -1013,12 +1024,12 @@ export default class S3VaultSyncPlugin
       this.networkFailureTarget = undefined;
     }
     if (this.data.settings.paused) {
-      this.setStatus("Paused", "Automatic sync is paused on this device.");
+      this.setStatus("Paused", "本设备已暂停自动同步。");
       return;
     }
     const vaultKey = this.credentials.loadVaultKey();
     if (!vaultKey || !this.data.settings.vaultId) {
-      this.setStatus("Not configured", "Initialize or unlock the encrypted Vault.");
+      this.setStatus("Not configured", "请初始化或解锁加密仓库。");
       return;
     }
     if (this.headRetryTimer !== undefined) {
@@ -1054,7 +1065,7 @@ export default class S3VaultSyncPlugin
         this.data.fullHashVerificationRequired = true;
         await this.savePluginData();
       }
-      this.setStatus("Checking", "Reading encrypted remote Head.");
+      this.setStatus("Checking", "正在读取加密的远端 Head 指针。");
       this.diagnostics.phase(diagnostic, "remote");
       const objects = this.createObjectStore();
       const remote = await RemoteStore.open({
@@ -1070,7 +1081,7 @@ export default class S3VaultSyncPlugin
         boundHead.value.vaultId !== this.data.settings.vaultId
       ) {
         throw new RepairModeError(
-          "Remote Head is missing or belongs to a different Vault",
+          "远端 Head 指针缺失，或属于另一个仓库",
         );
       }
       const integrityChecks = this.currentIntegrityChecks();
@@ -1085,7 +1096,7 @@ export default class S3VaultSyncPlugin
         async (attempt, totalAttempts) => {
           this.setStatus(
             "Syncing",
-            `Synchronizing (attempt ${attempt}/${totalAttempts}).`,
+            `正在同步（第 ${attempt}/${totalAttempts} 次尝试）。`,
           );
           return this.createSyncService(
             remote,
@@ -1163,8 +1174,8 @@ export default class S3VaultSyncPlugin
         this.setStatus(
           "Action required",
           result.bulkDeletion
-            ? "Review and confirm the Bulk Deletion."
-            : "Open sync status to review items that need attention.",
+            ? "请审查并确认这次批量删除。"
+            : "请打开同步状态，查看需要处理的项目。",
         );
       } else {
         this.pendingBulkDeletion = undefined;
@@ -1172,7 +1183,7 @@ export default class S3VaultSyncPlugin
         this.shownStopFingerprints.clear();
         this.setStatus(
           "Idle",
-          `Downloaded ${result.downloaded}, uploaded ${result.uploaded}, deleted ${result.deleted}, deferred ${result.deferredDownloads}, unsynced ${result.unsyncedLocalEntries}.`,
+          `下载 ${result.downloaded}，上传 ${result.uploaded}，删除 ${result.deleted}，暂缓下载 ${result.deferredDownloads}，未同步 ${result.unsyncedLocalEntries}。`,
         );
       }
     } catch (error) {
@@ -1198,7 +1209,7 @@ export default class S3VaultSyncPlugin
         this.dirtyPaths.mark(error.path);
         this.setStatus(
           "Checking",
-          "A local file changed during synchronization. Retrying after edits settle.",
+          "同步过程中有本地文件被改动。等编辑停下后会自动重试。",
         );
         this.scheduleAfterLocalChange();
       } else if (retryableNetwork && this.scheduleNetworkRetry(integrityTarget)) {
@@ -1221,7 +1232,7 @@ export default class S3VaultSyncPlugin
         this.status !== "Error" &&
         this.status !== "Action required"
       ) {
-        this.setStatus("Paused", "Automatic sync is paused on this device.");
+        this.setStatus("Paused", "本设备已暂停自动同步。");
       }
     }
   }
@@ -1254,7 +1265,7 @@ export default class S3VaultSyncPlugin
     this.networkRetryAttempt += 1;
     this.networkRetryAt = Date.now() + delay;
     this.setStatus(this.currentIntegrityChecks().length ? "Error" : "Checking",
-      `Temporary network failure. Retrying automatically in ${Math.ceil(delay / 1_000)} seconds (${this.networkRetryAttempt}/3).`);
+      `网络暂时出错。${Math.ceil(delay / 1_000)} 秒后自动重试（${this.networkRetryAttempt}/3）。`);
     this.networkRetryTimer = window.setTimeout(() => {
       this.networkRetryTimer = undefined;
       this.networkRetryAt = undefined;
@@ -1276,7 +1287,7 @@ export default class S3VaultSyncPlugin
     this.headRetryAt = Date.now() + delay;
     this.setStatus(
       "Checking",
-      `Another device published first. Retrying automatically in ${Math.ceil(delay / 1_000)} seconds.`,
+      `另一台设备先发布了更改。${Math.ceil(delay / 1_000)} 秒后自动重试。`,
     );
     this.headRetryTimer = window.setTimeout(() => {
       this.headRetryTimer = undefined;
@@ -1299,7 +1310,7 @@ export default class S3VaultSyncPlugin
       await this.runExclusiveSyncService((service) =>
         service.resolveConflict(entryId, resolution),
       );
-      this.reportManualCompletion("Conflict resolution saved to S3.");
+      this.reportManualCompletion("冲突处理结果已保存到 S3。");
     } catch (error) {
       this.showError(error);
       throw error;
@@ -1312,14 +1323,14 @@ export default class S3VaultSyncPlugin
     if (this.pendingLocalIssues.length || this.getConflicts().length ||
       this.pendingDeferredDownloads.some(entry => entry.reason === "unsupported-path") ||
       this.pendingBulkDeletion || this.data.pendingCollisionRename) {
-      this.setStatus("Action required", `${detail} Other items still need attention. Open sync status to review them.`);
+      this.setStatus("Action required", `${detail}还有其他项目需要处理，请打开同步状态查看。`);
     } else {
       const deferred = this.pendingDeferredDownloads.length
-        ? ` Deferred downloads: ${this.pendingDeferredDownloads.length}.`
+        ? `暂缓下载：${this.pendingDeferredDownloads.length} 个。`
         : "";
       this.setStatus(
         this.data.settings.paused ? "Paused" : "Idle",
-        `${detail}${deferred}${this.data.settings.paused ? " Automatic sync remains paused." : ""}`,
+        `${detail}${deferred}${this.data.settings.paused ? "自动同步仍处于暂停状态。" : ""}`,
       );
     }
   }
@@ -1327,15 +1338,15 @@ export default class S3VaultSyncPlugin
   private refreshConfiguredStatus(): void {
     if (this.syncRequests.isRunning || !["Idle", "Paused", "Not configured"].includes(this.status)) return;
     if (this.data.settings.paused) {
-      this.setStatus("Paused", "Automatic sync is paused on this device.");
+      this.setStatus("Paused", "本设备已暂停自动同步。");
     } else if (
       this.data.settings.vaultId &&
       this.credentials?.loadAwsCredentials() &&
       this.credentials.loadVaultKey()
     ) {
-      this.setStatus("Idle", "Ready to sync.");
+      this.setStatus("Idle", "可以同步。");
     } else {
-      this.setStatus("Not configured", "Complete the plugin settings.");
+      this.setStatus("Not configured", "请完成插件设置。");
     }
   }
 
@@ -1437,10 +1448,10 @@ export default class S3VaultSyncPlugin
   ): void {
     const integrityChecks = this.data ? this.currentIntegrityChecks() : [];
     if (integrityChecks.length && status !== "Checking" && status !== "Syncing") {
-      const lastError = status === "Error" ? ` Last attempt: ${detail}` : "";
+      const lastError = status === "Error" ? `上次尝试：${detail}` : "";
       status = "Action required";
-      detail = `Repair Mode: ${integrityChecks[0]!.message} (${integrityChecks.length} pending integrity checks). Resolve the reported problem, then sync to recheck.` +
-        (this.data.settings.paused ? " Automatic sync remains paused." : "") + lastError;
+      detail = `修复模式：${integrityChecks[0]!.message}（${integrityChecks.length} 项校验待完成）。请先解决报告的问题，再同步一次重新校验。` +
+        (this.data.settings.paused ? "自动同步仍处于暂停状态。" : "") + lastError;
     }
     if (this.session.signal.aborted) return;
     if (status !== "Syncing") {
@@ -1449,7 +1460,7 @@ export default class S3VaultSyncPlugin
     this.status = status;
     this.statusDetail = detail;
     this.progressLabel = progressLabel;
-    this.statusElement?.setText(`S3 Sync: ${detail}`);
+    this.statusElement?.setText(`S3 同步：${detail}`);
     this.statusElement?.setAttr("aria-label", this.getStatusText());
     this.statusElement?.setAttr("title", this.getStatusText());
     this.statusElement?.toggleClass(
@@ -1521,19 +1532,19 @@ export default class S3VaultSyncPlugin
 
   private showError(error: unknown, holdErrorPopup = false): void {
     if (this.session.signal.aborted || error instanceof SyncStoppedError) return;
-    const message = error instanceof Error ? error.message : "Unknown sync error";
+    const message = error instanceof Error ? error.message : "未知的同步错误";
     this.setStatus(
       error instanceof RepairModeError || error instanceof RemoteStateError
         ? "Action required"
         : "Error",
       error instanceof RepairModeError || error instanceof RemoteStateError
-        ? `Repair Mode: ${message}`
+        ? `修复模式：${message}`
         : message,
       undefined,
       holdErrorPopup,
     );
-    const notice = new Notice(`S3 Vault Sync: ${message}`, 12_000);
-    notice.messageEl.createEl("button", {text: "Open sync status", cls: "s3-vault-sync-notice-action"}).addEventListener("click", event => {
+    const notice = new Notice(`S3 Vault Sync：${message}`, 12_000);
+    notice.messageEl.createEl("button", {text: "打开同步状态", cls: "s3-vault-sync-notice-action"}).addEventListener("click", event => {
       event.stopPropagation();
       this.openStatus();
       notice.hide();

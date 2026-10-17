@@ -342,7 +342,7 @@ describe("plugin synchronization lifecycle", () => {
     hooks.headFailure = undefined;
     await vi.advanceTimersByTimeAsync(30_000);
     await vi.waitFor(() => {
-      expect(plugin.getStatusText()).toMatch(/^Idle:/);
+      expect(plugin.getStatusText()).toMatch(/^空闲：/);
       expect(plugin.getDiagnostics().queued).toBe(false);
     });
     const head = (await remote.readHead())!;
@@ -367,7 +367,7 @@ describe("plugin synchronization lifecycle", () => {
     await first;
     expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({errorCategory: "timeout", outcome: "retrying"});
     await vi.advanceTimersByTimeAsync(30_000);
-    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/));
     expect(plugin.getDiagnostics().acceptedCommit).toBe("initial");
     expect(plugin.getDiagnostics().nextRetryAt).toBeUndefined();
   }, 20_000);
@@ -383,7 +383,7 @@ describe("plugin synchronization lifecycle", () => {
     expect(wire.faults).toBe(1);
     expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({outcome: "retrying", writeResultUncertain: true});
     await vi.advanceTimersByTimeAsync(30_000);
-    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/));
     expect((await remote.readHead())!.value.commitId).toBe(head.value.commitId);
     expect(wire.headPublications).toBe(publications);
     const snapshot = await remote.readSnapshot(head.value);
@@ -400,7 +400,7 @@ describe("plugin synchronization lifecycle", () => {
     expect(wire.faults).toBe(1);
     expect(plugin.getDiagnostics().records.at(-1)?.errorCategory).toBe("network");
     await vi.advanceTimersByTimeAsync(30_000);
-    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/));
     const head = (await remote.readHead())!;
     const snapshot = await remote.readSnapshot(head.value);
     const entry = snapshot.entries["entry-1"];
@@ -509,7 +509,7 @@ describe("plugin synchronization lifecycle", () => {
     release();
     await syncing;
     expect(host.requestUrl.mock.calls.length).toBe(requestCount);
-    expect(plugin.getStatusText()).toContain("S3 target changed");
+    expect(plugin.getStatusText()).toContain("S3 目标被改了");
     plugin.onunload();
   });
 
@@ -551,7 +551,7 @@ describe("plugin synchronization lifecycle", () => {
     await first;
     expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({outcome: "retrying", errorCategory: "timeout", writeResultUncertain: true});
     await vi.advanceTimersByTimeAsync(30_000);
-    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/));
     const winner = (await remote.readHead())!.value.commitId;
     release();
     await vi.waitFor(() => expect(lateStatus).toBe(412));
@@ -579,7 +579,7 @@ describe("plugin synchronization lifecycle", () => {
     vi.spyOn(app.vault.adapter, "write").mockRejectedValue(new Error("secret local path and credentials"));
     edit("A saved paragraph.");
     await plugin.togglePause();
-    expect(plugin.getStatusText()).toMatch(/^Idle:/);
+    expect(plugin.getStatusText()).toMatch(/^空闲：/);
     expect((await remote.readHead())!.value.commitId).not.toBe("initial");
     expect(plugin.getDiagnostics().persistenceWarning).toContain("could not be saved");
     expect(plugin.exportDiagnostics()).not.toContain("secret local path");
@@ -648,11 +648,11 @@ describe("plugin synchronization lifecycle", () => {
       await vi.waitFor(() => expect(plugin.getDiagnostics().records.at(count - 1)?.finishedAt).toBeDefined());
     }
     expect(plugin.getDiagnostics().records).toHaveLength(4);
-    expect(plugin.getStatusText()).toMatch(/^Error:/);
+    expect(plugin.getStatusText()).toMatch(/^出错：/);
     expect(host.notices).toHaveLength(1);
     hooks.headFailure = undefined;
     await plugin.syncNow();
-    expect(plugin.getStatusText()).toMatch(/^Idle:/);
+    expect(plugin.getStatusText()).toMatch(/^空闲：/);
     plugin.onunload();
   });
 
@@ -687,9 +687,9 @@ describe("plugin synchronization lifecycle", () => {
     edit("Saved article including its final sentence.");
     await plugin.togglePause();
     const acceptedHead = (await remote.readHead())!.value.commitId;
-    expect(plugin.getStatusText()).toContain("Retrying automatically");
+    expect(plugin.getStatusText()).toContain("秒后自动重试");
     await vi.advanceTimersByTimeAsync(30_000);
-    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/));
     expect((await remote.readHead())!.value.commitId).toBe(acceptedHead);
     expect(publications).toBe(1);
     const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
@@ -705,7 +705,7 @@ describe("plugin synchronization lifecycle", () => {
     await plugin.togglePause();
     hooks.headFailure = undefined;
     for (const listener of host.domEvents.get("online") ?? []) {listener(); listener();}
-    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/));
     expect(plugin.getDiagnostics().records).toHaveLength(2);
     plugin.onunload();
   });
@@ -714,11 +714,11 @@ describe("plugin synchronization lifecycle", () => {
     const {plugin, hooks, remote} = await setup();
     hooks.headFailure = "network";
     await plugin.togglePause();
-    expect(plugin.getStatusText()).toContain("Retrying automatically");
+    expect(plugin.getStatusText()).toContain("秒后自动重试");
     expect(host.notices).toEqual([]);
     hooks.headFailure = undefined;
     await vi.advanceTimersByTimeAsync(30_000);
-    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/u));
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/u));
     expect((await remote.readHead())?.value.commitId).toBe("initial");
     expect(plugin.getDiagnostics().records.map(record => record.outcome)).toEqual(["retrying", "complete"]);
     plugin.onunload();
@@ -774,7 +774,7 @@ describe("plugin synchronization lifecycle", () => {
     });
     try {
       await plugin.togglePause();
-      expect(plugin.getStatusText()).toMatch(/^Idle:/);
+      expect(plugin.getStatusText()).toMatch(/^空闲：/);
       expect(plugin.getLocalIssues()).toEqual([]);
       expect(plugin.getDeferredDownloads()).toEqual([]);
       await plugin.syncNow();
@@ -890,7 +890,7 @@ describe("plugin synchronization lifecycle", () => {
     const key = "test-prefix/.s3-vault-sync-probe-00000000-0000-4000-8000-000000000000";
     const original = { body: new TextEncoder().encode("user-owned object"), etag: "user-etag" };
     objects.set(key, original);
-    await expect(plugin.initializeOrUnlock("test-password")).rejects.toThrow("prefix is not empty");
+    await expect(plugin.initializeOrUnlock("test-password")).rejects.toThrow("前缀不是空的");
     expect(objects.get(key)).toEqual(original);
   });
 
@@ -915,7 +915,7 @@ describe("plugin synchronization lifecycle", () => {
       hooks.beforeBlobRead = undefined;
       plugin.getSettings()[field] += "-changed";
     };
-    await expect(plugin.initializeOrUnlock("test-password")).rejects.toThrow("S3 target changed");
+    await expect(plugin.initializeOrUnlock("test-password")).rejects.toThrow("S3 目标被改了");
     expect(plugin.getSettings().vaultId).toBeUndefined();
     expect(objects.has("test-prefix/v1/head")).toBe(false);
     expect(host.data).toMatchObject({ pendingInitialization: {
@@ -971,13 +971,13 @@ describe("plugin synchronization lifecycle", () => {
     expect(objects.has("test-prefix/v1/head")).toBe(true);
     expect(replacement.getSettings().vaultId).toBeTruthy();
     objects.delete("test-prefix/v1/head");
-    await expect(replacement.initializeOrUnlock("test-password")).rejects.toThrow("Head is missing");
+    await expect(replacement.initializeOrUnlock("test-password")).rejects.toThrow("Head 指针缺失");
     expect(objects.has("test-prefix/v1/head")).toBe(false);
     replacement.onunload();
     host.data = interruptedCheckpoint;
     const rolledBackCache = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
     await rolledBackCache.onload();
-    await expect(rolledBackCache.initializeOrUnlock("test-password")).rejects.toThrow("Head is missing");
+    await expect(rolledBackCache.initializeOrUnlock("test-password")).rejects.toThrow("Head 指针缺失");
   });
 
   it("waits for an old in-flight data write before loading a replacement instance", async () => {
@@ -1028,12 +1028,12 @@ describe("plugin synchronization lifecycle", () => {
       edit("The complete paragraph and its final sentence.");
     };
     await plugin.togglePause();
-    expect(plugin.getStatusText()).toContain("Retrying after edits settle");
+    expect(plugin.getStatusText()).toContain("等编辑停下后会自动重试");
     expect(host.notices).toEqual([]);
     await vi.advanceTimersByTimeAsync(4_999);
     expect((await remote.readHead())?.value.commitId).toBe("initial");
     await vi.advanceTimersByTimeAsync(1);
-    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/u));
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/u));
     const head = await remote.readHead();
     if (!head) throw new Error("Expected accepted Head");
     const snapshot = await remote.readSnapshot(head.value);
@@ -1043,10 +1043,10 @@ describe("plugin synchronization lifecycle", () => {
     expect(localText()).toBe("The complete paragraph and its final sentence.");
     for (let poll = 0; poll < 2; poll += 1) {
       await vi.advanceTimersByTimeAsync(120_000);
-      await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/u));
+      await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/u));
     }
     expect(await remote.readHead()).toMatchObject({ etag: head.etag, value: head.value });
-    expect(plugin.getStatusText()).toMatch(/^Idle:/u);
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
     expect(host.notices).toEqual([]);
   });
 
@@ -1060,13 +1060,13 @@ describe("plugin synchronization lifecycle", () => {
     });
     await plugin.togglePause();
     expect(plugin.isPaused()).toBe(true);
-    expect(plugin.getStatusText()).toMatch(/^Paused:/u);
+    expect(plugin.getStatusText()).toMatch(/^已暂停：/u);
   });
 
   it.each(["network", "corrupt"] as const)("does not hide a %s failure after pausing", async failure => {
     const { plugin, hooks } = await setup();
     const stop = plugin.onStatusChange(status => {
-      if (status.text.startsWith("Checking: Reading")) {
+      if (status.text.startsWith("检查中：正在读取")) {
         stop();
         hooks.headFailure = failure;
         void plugin.togglePause();
@@ -1074,10 +1074,10 @@ describe("plugin synchronization lifecycle", () => {
     });
     await plugin.togglePause();
     expect(plugin.isPaused()).toBe(true);
-    expect(plugin.getStatusText()).toMatch(failure === "network" ? /^Error:/u : /^Action required:/u);
+    expect(plugin.getStatusText()).toMatch(failure === "network" ? /^出错：/u : /^需要处理：/u);
     expect(host.notices).toHaveLength(1);
     const openStatus = vi.spyOn(plugin, "openStatus").mockImplementation(() => {});
-    expect(host.noticeActions[0]?.text).toBe("Open sync status");
+    expect(host.noticeActions[0]?.text).toBe("打开同步状态");
     host.noticeActions[0]?.click({stopPropagation() {}});
     expect(openStatus).toHaveBeenCalledOnce();
   });
@@ -1086,7 +1086,7 @@ describe("plugin synchronization lifecycle", () => {
     const {plugin, hooks} = await setup();
     hooks.headFailure = "network";
     await expect(plugin.downloadDeferred("entry-1")).rejects.toThrow("503");
-    expect(plugin.getStatusText()).toMatch(/^Error:/);
+    expect(plugin.getStatusText()).toMatch(/^出错：/);
   });
 });
 
@@ -1095,7 +1095,7 @@ describe("opening sync status when synchronization stops", () => {
     const {plugin, setLocalPresent} = await setup();
     setLocalPresent(false);
     await plugin.togglePause();
-    expect(plugin.getStatusText()).toMatch(/^Action required: Review and confirm the Bulk Deletion/u);
+    expect(plugin.getStatusText()).toMatch(/^需要处理：请审查并确认这次批量删除/u);
     expect(host.openedModals).toHaveLength(1);
     plugin.onunload();
   });
@@ -1104,10 +1104,10 @@ describe("opening sync status when synchronization stops", () => {
     const {plugin, hooks} = await setup();
     hooks.headFailure = failure;
     await plugin.togglePause();
-    expect(plugin.getStatusText()).toMatch(failure === "forbidden" ? /^Error:/u : /^Action required: Repair Mode/u);
+    expect(plugin.getStatusText()).toMatch(failure === "forbidden" ? /^出错：/u : /^需要处理：修复模式/u);
     expect(host.openedModals).toHaveLength(1);
     expect(host.notices).toHaveLength(1);
-    expect(host.noticeActions.map(action => action.text)).toEqual(["Open sync status"]);
+    expect(host.noticeActions.map(action => action.text)).toEqual(["打开同步状态"]);
     plugin.onunload();
   });
 
@@ -1118,20 +1118,20 @@ describe("opening sync status when synchronization stops", () => {
     expect(host.openedModals).toHaveLength(1);
     host.openedModals[0]!.close();
     await plugin.syncNow();
-    expect(plugin.getStatusText()).toMatch(/^Action required:/u);
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
     expect(host.openedModals).toHaveLength(1);
     hooks.headFailure = "forbidden";
     await plugin.syncNow();
-    expect(plugin.getStatusText()).toMatch(/^Error:/u);
+    expect(plugin.getStatusText()).toMatch(/^出错：/u);
     expect(host.openedModals).toHaveLength(2);
     host.openedModals[1]!.close();
     hooks.headFailure = undefined;
     setLocalPresent(true);
     await plugin.syncNow();
-    expect(plugin.getStatusText()).toMatch(/^Idle:/u);
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
     setLocalPresent(false);
     await plugin.syncNow();
-    expect(plugin.getStatusText()).toMatch(/^Action required:/u);
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
     expect(host.openedModals).toHaveLength(3);
     plugin.onunload();
   });
@@ -1143,7 +1143,7 @@ describe("opening sync status when synchronization stops", () => {
     expect(host.openedModals).toHaveLength(1);
     hooks.headFailure = "forbidden";
     await plugin.syncNow();
-    expect(plugin.getStatusText()).toMatch(/^Error:/u);
+    expect(plugin.getStatusText()).toMatch(/^出错：/u);
     expect(host.openedModals).toHaveLength(1);
     host.openedModals[0]!.close();
     await plugin.syncNow();
@@ -1161,7 +1161,7 @@ describe("opening sync status when synchronization stops", () => {
     hooks.headFailure = "network";
     await plugin.togglePause();
     await settle(plugin, 29 * 60_000);
-    expect(plugin.getStatusText()).toMatch(/^Error:/u);
+    expect(plugin.getStatusText()).toMatch(/^出错：/u);
     expect(host.notices.length).toBeGreaterThan(0);
     expect(host.openedModals).toHaveLength(0);
     await settle(plugin, 2 * 60_000);
@@ -1178,11 +1178,11 @@ describe("opening sync status when synchronization stops", () => {
     await settle(plugin, 20 * 60_000);
     hooks.headFailure = undefined;
     await settle(plugin, 2 * 60_000);
-    expect(plugin.getStatusText()).toMatch(/^Idle:/u);
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
     hooks.headFailure = "network";
     await settle(plugin, 2 * 60_000);
     await settle(plugin, 16 * 60_000);
-    expect(plugin.getStatusText()).toMatch(/^Error:/u);
+    expect(plugin.getStatusText()).toMatch(/^出错：/u);
     expect(host.openedModals).toHaveLength(0);
     await settle(plugin, 16 * 60_000);
     expect(host.openedModals).toHaveLength(1);
@@ -1205,10 +1205,10 @@ describe("opening sync status when synchronization stops", () => {
     host.openedModals[0]!.close();
     hooks.headFailure = undefined;
     await plugin.syncNow();
-    expect(plugin.getStatusText()).toMatch(/^Idle:/u);
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
     setLocalPresent(false);
     await plugin.syncNow();
-    expect(plugin.getStatusText()).toMatch(/^Action required:/u);
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
     expect(host.openedModals).toHaveLength(2);
     await plugin.syncNow();
     expect(host.openedModals).toHaveLength(2);

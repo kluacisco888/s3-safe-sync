@@ -332,7 +332,8 @@ export class StatusModal extends Modal {
     this.stopStatusUpdates = this.controller.onStatusChange(display => {
       status.setText(display.text);
       this.pauseButton?.setText(this.controller.isPaused() ? "Resume" : "Pause");
-      if (/^(Idle|Action required|Error|Not configured|Paused):/.test(display.text)) render();
+      // 状态文字以中文状态名开头：空闲 / 需要处理 / 出错 / 未配置 / 已暂停
+      if (/^(空闲|需要处理|出错|未配置|已暂停)：/.test(display.text)) render();
       else this.renderDiagnostics(diagnostics);
     });
   }

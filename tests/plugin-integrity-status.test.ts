@@ -100,18 +100,18 @@ it("keeps a known corrupt recovery actionable after an unrelated import and a no
     expect(plugin.getLocalIssues()).toEqual([{kind: "import-candidate", path: "import.md"}]);
     const damaged = corrupt("/current-blob");
     await expect(plugin.restoreRevision("existing", "old")).rejects.toThrow("No authenticated remote recovery");
-    expect(plugin.getStatusText()).toMatch(/^Action required: Repair Mode:/);
+    expect(plugin.getStatusText()).toMatch(/^需要处理：修复模式：/);
     await plugin.importCandidate("import.md");
     expect(data.get(damaged.key)!.body).toEqual(damaged.damaged);
-    expect(plugin.getStatusText()).toMatch(/^Action required:/);
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/);
     const before = host.request.mock.calls.length;
     await plugin.syncNow();
-    expect(plugin.getStatusText()).toMatch(/^Action required:/);
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/);
     expect(host.request.mock.calls.slice(before).some(([request]) => request.method === "PUT")).toBe(false);
     damaged.restore();
     host.request.mockClear();
     await plugin.syncNow();
-    expect(plugin.getStatusText()).toMatch(/^Idle:/);
+    expect(plugin.getStatusText()).toMatch(/^空闲：/);
     expect(host.stored.pendingIntegrityChecks).toEqual([]);
     const blobReads = host.request.mock.calls.map(([request]) => new URL(request.url).pathname).filter(path => path.includes("/blobs/"));
     expect(blobReads).toEqual(["/obs-sync/v1/blobs/current-blob"]);
@@ -123,20 +123,20 @@ it("preserves integrity attention across pause, settings, reload, and a network 
   await expect(plugin.readHistoricalRevision("existing", "old")).rejects.toThrow("cannot be authenticated");
   await plugin.togglePause();
   await plugin.saveSettings();
-  expect(plugin.getStatusText()).toMatch(/^Action required:/);
-  expect(plugin.getStatusText()).toContain("paused");
+  expect(plugin.getStatusText()).toMatch(/^需要处理：/);
+  expect(plugin.getStatusText()).toContain("暂停");
   plugin.onunload();
   const restarted = await start();
-  expect(restarted.getStatusText()).toMatch(/^Action required:/);
+  expect(restarted.getStatusText()).toMatch(/^需要处理：/);
   expect(restarted.getStatusText()).toContain("cannot be authenticated");
   damaged.restore();
   host.request.mockRejectedValueOnce(new Error("Network offline"));
   await restarted.togglePause();
-  expect(restarted.getStatusText()).toMatch(/^Action required:/);
-  expect(restarted.getStatusText()).toContain("Temporary network failure");
+  expect(restarted.getStatusText()).toMatch(/^需要处理：/);
+  expect(restarted.getStatusText()).toContain("网络暂时出错");
   expect(host.stored.pendingIntegrityChecks).toHaveLength(1);
   await restarted.syncNow();
-  expect(restarted.getStatusText()).toMatch(/^Action required:/); // Import still needs its own decision.
+  expect(restarted.getStatusText()).toMatch(/^需要处理：/); // Import still needs its own decision.
   expect(host.stored.pendingIntegrityChecks).toEqual([]);
   expect(restarted.getLocalIssues()).toEqual([{kind: "import-candidate", path: "import.md"}]);
 });
@@ -145,7 +145,7 @@ it("clears metadata failures only after the original Head can be authenticated a
   const {plugin, corrupt} = await fixture();
   const head = corrupt("/head");
   await plugin.syncNow();
-  expect(plugin.getStatusText()).toMatch(/^Action required:/);
+  expect(plugin.getStatusText()).toMatch(/^需要处理：/);
   expect(host.stored.pendingIntegrityChecks).toHaveLength(1);
   await plugin.syncNow();
   expect(host.stored.pendingIntegrityChecks).toHaveLength(1);
@@ -202,7 +202,7 @@ it("rechecks authenticated recovery on mobile without a separate transfer ceilin
   });
   await plugin.downloadDeferred("existing");
   expect(host.stored.pendingIntegrityChecks).toEqual([]);
-  expect(plugin.getStatusText()).toMatch(/^Action required:/); // Unrelated import still needs review.
+  expect(plugin.getStatusText()).toMatch(/^需要处理：/); // Unrelated import still needs review.
   expect(files.get("existing.md")).toBe("current");
 });
 
@@ -223,7 +223,7 @@ it.each(["preview", "restore"])("clears the exact historical integrity issue aft
   }
   expect(host.stored.pendingIntegrityChecks).toEqual([]);
   expect(plugin.getStatusText()).not.toContain("Repair Mode");
-  expect(plugin.getStatusText()).toMatch(/^Action required:/); // Unrelated import still awaits confirmation.
+  expect(plugin.getStatusText()).toMatch(/^需要处理：/); // Unrelated import still awaits confirmation.
 });
 
 it("clears a matching Entry/hash recovery issue when content review authenticates that exact version", async () => {

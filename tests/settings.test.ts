@@ -109,7 +109,7 @@ describe("S3VaultSyncSettingsTab mobile credentials", () => {
       openStatus: () => {},
       getProgressLabel: () => undefined,
       getSettings: () => ({ ...DEFAULT_SETTINGS, vaultId: "vault-id" }),
-      getStatusText: () => "Idle: Ready to sync.",
+      getStatusText: () => "空闲：Ready to sync.",
       hasAwsCredentials: () => true,
       initializeOrUnlock: async () => {},
       isVaultUnlocked: () => true,
@@ -132,24 +132,24 @@ describe("S3VaultSyncSettingsTab mobile credentials", () => {
     expect(secretKey.texts[0]?.inputEl.type).toBe("password");
     expect(accessKey.settingEl.classes.has("s3-vault-sync-secret-setting")).toBe(true);
     expect(secretKey.settingEl.classes.has("s3-vault-sync-secret-setting")).toBe(true);
-    expect(accessKey.buttons[0]?.buttonText).toBe("Show");
-    expect(secretKey.buttons[0]?.buttonText).toBe("Show");
+    expect(accessKey.buttons[0]?.buttonText).toBe("显示");
+    expect(secretKey.buttons[0]?.buttonText).toBe("显示");
 
     await accessKey.buttons[0]?.click();
     expect(accessKey.texts[0]?.inputEl.type).toBe("text");
-    expect(accessKey.buttons[0]?.buttonText).toBe("Hide");
+    expect(accessKey.buttons[0]?.buttonText).toBe("隐藏");
 
-    const vaultPassword = findSetting("Vault password");
-    expect(vaultPassword.description).toContain("Unlocked on this device");
-    expect(vaultPassword.description).toContain("password is not stored");
-    expect(vaultPassword.buttons[0]?.buttonText).toBe("Show");
-    const vaultEncryption = findSetting("Vault encryption");
+    const vaultPassword = findSetting("仓库密码");
+    expect(vaultPassword.description).toContain("本设备已解锁");
+    expect(vaultPassword.description).toContain("密码不会被保存");
+    expect(vaultPassword.buttons[0]?.buttonText).toBe("显示");
+    const vaultEncryption = findSetting("仓库加密");
     expect(vaultEncryption.buttons[0]?.disabled).toBe(true);
     vaultPassword.texts[0]?.trigger("vault-password");
     expect(vaultEncryption.buttons[0]?.disabled).toBe(false);
-    expect(vaultEncryption.buttons[0]?.buttonText).toBe("Unlock again");
+    expect(vaultEncryption.buttons[0]?.buttonText).toBe("重新解锁");
 
-    const save = findSetting("Save AWS credentials").buttons[0];
+    const save = findSetting("保存 AWS 凭证").buttons[0];
     expect(save?.disabled).toBe(true);
     accessKey.texts[0]?.trigger("AKIAEXAMPLE");
     secretKey.texts[0]?.trigger("secret-example");
@@ -173,11 +173,11 @@ describe("S3VaultSyncSettingsTab mobile credentials", () => {
     };
     const tab = new S3VaultSyncSettingsTab({} as App, controller as never);
     tab.display();
-    await findSetting("Status").buttons[0]!.click();
+    await findSetting("状态").buttons[0]!.click();
     expect(openStatus).toHaveBeenCalledOnce();
-    const password = findSetting("Vault password").texts[0]!;
+    const password = findSetting("仓库密码").texts[0]!;
     password.trigger("typed-password");
-    const encryption = findSetting("Vault encryption");
+    const encryption = findSetting("仓库加密");
     const button = encryption.buttons[0]!;
     await button.click();
     expect(encryption.description).toBe("Connection closed");
