@@ -132,14 +132,14 @@ describe("StatusModal", () => {
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
     all(modal.contentEl as unknown as FakeElement).find(node => node.text === "审查路径撞名")!.events.get("click")!();
     const review = opened.at(-1)!;
-    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Rename S3 record and sync")).toBe(true));
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "给 S3 记录改名并同步")).toBe(true));
     const nodes = all(review.contentEl);
     expect(nodes.some(node => node.text === "local")).toBe(true);
     expect(nodes.some(node => node.text === "remote")).toBe(true);
-    expect(nodes.some(node => node.text === "Previously accepted path: old.md")).toBe(true);
+    expect(nodes.some(node => node.text === "之前认可的路径：old.md")).toBe(true);
     expect(rename).not.toHaveBeenCalled();
     nodes.filter(node => node.tag === "input")[side === "local" ? 0 : 1]!.value = "chosen.md";
-    nodes.find(node => node.text === (side === "local" ? "Rename local file and sync" : "Rename S3 record and sync"))!.events.get("click")!();
+    nodes.find(node => node.text === (side === "local" ? "给本地文件改名并同步" : "给 S3 记录改名并同步"))!.events.get("click")!();
     expect(rename).toHaveBeenCalledWith({paths: ["note.md"], reviewToken: "collision", side, path: "note.md",
       entryId: `${side}-id`, newName: "chosen.md"});
     await vi.waitFor(() => expect(rename).toHaveResolved());
@@ -158,11 +158,11 @@ describe("StatusModal", () => {
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
     all(modal.contentEl as unknown as FakeElement).find(node => node.text === "审查路径撞名")!.events.get("click")!();
     const review = opened.at(-1)!;
-    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Confirm target is the renamed original")).toBe(true));
-    expect(all(review.contentEl).some(node => node.text === "Rename local file and sync")).toBe(false);
-    expect(all(review.contentEl).some(node => node.text === "Reload collision review")).toBe(true);
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "确认目标路径就是改名后的原文件")).toBe(true));
+    expect(all(review.contentEl).some(node => node.text === "给本地文件改名并同步")).toBe(false);
+    expect(all(review.contentEl).some(node => node.text === "重新加载撞名审查")).toBe(true);
     expect(recover).not.toHaveBeenCalled();
-    all(review.contentEl).find(node => node.text === "Confirm target is the renamed original")!.events.get("click")!();
+    all(review.contentEl).find(node => node.text === "确认目标路径就是改名后的原文件")!.events.get("click")!();
     expect(recover).toHaveBeenCalledWith(["source.md", "target.md"], "recovery", "target");
     await vi.waitFor(() => expect(recover).toHaveResolved());
   });
@@ -321,9 +321,9 @@ describe("StatusModal", () => {
     expect(all(review.contentEl).some(node => node.text === "local")).toBe(true);
     expect(preserve).not.toHaveBeenCalled();
     const nodes = all(review.contentEl);
-    expect(nodes.findIndex(node => node.text === "Keep both (local copy)"))
+    expect(nodes.findIndex(node => node.text === "两份都保留（本地副本）"))
       .toBeLessThan(nodes.findIndex(node => node.tag === "pre"));
-    all(review.contentEl).find(node => node.text === "Keep both (local copy)")!.events.get("click")!();
+    all(review.contentEl).find(node => node.text === "两份都保留（本地副本）")!.events.get("click")!();
     expect(preserve).toHaveBeenCalledWith("article.md", "review", "both");
     await vi.waitFor(() => expect(preserve).toHaveResolved());
   });
@@ -350,7 +350,7 @@ describe("StatusModal", () => {
     expect(preserve).not.toHaveBeenCalled();
   });
 
-  it.each([["Use local version", "local"], ["Use S3 version", "remote"], ["Keep both (local copy)", "both"]] as const)(
+  it.each([["使用本地版本", "local"], ["使用 S3 版本", "remote"], ["两份都保留（本地副本）", "both"]] as const)(
     "offers %s with clear consequences, timestamps and access to recovery", async (label, choice) => {
       const controller = issueController([{kind: "bootstrap-mismatch", path: "article.md"}]);
       const resolve = vi.fn().mockResolvedValue(choice === "both" ? "article (local copy).md" : undefined);
@@ -365,18 +365,18 @@ describe("StatusModal", () => {
       const review = opened.at(-1)!;
       await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === label)).toBe(true));
       const nodes = all(review.contentEl);
-      expect(nodes.some(node => node.text.startsWith("Local last modified:"))).toBe(true);
-      expect(nodes.some(node => node.text.startsWith("S3 version recorded:"))).toBe(true);
-      expect(nodes.some(node => node.text.includes("30 days"))).toBe(true);
-      expect(nodes.some(node => node.text === "Decide later")).toBe(true);
+      expect(nodes.some(node => node.text.startsWith("本地最后修改："))).toBe(true);
+      expect(nodes.some(node => node.text.startsWith("S3 版本记录时间："))).toBe(true);
+      expect(nodes.some(node => node.text.includes("30 天"))).toBe(true);
+      expect(nodes.some(node => node.text === "稍后再决定")).toBe(true);
       expect(resolve).not.toHaveBeenCalled();
       nodes.find(node => node.text === label)!.events.get("click")!();
       expect(resolve).toHaveBeenCalledWith("article.md", "review", choice);
-      expect(nodes.filter(node => ["Use local version", "Use S3 version", "Keep both (local copy)"].includes(node.text))
+      expect(nodes.filter(node => ["使用本地版本", "使用 S3 版本", "两份都保留（本地副本）"].includes(node.text))
         .every(node => node.disabled)).toBe(true);
-      await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Resolution complete")).toBe(true));
+      await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "处理完成")).toBe(true));
       if (choice !== "both") {
-        all(review.contentEl).find(node => node.text === "Open version history")!.events.get("click")!();
+        all(review.contentEl).find(node => node.text === "打开历史版本")!.events.get("click")!();
         expect(history).toHaveBeenCalledWith("article.md");
       } else expect(all(review.contentEl).some(node => node.text.includes("article (local copy).md"))).toBe(true);
     },
@@ -392,8 +392,8 @@ describe("StatusModal", () => {
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
     all(modal.contentEl as unknown as FakeElement).find(node => node.text === "对比并处理")!.events.get("click")!();
     const review = opened.at(-1)! as typeof opened[number] & {closed: boolean};
-    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Use local version")).toBe(true));
-    all(review.contentEl).find(node => node.text === "Decide later")!.events.get("click")!();
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "使用本地版本")).toBe(true));
+    all(review.contentEl).find(node => node.text === "稍后再决定")!.events.get("click")!();
     expect(review.closed).toBe(true);
     expect(resolve).not.toHaveBeenCalled();
   });
@@ -411,8 +411,8 @@ describe("StatusModal", () => {
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
     all(modal.contentEl as unknown as FakeElement).find(node => node.text === "对比并处理")!.events.get("click")!();
     const review = opened.at(-1)!;
-    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text.startsWith("Line comparison unavailable:"))).toBe(true));
-    expect(all(review.contentEl).some(node => node.text === "Keep both (local copy)")).toBe(!blocked);
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text.startsWith("无法逐行对比："))).toBe(true));
+    expect(all(review.contentEl).some(node => node.text === "两份都保留（本地副本）")).toBe(!blocked);
     expect(preserve).not.toHaveBeenCalled();
   });
 
@@ -430,20 +430,20 @@ describe("StatusModal", () => {
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
     all(modal.contentEl as unknown as FakeElement).find(node => node.text === "对比并处理")!.events.get("click")!();
     const review = opened.at(-1)!;
-    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Retry review")).toBe(true));
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "重试审查")).toBe(true));
     expect(preserve).not.toHaveBeenCalled();
-    all(review.contentEl).find(node => node.text === "Retry review")!.events.get("click")!();
-    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Keep both (local copy)")).toBe(true));
-    const confirm = all(review.contentEl).find(node => node.text === "Keep both (local copy)")!;
+    all(review.contentEl).find(node => node.text === "重试审查")!.events.get("click")!();
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "两份都保留（本地副本）")).toBe(true));
+    const confirm = all(review.contentEl).find(node => node.text === "两份都保留（本地副本）")!;
     confirm.events.get("click")!();
-    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Reload review")).toBe(true));
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "重新加载审查")).toBe(true));
     expect(confirm.disabled).toBe(true);
     confirm.events.get("click")!();
     expect(preserve).toHaveBeenCalledTimes(1);
-    all(review.contentEl).find(node => node.text === "Reload review")!.events.get("click")!();
+    all(review.contentEl).find(node => node.text === "重新加载审查")!.events.get("click")!();
     await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "+ fresh local")).toBe(true));
     expect(preserve).toHaveBeenCalledTimes(1);
-    all(review.contentEl).find(node => node.text === "Keep both (local copy)")!.events.get("click")!();
+    all(review.contentEl).find(node => node.text === "两份都保留（本地副本）")!.events.get("click")!();
     expect(preserve).toHaveBeenLastCalledWith("article.md", "fresh", "both");
     await vi.waitFor(() => expect(preserve).toHaveResolved());
   });
