@@ -169,6 +169,8 @@ export default class S3VaultSyncPlugin
     (status: SyncStatusDisplay) => void
   >();
   private progressLabel: string | undefined;
+  // 已自动弹过同步状态窗口的问题指纹；一次同步成功后清空
+  private readonly shownStopFingerprints = new Set<string>();
 
   async onload(): Promise<void> {
     this.session = new SyncSession(this.app.vault);
@@ -1439,6 +1441,40 @@ export default class S3VaultSyncPlugin
       status === "Action required" || status === "Error",
     );
     this.emitStatus();
+    this.openStatusWhenStopped(status, detail);
+  }
+
+  // 停住就弹窗：状态进入「需要处理」或「出错」时自动打开同步状态窗口；同一问题指纹只弹一次
+  private openStatusWhenStopped(status: PluginStatus, detail: string): void {
+    if (status !== "Action required" && status !== "Error") return;
+    const fingerprint = this.stopFingerprint(status, detail);
+    if (this.shownStopFingerprints.has(fingerprint)) return;
+    this.shownStopFingerprints.add(fingerprint);
+    this.openStatus();
+  }
+
+  // 问题指纹 = 问题种类 + 涉及路径（排序后）或错误信息
+  private stopFingerprint(status: PluginStatus, detail: string): string {
+    const integrityChecks = this.data ? this.currentIntegrityChecks() : [];
+    if (integrityChecks.length) {
+      return `repair:${integrityChecks.map(issue => JSON.stringify(issue.check)).sort().join("\n")}`;
+    }
+    if (status === "Error") return `error:${detail}`;
+    const items = [
+      ...this.pendingLocalIssues.map(issue => {
+        const paths = issue.kind === "path-collision" ? issue.paths
+          : issue.kind === "possible-rename" ? [...issue.oldPaths, ...issue.newPaths]
+          : [issue.path];
+        return `${issue.kind}:${[...paths].sort().join("|")}`;
+      }),
+      ...this.getConflicts().map(entry => `conflict:${entry.path}`),
+      ...this.pendingDeferredDownloads.flatMap(entry =>
+        entry.reason === "unsupported-path" ? [`unsupported-path:${entry.path}`] : []),
+      ...(this.pendingBulkDeletion ? [`bulk-deletion:${[...this.pendingBulkDeletion.entryIds].sort().join("|")}`] : []),
+      ...(this.data?.pendingCollisionRename
+        ? [`collision-rename:${this.data.pendingCollisionRename.from}|${this.data.pendingCollisionRename.to}`] : []),
+    ].sort();
+    return items.length ? `action:${items.join("\n")}` : `action:${detail}`;
   }
 
   private emitStatus(): void {

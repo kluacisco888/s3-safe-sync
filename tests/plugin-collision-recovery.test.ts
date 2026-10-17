@@ -6,7 +6,7 @@ const host = vi.hoisted(() => {
   return {stored, failSave: false, isMobile: false, request: vi.fn()};
 });
 vi.mock("obsidian", () => ({
-  App: class {}, PluginSettingTab: class {}, Modal: class {}, Setting: class {}, FileSystemAdapter: class {},
+  App: class {}, PluginSettingTab: class {}, Modal: class { contentEl = {empty() {}}; open() {} close() {} }, Setting: class {}, FileSystemAdapter: class {},
   TFile: class { constructor(public path: string, public stat: {mtime: number; size: number}) {} },
   Platform: {isDesktop: false, isDesktopApp: false, get isMobile() {return host.isMobile;}, isAndroidApp: false},
   normalizePath: (path: string) => path,
