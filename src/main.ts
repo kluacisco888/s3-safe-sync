@@ -120,6 +120,8 @@ const normalizePrefix = (prefix: string): string =>
 
 const ANDROID_DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const ANDROID_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
+// 网络类可重试错误从这一轮第一次失败起连续满这么久仍未成功，才自动弹出同步状态窗口
+const NETWORK_FAILURE_POPUP_DELAY_MS = 30 * 60_000;
 
 export default class S3VaultSyncPlugin
   extends Plugin
@@ -135,6 +137,8 @@ export default class S3VaultSyncPlugin
   private networkRetryTimer: number | undefined;
   private networkRetryAt: number | undefined;
   private networkFailureTarget: string | undefined;
+  // 这一轮网络类可重试错误第一次失败的时间；同步成功或出现非网络错误时清空
+  private networkFailureSince: number | undefined;
   private pathRenames = new PathRenameTracker();
   private credentials!: CredentialStore;
   private data!: PersistedPluginData;
@@ -169,6 +173,10 @@ export default class S3VaultSyncPlugin
     (status: SyncStatusDisplay) => void
   >();
   private progressLabel: string | undefined;
+  // 已自动弹过同步状态窗口的问题指纹；一次同步成功后清空
+  private readonly shownStopFingerprints = new Set<string>();
+  // 当前开着的同步状态窗口
+  private readonly openStatusModals = new Set<StatusModal>();
 
   async onload(): Promise<void> {
     this.session = new SyncSession(this.app.vault);
@@ -299,7 +307,9 @@ export default class S3VaultSyncPlugin
   }
 
   openStatus(): void {
-    new StatusModal(this.app, this).open();
+    const modal: StatusModal = new StatusModal(this.app, this, () => this.openStatusModals.delete(modal));
+    this.openStatusModals.add(modal);
+    modal.open();
   }
 
   openSettings(): void {
@@ -1108,6 +1118,7 @@ export default class S3VaultSyncPlugin
       this.headRetryAttempt = 0;
       this.networkRetryAttempt = 0;
       this.networkFailureTarget = undefined;
+      this.networkFailureSince = undefined;
       this.pendingBulkDeletion = result.bulkDeletion;
       this.pendingLocalIssues = result.localIssues;
       this.pendingDeferredDownloads = result.deferredDownloadEntries;
@@ -1157,6 +1168,8 @@ export default class S3VaultSyncPlugin
         );
       } else {
         this.pendingBulkDeletion = undefined;
+        // 同步成功一次后清空弹窗记录，同一问题再出现时会再弹
+        this.shownStopFingerprints.clear();
         this.setStatus(
           "Idle",
           `Downloaded ${result.downloaded}, uploaded ${result.uploaded}, deleted ${result.deleted}, deferred ${result.deferredDownloads}, unsynced ${result.unsyncedLocalEntries}.`,
@@ -1166,6 +1179,8 @@ export default class S3VaultSyncPlugin
       const retryableNetwork = error instanceof S3TransportError ||
         (error instanceof S3RequestError && [408, 429, 500, 502, 503, 504].includes(error.status));
       if (!retryableNetwork) {this.networkFailureTarget = undefined; this.networkRetryAttempt = 0;}
+      if (retryableNetwork) this.networkFailureSince ??= Date.now();
+      else this.networkFailureSince = undefined;
       diagnostic.errorCategory = error instanceof S3TransportError ? error.kind
         : error instanceof S3RequestError ? ([401, 403].includes(error.status) ? "authentication" : "service")
         : error instanceof RemoteStateError || error instanceof RepairModeError ? "remote-integrity"
@@ -1191,7 +1206,9 @@ export default class S3VaultSyncPlugin
       } else {
         diagnostic.outcome = "error";
         await this.rememberIntegrityFailure(error, integrityTarget);
-        this.showError(error);
+        // 网络类可重试错误未连续满 30 分钟时，只显示状态栏和通知，不自动弹窗
+        this.showError(error, retryableNetwork &&
+          Date.now() - (this.networkFailureSince ?? Date.now()) < NETWORK_FAILURE_POPUP_DELAY_MS);
       }
     } finally {
       diagnostic.nextRetryAt = this.networkRetryAt ?? this.headRetryAt;
@@ -1416,6 +1433,7 @@ export default class S3VaultSyncPlugin
     status: PluginStatus,
     detail: string,
     progressLabel?: string,
+    holdErrorPopup = false,
   ): void {
     const integrityChecks = this.data ? this.currentIntegrityChecks() : [];
     if (integrityChecks.length && status !== "Checking" && status !== "Syncing") {
@@ -1439,6 +1457,42 @@ export default class S3VaultSyncPlugin
       status === "Action required" || status === "Error",
     );
     this.emitStatus();
+    if (status === "Action required" || (status === "Error" && !holdErrorPopup)) {
+      this.openStatusWhenStopped(status, detail);
+    }
+  }
+
+  // 停住就弹窗：状态进入「需要处理」或「出错」时自动打开同步状态窗口；同一问题指纹只弹一次
+  private openStatusWhenStopped(status: PluginStatus, detail: string): void {
+    const fingerprint = this.stopFingerprint(status, detail);
+    if (this.shownStopFingerprints.has(fingerprint)) return;
+    // 窗口已开着时问题已经展示给用户，同样记为弹过，不再叠一个新窗口
+    this.shownStopFingerprints.add(fingerprint);
+    if (this.openStatusModals.size === 0) this.openStatus();
+  }
+
+  // 问题指纹 = 问题种类 + 涉及路径（排序后）或错误信息
+  private stopFingerprint(status: PluginStatus, detail: string): string {
+    const integrityChecks = this.data ? this.currentIntegrityChecks() : [];
+    if (integrityChecks.length) {
+      return `repair:${integrityChecks.map(issue => JSON.stringify(issue.check)).sort().join("\n")}`;
+    }
+    if (status === "Error") return `error:${detail}`;
+    const items = [
+      ...this.pendingLocalIssues.map(issue => {
+        const paths = issue.kind === "path-collision" ? issue.paths
+          : issue.kind === "possible-rename" ? [...issue.oldPaths, ...issue.newPaths]
+          : [issue.path];
+        return `${issue.kind}:${[...paths].sort().join("|")}`;
+      }),
+      ...this.getConflicts().map(entry => `conflict:${entry.path}`),
+      ...this.pendingDeferredDownloads.flatMap(entry =>
+        entry.reason === "unsupported-path" ? [`unsupported-path:${entry.path}`] : []),
+      ...(this.pendingBulkDeletion ? [`bulk-deletion:${[...this.pendingBulkDeletion.entryIds].sort().join("|")}`] : []),
+      ...(this.data?.pendingCollisionRename
+        ? [`collision-rename:${this.data.pendingCollisionRename.from}|${this.data.pendingCollisionRename.to}`] : []),
+    ].sort();
+    return items.length ? `action:${items.join("\n")}` : `action:${detail}`;
   }
 
   private emitStatus(): void {
@@ -1465,7 +1519,7 @@ export default class S3VaultSyncPlugin
     this.setStatus("Syncing", formatted.detail, formatted.label);
   }
 
-  private showError(error: unknown): void {
+  private showError(error: unknown, holdErrorPopup = false): void {
     if (this.session.signal.aborted || error instanceof SyncStoppedError) return;
     const message = error instanceof Error ? error.message : "Unknown sync error";
     this.setStatus(
@@ -1475,6 +1529,8 @@ export default class S3VaultSyncPlugin
       error instanceof RepairModeError || error instanceof RemoteStateError
         ? `Repair Mode: ${message}`
         : message,
+      undefined,
+      holdErrorPopup,
     );
     const notice = new Notice(`S3 Vault Sync: ${message}`, 12_000);
     notice.messageEl.createEl("button", {text: "Open sync status", cls: "s3-vault-sync-notice-action"}).addEventListener("click", event => {

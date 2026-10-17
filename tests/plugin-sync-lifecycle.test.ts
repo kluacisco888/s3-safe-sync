@@ -17,6 +17,7 @@ const host = vi.hoisted((): {
   domEvents: Map<string, Array<() => void>>;
   mobile: boolean;
   android: boolean;
+  openedModals: Array<{close(): void}>;
 } => ({
   data: undefined,
   notices: [],
@@ -26,12 +27,17 @@ const host = vi.hoisted((): {
   domEvents: new Map(),
   mobile: false,
   android: false,
+  openedModals: [],
 }));
 
 vi.mock("obsidian", () => ({
   App: class {},
   FileSystemAdapter: class {},
-  Modal: class {},
+  Modal: class {
+    contentEl = {empty() {}};
+    open() { host.openedModals.push(this); }
+    close() { (this as {onClose?: () => void}).onClose?.(); }
+  },
   Notice: class {
     constructor(message: string) { host.notices.push(message); }
     hide() {}
@@ -83,6 +89,7 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
   vi.stubGlobal("document", { visibilityState: "visible" });
   host.notices = [];
   host.noticeActions = [];
+  host.openedModals = [];
   host.beforeSave = undefined;
   host.beforeLoad = undefined;
   host.registrationCount = 0;
@@ -236,6 +243,7 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
     head: { commitId: "initial", generation: 1, protocolVersion: 1, vaultId: "vault-1" },
   });
   let text = initialFile.text;
+  let localPresent = true;
   const file = Object.assign(new TFile(), { path: entry.path, stat: { mtime: 1, size: initialBytes.byteLength } });
   const events = new Map<string, Array<(file: TFile, oldPath?: string) => void>>();
   const edit = (value: string) => {
@@ -259,8 +267,8 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
         read: async (path: string) => { if (localRoot) return readFile(join(localRoot, path), "utf8"); const body = diagnosticFiles.get(path); if (body === undefined) throw new Error("Missing file"); return body; },
         write: async (path: string, body: string) => { if (localRoot) {await mkdir(dirname(join(localRoot, path)), {recursive: true}); await writeFile(join(localRoot, path), body);} else diagnosticFiles.set(path, body); },
       },
-      getFiles: () => [file],
-      getAbstractFileByPath: (path: string) => path === file.path ? file : null,
+      getFiles: () => localPresent ? [file] : [],
+      getAbstractFileByPath: (path: string) => localPresent && path === file.path ? file : null,
       readBinary: () => localRoot ? readFile(join(localRoot, initialFile.path)).then(body => Uint8Array.from(body).buffer) : Promise.resolve(new TextEncoder().encode(text).buffer),
       on: (name: string, listener: (file: TFile, oldPath?: string) => void) => {
         const listeners = events.get(name) ?? [];
@@ -290,7 +298,8 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
   const plugin = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
   await plugin.onload();
   if (loopback) cleanups.push(() => {plugin.onunload(); return Promise.resolve();});
-  return { plugin, remote, hooks, edit, rename, localText: () => localRoot ? readFileSync(join(localRoot, initialFile.path), "utf8") : text, app, objects, diagnosticFiles, wire, localRoot };
+  const setLocalPresent = (present: boolean) => {localPresent = present;};
+  return { plugin, remote, hooks, edit, rename, setLocalPresent, localText: () => localRoot ? readFileSync(join(localRoot, initialFile.path), "utf8") : text, app, objects, diagnosticFiles, wire, localRoot };
 };
 
 afterEach(async () => {
@@ -1078,5 +1087,131 @@ describe("plugin synchronization lifecycle", () => {
     hooks.headFailure = "network";
     await expect(plugin.downloadDeferred("entry-1")).rejects.toThrow("503");
     expect(plugin.getStatusText()).toMatch(/^Error:/);
+  });
+});
+
+describe("opening sync status when synchronization stops", () => {
+  it("opens sync status once when a sync needs a Bulk Deletion decision", async () => {
+    const {plugin, setLocalPresent} = await setup();
+    setLocalPresent(false);
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toMatch(/^Action required: Review and confirm the Bulk Deletion/u);
+    expect(host.openedModals).toHaveLength(1);
+    plugin.onunload();
+  });
+
+  it.each(["forbidden", "corrupt"] as const)("opens sync status once at once for a %s failure", async failure => {
+    const {plugin, hooks} = await setup();
+    hooks.headFailure = failure;
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toMatch(failure === "forbidden" ? /^Error:/u : /^Action required: Repair Mode/u);
+    expect(host.openedModals).toHaveLength(1);
+    expect(host.notices).toHaveLength(1);
+    expect(host.noticeActions.map(action => action.text)).toEqual(["Open sync status"]);
+    plugin.onunload();
+  });
+
+  it("opens sync status once per problem until it changes or a sync succeeds", async () => {
+    const {plugin, hooks, setLocalPresent} = await setup();
+    setLocalPresent(false);
+    await plugin.togglePause();
+    expect(host.openedModals).toHaveLength(1);
+    host.openedModals[0]!.close();
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^Action required:/u);
+    expect(host.openedModals).toHaveLength(1);
+    hooks.headFailure = "forbidden";
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^Error:/u);
+    expect(host.openedModals).toHaveLength(2);
+    host.openedModals[1]!.close();
+    hooks.headFailure = undefined;
+    setLocalPresent(true);
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^Idle:/u);
+    setLocalPresent(false);
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^Action required:/u);
+    expect(host.openedModals).toHaveLength(3);
+    plugin.onunload();
+  });
+
+  it("does not open another sync status window while one is open", async () => {
+    const {plugin, hooks, setLocalPresent} = await setup();
+    setLocalPresent(false);
+    await plugin.togglePause();
+    expect(host.openedModals).toHaveLength(1);
+    hooks.headFailure = "forbidden";
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^Error:/u);
+    expect(host.openedModals).toHaveLength(1);
+    host.openedModals[0]!.close();
+    await plugin.syncNow();
+    expect(host.openedModals).toHaveLength(1);
+    plugin.onunload();
+  });
+
+  const settle = async (plugin: S3VaultSyncPlugin, ms: number) => {
+    await vi.advanceTimersByTimeAsync(ms);
+    await vi.waitFor(() => expect(plugin.getDiagnostics().records.at(-1)?.finishedAt).toBeDefined());
+  };
+
+  it("opens sync status only after network failures continue for 30 minutes", async () => {
+    const {plugin, hooks} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    await settle(plugin, 29 * 60_000);
+    expect(plugin.getStatusText()).toMatch(/^Error:/u);
+    expect(host.notices.length).toBeGreaterThan(0);
+    expect(host.openedModals).toHaveLength(0);
+    await settle(plugin, 2 * 60_000);
+    expect(host.openedModals).toHaveLength(1);
+    await settle(plugin, 10 * 60_000);
+    expect(host.openedModals).toHaveLength(1);
+    plugin.onunload();
+  });
+
+  it("restarts the 30 minute network wait after one successful sync", async () => {
+    const {plugin, hooks} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    await settle(plugin, 20 * 60_000);
+    hooks.headFailure = undefined;
+    await settle(plugin, 2 * 60_000);
+    expect(plugin.getStatusText()).toMatch(/^Idle:/u);
+    hooks.headFailure = "network";
+    await settle(plugin, 2 * 60_000);
+    await settle(plugin, 16 * 60_000);
+    expect(plugin.getStatusText()).toMatch(/^Error:/u);
+    expect(host.openedModals).toHaveLength(0);
+    await settle(plugin, 16 * 60_000);
+    expect(host.openedModals).toHaveLength(1);
+    plugin.onunload();
+  });
+
+  it.each([
+    {device: "Android", android: true},
+    {device: "iOS", android: false},
+  ])("applies the same popup rules on $device", async ({android}) => {
+    host.mobile = true;
+    host.android = android;
+    const {plugin, hooks, setLocalPresent} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    await settle(plugin, 29 * 60_000);
+    expect(host.openedModals).toHaveLength(0);
+    await settle(plugin, 2 * 60_000);
+    expect(host.openedModals).toHaveLength(1);
+    host.openedModals[0]!.close();
+    hooks.headFailure = undefined;
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^Idle:/u);
+    setLocalPresent(false);
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^Action required:/u);
+    expect(host.openedModals).toHaveLength(2);
+    await plugin.syncNow();
+    expect(host.openedModals).toHaveLength(2);
+    plugin.onunload();
   });
 });
