@@ -4987,7 +4987,7 @@ describe("SyncService", () => {
     await local.write("note.md", new TextEncoder().encode("typing"));
     const head = await remote.readHead();
     await expect(service.resolvePathCollision({paths: review.paths, reviewToken: review.reviewToken, side: "local",
-      path: "note.md", newName: "renamed.md"}, tracker.capture(), collisionJournal(local, cache, tracker))).rejects.toThrow("changed");
+      path: "note.md", newName: "renamed.md"}, tracker.capture(), collisionJournal(local, cache, tracker))).rejects.toThrow("文件或同步记录有变化");
     expect(await remote.readHead()).toEqual(head);
     expect(local.readText("note.md")).toBe("typing");
     expect(local.readText("renamed.md")).toBeUndefined();
@@ -5007,7 +5007,7 @@ describe("SyncService", () => {
     const head = await remote.readHead();
     await expect(service.resolvePathCollision({paths: review.paths, reviewToken: review.reviewToken, side: "remote",
       path: "note.md", entryId: review.remoteFiles[0]!.entryId, newName: "EMPTY.md"}, tracker.capture(), collisionJournal(local, cache, tracker)))
-      .rejects.toThrow("occupied");
+      .rejects.toThrow("已被占用");
     expect(await remote.readHead()).toEqual(head);
   });
 
