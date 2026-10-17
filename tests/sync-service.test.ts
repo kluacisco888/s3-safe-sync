@@ -5381,6 +5381,135 @@ describe("SyncService", () => {
     expect((await remote.readHead())?.value.generation).toBe(initialGeneration);
   });
 
+  describe("same-name move inference among identical candidates", () => {
+    const drawing = new TextEncoder().encode("%PDF identical drawing bytes");
+    const setupVault = async (files: Record<string, Uint8Array>) => {
+      const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "same-name", vaultKey: new Uint8Array(32)});
+      const local = new MemoryVault();
+      for (const [path, bytes] of Object.entries(files)) await local.write(path, bytes);
+      const cache = new MemorySyncCache();
+      const service = new SyncService({cache, local, remote, replicaId: "desktop"});
+      await service.initializeNew("vault");
+      const readSnapshot = async () => remote.readSnapshot((await remote.readHead())!.value);
+      const before = await readSnapshot();
+      const entryAt = (path: string) => Object.values(before.entries).find(entry => entry.path === path)!;
+      return {remote, local, cache, service, readSnapshot, entryAt};
+    };
+
+    it("keeps the Entry of a drawing moved under its own name when an identical new drawing appears", async () => {
+      const {local, service, readSnapshot, entryAt} = await setupVault({
+        "TM图纸/8799-D (Section) R1.pdf": drawing,
+        "notes/project.md": new TextEncoder().encode("v1"),
+      });
+      const moved = entryAt("TM图纸/8799-D (Section) R1.pdf");
+      if (moved.kind !== "live") throw new Error("Expected live fixture");
+      await local.move("TM图纸/8799-D (Section) R1.pdf", "TM图纸/过程文档/8799-D (Section) R1.pdf");
+      await local.write("TM图纸/8797-D (Section) R1.pdf", drawing);
+      for (let index = 1; index <= 5; index += 1) {
+        await local.write(`截图/screenshot-${index}.png`, new TextEncoder().encode(`png ${index}`));
+      }
+      await local.write("notes/project.md", new TextEncoder().encode("v2"));
+
+      const result = await service.synchronize();
+
+      expect(result.status).toBe("complete");
+      expect(result.localIssues).toEqual([]);
+      const snapshot = await readSnapshot();
+      expect(snapshot.entries[moved.entryId]).toMatchObject({
+        kind: "live",
+        path: "TM图纸/过程文档/8799-D (Section) R1.pdf",
+        revision: {blobId: moved.revision.blobId},
+      });
+      expect(Object.values(snapshot.entries).filter(entry => entry.kind === "deleted")).toEqual([]);
+      const livePaths = Object.values(snapshot.entries).filter(entry => entry.kind === "live").map(entry => entry.path).sort();
+      expect(livePaths).toEqual([
+        "TM图纸/8797-D (Section) R1.pdf",
+        "TM图纸/过程文档/8799-D (Section) R1.pdf",
+        "notes/project.md",
+        ...[1, 2, 3, 4, 5].map(index => `截图/screenshot-${index}.png`),
+      ].sort());
+      expect((await service.synchronize()).uploaded).toBe(0);
+    });
+
+    it("pairs every uniquely same-named move within one identical content group", async () => {
+      const {local, service, readSnapshot, entryAt} = await setupVault({
+        "图纸/a.pdf": drawing,
+        "图纸/b.pdf": drawing,
+        "图纸/c.pdf": drawing,
+      });
+      const ids = ["a", "b", "c"].map(name => entryAt(`图纸/${name}.pdf`).entryId);
+      for (const name of ["a", "b", "c"]) await local.move(`图纸/${name}.pdf`, `归档/${name}.pdf`);
+      await local.write("图纸/d.pdf", drawing);
+
+      const result = await service.synchronize();
+
+      expect(result.status).toBe("complete");
+      expect(result.localIssues).toEqual([]);
+      const snapshot = await readSnapshot();
+      ["a", "b", "c"].forEach((name, index) => {
+        expect(snapshot.entries[ids[index]!]).toMatchObject({kind: "live", path: `归档/${name}.pdf`});
+      });
+      expect(Object.values(snapshot.entries).filter(entry => entry.kind === "deleted")).toEqual([]);
+      expect(Object.values(snapshot.entries).filter(entry => entry.kind === "live").map(entry => entry.path))
+        .toContain("图纸/d.pdf");
+    });
+
+    it("still reviews the move when two identical candidates share the missing name", async () => {
+      const {remote, local, service} = await setupVault({"图纸/x.pdf": drawing});
+      const before = (await remote.readHead())!.value.commitId;
+      await local.move("图纸/x.pdf", "甲/x.pdf");
+      await local.write("乙/x.pdf", drawing);
+
+      const result = await service.synchronize();
+
+      expect(result.status).toBe("action-required");
+      expect(result.localIssues).toEqual([{
+        kind: "possible-rename",
+        newPaths: ["甲/x.pdf", "乙/x.pdf"],
+        oldPaths: ["图纸/x.pdf"],
+        reviewToken: expect.any(String),
+      }]);
+      expect((await remote.readHead())!.value.commitId).toBe(before);
+    });
+
+    it("does not pair a same-named candidate whose path another live Entry owns", async () => {
+      const {remote, local, service, readSnapshot, entryAt} = await setupVault({"图纸/x.pdf": drawing});
+      const moved = entryAt("图纸/x.pdf");
+      const phoneFiles = new MemoryVault();
+      const phone = new SyncService({cache: new MemorySyncCache(), local: phoneFiles, remote, replicaId: "phone"});
+      await phone.synchronize();
+      await phoneFiles.write("归档/x.pdf", drawing);
+      await phone.synchronize();
+      const owner = Object.values((await readSnapshot()).entries).find(entry => entry.path === "归档/x.pdf")!;
+      await local.move("图纸/x.pdf", "归档/x.pdf");
+      await local.write("图纸/y.pdf", drawing);
+      const result = await service.synchronize();
+
+      // 被占用的同名路径不配对：它归属另一 Entry，剩下的消失/新增照旧进入挪动审查，而不是路径冲突。
+      expect(result.localIssues).toEqual([{
+        kind: "possible-rename",
+        newPaths: ["图纸/y.pdf"],
+        oldPaths: ["图纸/x.pdf"],
+        reviewToken: expect.any(String),
+      }]);
+
+      const snapshot = await readSnapshot();
+      expect(snapshot.entries[owner.entryId]).toMatchObject({kind: "live", path: "归档/x.pdf"});
+      expect(snapshot.entries[moved.entryId]?.path).not.toBe("归档/x.pdf");
+    });
+
+    it("still infers a single identical move whose name changed", async () => {
+      const {local, service, readSnapshot, entryAt} = await setupVault({"图纸/x.pdf": drawing});
+      const moved = entryAt("图纸/x.pdf");
+      await local.move("图纸/x.pdf", "归档/renamed.pdf");
+
+      const result = await service.synchronize();
+
+      expect(result.status).toBe("complete");
+      expect((await readSnapshot()).entries[moved.entryId]).toMatchObject({kind: "live", path: "归档/renamed.pdf"});
+    });
+  });
+
   it("publishes a rename and edit as one updated live Entry", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
