@@ -11,6 +11,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:integration": "vitest run tests/aws-live.integration.test.ts",
+    "test:e2e": "vitest run tests/e2e-unobserved-move.live.test.ts",
     "test:watch": "vitest"
   },
   "keywords": [
