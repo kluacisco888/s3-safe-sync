@@ -41,7 +41,7 @@ describe("createObsidianHttpExecutor", () => {
     const request = { url: "https://example.invalid/head", method: "GET", headers: {} };
     const result = execute(request).then(() => "success", error => String(error));
     await vi.advanceTimersByTimeAsync(120_000);
-    expect(await Promise.race([result, Promise.resolve("still pending")])).toContain("timed out");
+    expect(await Promise.race([result, Promise.resolve("still pending")])).toContain("超时");
     await expect(execute(request)).resolves.toMatchObject({ status: 200 });
     expect(vi.getTimerCount()).toBe(0);
   });

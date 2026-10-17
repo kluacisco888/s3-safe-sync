@@ -217,7 +217,7 @@ const applicableRenames = (
       continue;
     }
     if (usedIds.has(rename.entryId) || usedTargets.has(rename.toPath) || result.has(source)) {
-      throw new Error("Ambiguous saved rename identities; review the affected paths.");
+      throw new Error("保存的改名记录对应不唯一，请检查受影响的路径。");
     }
     usedIds.add(rename.entryId);
     usedTargets.add(rename.toPath);
@@ -302,7 +302,7 @@ export class SyncService {
 
   async initializeNew(vaultId: string, beforeHeadPublication?: () => Promise<void>): Promise<void> {
     if (await this.options.remote.readHead()) {
-      throw new Error("Remote Store is already initialized");
+      throw new Error("远端存储已经初始化过了");
     }
     const scan = await this.scanFiles(undefined, true);
     const files = scan.files;
@@ -318,11 +318,11 @@ export class SyncService {
     );
     if (collision) {
       throw new Error(
-        `Migration Baseline contains a cross-platform path collision: ${collision.join(", ")}`,
+        `迁移基线里有跨平台路径撞名：${collision.join("、")}`,
       );
     }
     if (scan.unsyncedLocalEntries > 0) {
-      throw new Error("The Migration Baseline contains files above the device limit");
+      throw new Error("迁移基线里有超过本设备限制的文件");
     }
     const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
     let completed = 0;
@@ -354,7 +354,7 @@ export class SyncService {
         plaintext.byteLength !== file.size ||
         (await sha256(plaintext)) !== file.contentHash
       ) {
-        throw new Error(`Local file changed while reading ${file.path}`);
+        throw new Error(`读取期间本地文件被改动：${file.path}`);
       }
       await this.options.remote.writeBlob(blobId, plaintext);
       const revision: RevisionRef = {
@@ -442,15 +442,15 @@ export class SyncService {
   async downloadDeferred(entryId: string): Promise<void> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
-      throw new Error("Remote Store is not initialized");
+      throw new Error("远端存储尚未初始化");
     }
     const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
     const entry = snapshot.entries[entryId];
     if (entry?.kind !== "live") {
-      throw new Error(`Deferred Entry ${entryId} is not live`);
+      throw new Error(`暂缓下载的文件 ${entryId} 已不是当前版本`);
     }
     if (this.options.local.supportsPath?.(entry.path) === false) {
-      throw new Error(`Path is not supported on this device: ${entry.path}`);
+      throw new Error(`本设备不支持这个路径：${entry.path}`);
     }
     const cached = await this.options.cache.load();
     const expectedContentHash = cached?.files[entry.path]?.contentHash ?? null;
@@ -466,7 +466,7 @@ export class SyncService {
       plaintext.byteLength !== entry.revision.size ||
       (await sha256(plaintext)) !== entry.revision.contentHash
     ) {
-      throw new Error(`Deferred Revision ${entry.revision.revisionId} is damaged`);
+      throw new Error(`暂缓下载的版本 ${entry.revision.revisionId} 已损坏`);
     }
     await this.reportVerifiedContent(entry, entry.revision);
     await this.assertLocalContent(entry.path, expectedContentHash);
@@ -481,7 +481,7 @@ export class SyncService {
   async importCandidate(path: string): Promise<void> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
-      throw new Error("Remote Store is not initialized");
+      throw new Error("远端存储尚未初始化");
     }
     const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
     const canonicalPath = canonicalVaultPath(path);
@@ -490,18 +490,18 @@ export class SyncService {
         canonicalVaultPath(entry.path) === canonicalPath,
     );
     if (pathIsKnown) {
-      throw new Error(`Remote Store already knows path ${path}`);
+      throw new Error(`远端存储里已有路径 ${path}`);
     }
     const file = (await this.options.local.list()).find(
       (candidate) => candidate.path === path,
     );
     if (!file) {
-      throw new Error(`Import Candidate no longer exists: ${path}`);
+      throw new Error(`待导入文件已不存在：${path}`);
     }
     if (
       this.exceedsAutomaticFileLimit(file.path, file.size)
     ) {
-      throw new Error(`Import Candidate exceeds the mobile limit: ${path}`);
+      throw new Error(`待导入文件超过移动端限制：${path}`);
     }
     const plaintext = await this.options.local.read(path);
     if (plaintext.byteLength !== file.size) {
@@ -564,12 +564,12 @@ export class SyncService {
 
   private async loadLocalContentReview(path: string) {
     const head = await this.options.remote.readHead();
-    if (!head) throw new Error("Remote Store is not initialized");
+    if (!head) throw new Error("远端存储尚未初始化");
     const snapshot = await this.options.remote.readSnapshot(head.value);
     const atPath = Object.values(snapshot.entries).filter(entry => entry.path === path);
     const currentOwners = atPath.filter(entry => entry.kind !== "deleted");
     const matches = currentOwners.length ? currentOwners : atPath;
-    if (matches.length !== 1) throw new Error("Remote path changed or is ambiguous. Sync and review its current path.");
+    if (matches.length !== 1) throw new Error("远端路径已变化或对应不唯一。请同步后检查它当前的路径。");
     const entry = matches[0]!;
     const file = await this.options.local.stat(path);
     const revisions = entry.kind === "live" ? [entry.revision]
@@ -578,14 +578,14 @@ export class SyncService {
       : entry.kind === "conflicted" ? entry.candidates.find(r => r.contentHash === entry.materializedContentHash)
       : undefined;
     if (entry.kind === "conflicted" && entry.materializedContentHash && !materialized) {
-      throw new RemoteStateError("Conflict has no authenticated materialized candidate", undefined,
+      throw new RemoteStateError("冲突没有可核实的候选版本", undefined,
         {kind: "recovery", entryId: entry.entryId, contentHash: entry.materializedContentHash});
     }
     const blockedReason = (file && this.exceedsAutomaticFileLimit(path, file.size)) ||
       revisions.some(revision => this.exceedsAutomaticFileLimit(path, revision.size))
-      ? "This review exceeds this device's transfer limit. Resolve it on a desktop, or connect to Wi-Fi for attachments below the mobile limit."
+      ? "这次审查超过了本设备的传输限制。请在桌面端处理；若是低于移动端限制的附件，可连接 Wi-Fi 后处理。"
       : this.options.local.supportsPath?.(path) === false
-        ? "This path is unsupported on this device. Rename it on a compatible desktop first."
+        ? "本设备不支持这个路径。请先在兼容的桌面设备上改名。"
         : undefined;
     const previewLimit = 256 * 1024;
     const textPreview = (body: Uint8Array): string | undefined => {
@@ -619,7 +619,7 @@ export class SyncService {
       if (!blockedReason && index < 3 && revision.size <= previewLimit) {
         const body = await this.options.remote.readBlob(revision.blobId);
         if (!body || body.byteLength !== revision.size || await sha256(body) !== revision.contentHash) {
-          throw new RemoteStateError("Remote review content failed verification", undefined, {kind: "blob", blobId: revision.blobId});
+          throw new RemoteStateError("远端审查内容未通过校验", undefined, {kind: "blob", blobId: revision.blobId});
         }
         await this.reportVerifiedContent(entry, revision);
         preview = textPreview(body);
@@ -641,15 +641,15 @@ export class SyncService {
     if (choice === "both") return this.preserveLocalCopyAndAcceptRemote(path, reviewToken);
     const {head, snapshot, entry, file, localHash, review} = await this.loadLocalContentReview(path);
     if (review.blockedReason) throw new Error(review.blockedReason);
-    if (review.reviewToken !== reviewToken) throw new Error("Local or remote content changed. Review the versions again.");
+    if (review.reviewToken !== reviewToken) throw new Error("本地或远端内容有变化。请重新审查两个版本。");
     if (entry.kind !== "live" || !file || !localHash) {
-      throw new Error("This choice requires both a local file and a live S3 version. Review the current state again.");
+      throw new Error("这个选项需要同时有本地文件和 S3 当前版本。请重新审查当前状态。");
     }
     await this.assertLocalContent(path, localHash);
     await this.assertRemoteEntriesBeforePublication(snapshot, new Set([entry.entryId]), []);
     const remoteBody = await this.options.remote.readBlob(entry.revision.blobId);
     if (!remoteBody || remoteBody.byteLength !== entry.revision.size || await sha256(remoteBody) !== entry.revision.contentHash) {
-      throw new RemoteStateError("Remote content failed verification", undefined, {kind: "blob", blobId: entry.revision.blobId});
+      throw new RemoteStateError("远端内容未通过校验", undefined, {kind: "blob", blobId: entry.revision.blobId});
     }
     const localBody = await this.options.local.read(path);
     if (localBody.byteLength !== file.size || await sha256(localBody) !== localHash) throw new LocalStateChangedError(path);
@@ -679,14 +679,14 @@ export class SyncService {
   async preserveLocalCopyAndAcceptRemote(path: string, reviewToken: string): Promise<string | undefined> {
     const {head, snapshot, entry, file, localHash, materialized, review} = await this.loadLocalContentReview(path);
     if (review.blockedReason) throw new Error(review.blockedReason);
-    if (review.reviewToken !== reviewToken) throw new Error("Local or remote content changed. Review the versions again.");
+    if (review.reviewToken !== reviewToken) throw new Error("本地或远端内容有变化。请重新审查两个版本。");
     await this.assertLocalContent(path, localHash);
     await this.assertRemoteEntriesBeforePublication(snapshot, new Set([entry.entryId]), []);
     let remoteBody: Uint8Array | undefined;
     if (materialized) {
       remoteBody = await this.options.remote.readBlob(materialized.blobId);
       if (!remoteBody || remoteBody.byteLength !== materialized.size || await sha256(remoteBody) !== materialized.contentHash) {
-        throw new RemoteStateError("Remote content failed verification", undefined, {kind: "blob", blobId: materialized.blobId});
+        throw new RemoteStateError("远端内容未通过校验", undefined, {kind: "blob", blobId: materialized.blobId});
       }
     }
     let copy: LiveEntry | undefined;
@@ -768,16 +768,16 @@ export class SyncService {
 
   async readConflictCandidate(entryId: string, revisionId: string): Promise<Uint8Array> {
     const head = await this.options.remote.readHead();
-    if (!head) throw new Error("Remote Store is not initialized");
+    if (!head) throw new Error("远端存储尚未初始化");
     const snapshot = await this.options.remote.readSnapshot(head.value);
     const entry = snapshot.entries[entryId];
-    if (entry?.kind !== "conflicted") throw new Error("This conflict has changed. Refresh sync status.");
+    if (entry?.kind !== "conflicted") throw new Error("这个冲突已有变化。请刷新同步状态。");
     const revision = entry.candidates.find(candidate => candidate.revisionId === revisionId);
-    if (!revision) throw new Error("This version is no longer a conflict candidate. Refresh sync status.");
-    if (revision.size > 1024 * 1024) throw new Error("This version exceeds the text preview limit.");
+    if (!revision) throw new Error("这个版本已不是冲突候选版本。请刷新同步状态。");
+    if (revision.size > 1024 * 1024) throw new Error("这个版本超过了文字预览限制。");
     const body = await this.options.remote.readBlob(revision.blobId);
     if (!body || body.byteLength !== revision.size || await sha256(body) !== revision.contentHash) {
-      throw new RemoteStateError("Conflict preview failed content verification", undefined, {kind: "blob", blobId: revision.blobId});
+      throw new RemoteStateError("冲突预览未通过内容校验", undefined, {kind: "blob", blobId: revision.blobId});
     }
     await this.reportVerifiedContent(entry, revision);
     return body;
@@ -789,15 +789,15 @@ export class SyncService {
   ): Promise<void> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
-      throw new Error("Remote Store is not initialized");
+      throw new Error("远端存储尚未初始化");
     }
     const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
     const conflicted = snapshot.entries[entryId];
     if (conflicted?.kind !== "conflicted") {
-      throw new Error(`Entry ${entryId} is not conflicted`);
+      throw new Error(`文件 ${entryId} 没有冲突`);
     }
     if (this.options.local.supportsPath?.(conflicted.path) === false) {
-      throw new Error(`Path is not supported on this device: ${conflicted.path}`);
+      throw new Error(`本设备不支持这个路径：${conflicted.path}`);
     }
     await this.assertRemoteEntriesBeforePublication(
       snapshot,
@@ -824,7 +824,7 @@ export class SyncService {
       );
       if (!candidate) {
         throw new Error(
-          `Conflict candidate ${resolution.revisionId} does not exist`,
+          `冲突候选版本 ${resolution.revisionId} 不存在`,
         );
       }
       materializedContent = await this.options.remote.readBlob(candidate.blobId);
@@ -833,7 +833,7 @@ export class SyncService {
         materializedContent.byteLength !== candidate.size ||
         (await sha256(materializedContent)) !== candidate.contentHash
       ) {
-        throw new Error(`Conflict candidate ${resolution.revisionId} is damaged`);
+        throw new Error(`冲突候选版本 ${resolution.revisionId} 已损坏`);
       }
       resolvedEntry = {
         entryId,
@@ -857,7 +857,7 @@ export class SyncService {
         !conflicted.lastContentHash ||
         !conflicted.lastRevisionId
       ) {
-        throw new Error("This Conflict does not contain a deletion decision");
+        throw new Error("这个冲突里没有删除决定");
       }
       resolvedEntry = {
         deletedAt: conflicted.deletedAt,
@@ -916,33 +916,33 @@ export class SyncService {
 
   async readHistoricalRevision(entryId: string, revisionId: string): Promise<Uint8Array> {
     const head = await this.options.remote.readHead();
-    if (!head) throw new Error("Remote Store is not initialized");
+    if (!head) throw new Error("远端存储尚未初始化");
     const snapshot = await this.options.remote.readSnapshot(head.value);
     const entry = snapshot.entries[entryId];
     const revision = entry?.kind === "live" ? entry.history?.find(value => value.revisionId === revisionId) : undefined;
-    if (entry?.kind !== "live" || !revision) throw new Error("This historical version is no longer available. Refresh version history.");
-    if (this.exceedsAutomaticFileLimit(entry.path, revision.size)) throw new Error("This preview exceeds this device's transfer limit.");
+    if (entry?.kind !== "live" || !revision) throw new Error("这个历史版本已不可用。请刷新历史版本。");
+    if (this.exceedsAutomaticFileLimit(entry.path, revision.size)) throw new Error("这次预览超过了本设备的传输限制。");
     return this.readDeletedRevisionCopy(entry, revision, head.serverDate);
   }
 
   async restoreRevision(entryId: string, revisionId: string): Promise<void> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
-      throw new Error("Remote Store is not initialized");
+      throw new Error("远端存储尚未初始化");
     }
     const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
     const entry = snapshot.entries[entryId];
     if (entry?.kind !== "live") {
-      throw new Error(`Entry ${entryId} is not live`);
+      throw new Error(`文件 ${entryId} 已不是当前版本`);
     }
     if (this.options.local.supportsPath?.(entry.path) === false) {
-      throw new Error(`Path is not supported on this device: ${entry.path}`);
+      throw new Error(`本设备不支持这个路径：${entry.path}`);
     }
     const historical = entry.history?.find(
       (revision) => revision.revisionId === revisionId,
     );
     if (!historical) {
-      throw new Error(`Historical Revision ${revisionId} does not exist`);
+      throw new Error(`历史版本 ${revisionId} 不存在`);
     }
     await this.assertLocalContent(entry.path, entry.revision.contentHash);
     await this.assertRemoteRecoveryForLocalContent(
@@ -956,14 +956,14 @@ export class SyncService {
       plaintext.byteLength !== historical.size ||
       (await sha256(plaintext)) !== historical.contentHash
     ) {
-      throw new Error(`Historical Revision ${revisionId} is damaged`);
+      throw new Error(`历史版本 ${revisionId} 已损坏`);
     }
     await this.reportVerifiedContent(entry, historical);
     if (
       historical.expiresAt !== undefined &&
       Date.parse(historical.expiresAt) <= Date.parse(versionedHead.serverDate)
     ) {
-      throw new Error(`Historical Revision ${revisionId} has expired`);
+      throw new Error(`历史版本 ${revisionId} 已过期`);
     }
     const createdAt = versionedHead.serverDate;
     const restoredEntry: VaultEntry = {
@@ -1013,12 +1013,12 @@ export class SyncService {
   ): Promise<Uint8Array> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
-      throw new Error("Remote Store is not initialized");
+      throw new Error("远端存储尚未初始化");
     }
     const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
     const deleted = snapshot.entries[entryId];
     if (deleted?.kind !== "deleted") {
-      throw new Error(`Entry ${entryId} is not deleted`);
+      throw new Error(`文件 ${entryId} 没有被删除`);
     }
     const revision = revisionId
       ? [deleted.recovery, ...(deleted.history ?? [])].find(
@@ -1026,7 +1026,7 @@ export class SyncService {
         )
       : deleted.recovery;
     if (!revision) {
-      throw new Error(`Deleted Revision ${revisionId ?? entryId} does not exist`);
+      throw new Error(`已删除的版本 ${revisionId ?? entryId} 不存在`);
     }
     return this.readDeletedRevisionCopy(
       deleted,
@@ -1038,12 +1038,12 @@ export class SyncService {
   async restoreDeleted(entryId: string, revisionId?: string): Promise<void> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
-      throw new Error("Remote Store is not initialized");
+      throw new Error("远端存储尚未初始化");
     }
     const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
     const deleted = snapshot.entries[entryId];
     if (deleted?.kind !== "deleted") {
-      throw new Error(`Entry ${entryId} is not deleted`);
+      throw new Error(`文件 ${entryId} 没有被删除`);
     }
     const selected = revisionId
       ? [deleted.recovery, ...(deleted.history ?? [])].find(
@@ -1051,10 +1051,10 @@ export class SyncService {
         )
       : deleted.recovery;
     if (!selected) {
-      throw new Error(`Deleted Revision ${revisionId ?? entryId} does not exist`);
+      throw new Error(`已删除的版本 ${revisionId ?? entryId} 不存在`);
     }
     if (this.options.local.supportsPath?.(deleted.path) === false) {
-      throw new Error(`Path is not supported on this device: ${deleted.path}`);
+      throw new Error(`本设备不支持这个路径：${deleted.path}`);
     }
     this.assertRemotePathAvailable(snapshot, deleted.entryId, deleted.path);
     await this.assertRemoteEntriesBeforePublication(
@@ -1118,7 +1118,7 @@ export class SyncService {
   ): Promise<Uint8Array> {
     const recovery = deleted.recovery;
     if (!recovery) {
-      throw new Error(`Entry ${deleted.entryId} has no Recovery Copy`);
+      throw new Error(`文件 ${deleted.entryId} 没有恢复副本`);
     }
     return this.readDeletedRevisionCopy(
       deleted,
@@ -1138,14 +1138,14 @@ export class SyncService {
       plaintext.byteLength !== revision.size ||
       (await sha256(plaintext)) !== revision.contentHash
     ) {
-      throw new Error(`Recovery Copy for ${entry.entryId} is damaged`);
+      throw new Error(`文件 ${entry.entryId} 的恢复副本已损坏`);
     }
     await this.reportVerifiedContent(entry, revision);
     if (
       revision.expiresAt !== undefined &&
       Date.parse(revision.expiresAt) <= Date.parse(serverDate)
     ) {
-      throw new Error(`Recovery Copy for ${entry.entryId} has expired`);
+      throw new Error(`文件 ${entry.entryId} 的恢复副本已过期`);
     }
     return plaintext;
   }
@@ -1156,7 +1156,7 @@ export class SyncService {
   ): Promise<SyncResult> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
-      throw new Error("Remote Store is not initialized");
+      throw new Error("远端存储尚未初始化");
     }
     this.options.onRemoteHead?.(versionedHead.value.commitId);
     let remote = await this.options.remote.readSnapshot(versionedHead.value);
@@ -1403,7 +1403,7 @@ export class SyncService {
     const resolution = syncOptions.renameResolution;
     if (resolution) {
       if (!renameIssue || resolution.reviewToken !== renameIssue.reviewToken || !possibleRename) {
-        throw new Error("Files or remote state changed since the rename review. Sync again and review the new plan.");
+        throw new Error("审查挪动之后文件或远端状态有变化。请再同步一次并审查新的方案。");
       }
       if (resolution.kind === "moves") {
         // 部分配对：每个消失路径、每个新路径至多出现一次；没列出的消失 Entry 按删除处理，没被选中的新文件按新文件上传
@@ -1412,9 +1412,9 @@ export class SyncService {
         const assignments = new Map<string, string>();
         for (const pair of resolution.pairs) {
           const entryId = sources.get(pair.fromPath);
-          if (!entryId || !targets.delete(pair.toPath)) throw new Error("Rename mapping is not one-to-one.");
+          if (!entryId || !targets.delete(pair.toPath)) throw new Error("挪动对应关系不是一对一的。");
           if (fileType(pair.fromPath) !== fileType(pair.toPath)) {
-            throw new Error("A missing file can only move to a new file of the same file type.");
+            throw new Error("消失的文件只能挪到同类型的新文件。");
           }
           sources.delete(pair.fromPath);
           assignments.set(pair.toPath, entryId);
@@ -1593,13 +1593,13 @@ export class SyncService {
           action.revision.blobId,
         );
         if (!plaintext) {
-          throw new Error(`Missing remote blob ${action.revision.blobId}`);
+          throw new Error(`远端缺少数据块 ${action.revision.blobId}`);
         }
         if (
           plaintext.byteLength !== action.revision.size ||
           (await sha256(plaintext)) !== action.revision.contentHash
         ) {
-          throw new Error(`Remote blob ${action.revision.blobId} failed hash verification`);
+          throw new Error(`远端数据块 ${action.revision.blobId} 未通过哈希校验`);
         }
         const expectedContentHash =
           expectedLocalContentByPath.get(action.path) ?? null;
@@ -1697,7 +1697,7 @@ export class SyncService {
         } else if (change.kind === "move-remote") {
           const current = remote.entries[change.entryId];
           if (current?.kind !== "live") {
-            throw new Error(`Cannot move non-live Entry ${change.entryId}`);
+            throw new Error(`无法挪动不是当前版本的文件 ${change.entryId}`);
           }
           changedEntry = { ...current, path: change.toPath };
         } else {
@@ -1744,7 +1744,7 @@ export class SyncService {
         let changedEntry: VaultEntry;
         if (conflict.kind === "delete-edit") {
           if (remoteEntry?.kind !== "live") {
-            throw new Error(`Expected live Entry ${conflict.entryId}`);
+            throw new Error(`文件 ${conflict.entryId} 应为当前版本`);
           }
           changedEntry = {
             candidates: [remoteEntry.revision],
@@ -1784,7 +1784,7 @@ export class SyncService {
         await this.assertRemoteRevision(localRevision);
         if (conflict.kind === "edit-delete") {
           if (remoteEntry?.kind !== "deleted") {
-            throw new Error(`Expected deleted Entry ${conflict.entryId}`);
+            throw new Error(`文件 ${conflict.entryId} 应为已删除`);
           }
           changedEntry = {
             candidates: [localRevision],
@@ -1809,7 +1809,7 @@ export class SyncService {
             remoteEntry?.kind !== "live" ||
             (baseEntry?.kind !== "live" && baseEntry?.kind !== "deleted")
           ) {
-            throw new Error(`Expected live or restored Entry ${conflict.entryId}`);
+            throw new Error(`文件 ${conflict.entryId} 应为当前版本或已恢复`);
           }
           const baseContent =
             baseEntry.kind === "live"
@@ -1819,7 +1819,7 @@ export class SyncService {
             remoteEntry.revision.blobId,
           );
           if ((baseEntry.kind === "live" && !baseContent) || !remoteContent) {
-            throw new Error(`Conflict history is incomplete for ${conflict.path}`);
+            throw new Error(`${conflict.path} 的冲突历史不完整`);
           }
           if (
             (baseEntry.kind === "live" &&
@@ -1830,7 +1830,7 @@ export class SyncService {
             remoteContent.byteLength !== remoteEntry.revision.size ||
             (await sha256(remoteContent)) !== remoteEntry.revision.contentHash
           ) {
-            throw new Error(`Conflict history is damaged for ${conflict.path}`);
+            throw new Error(`${conflict.path} 的冲突历史已损坏`);
           }
           let merged: Uint8Array | undefined;
           if (
@@ -2239,7 +2239,7 @@ export class SyncService {
     );
     if (occupyingEntry) {
       throw new Error(
-        `Cannot restore ${path}; it is owned by Entry ${occupyingEntry.entryId}`,
+        `无法恢复 ${path}：这个路径已被文件 ${occupyingEntry.entryId} 占用`,
       );
     }
   }
@@ -2248,7 +2248,7 @@ export class SyncService {
   async verifyRemoteIntegrity(checks: readonly RemoteIntegrityCheck[], vaultId: string): Promise<void> {
     const head = await this.options.remote.readHead();
     if (!head || head.value.vaultId !== vaultId) {
-      throw new RemoteStateError("Remote Head is missing or belongs to a different Vault");
+      throw new RemoteStateError("远端 Head 指针缺失，或属于另一个仓库");
     }
     const snapshot = await this.options.remote.readSnapshot(head.value);
     for (const check of checks) {
@@ -2256,18 +2256,18 @@ export class SyncService {
         const entry = snapshot.entries[check.entryId];
         if (entry?.kind === "conflicted" && entry.materializedContentHash &&
           !entry.candidates.some(candidate => candidate.contentHash === entry.materializedContentHash)) {
-          throw new RemoteStateError("Conflict has no authenticated materialized candidate", undefined, check);
+          throw new RemoteStateError("冲突没有可核实的候选版本", undefined, check);
         }
         if (entry && retainedRevisions(entry).some(revision => revision.contentHash === check.contentHash &&
           this.exceedsAutomaticFileLimit(entry.path, revision.size))) {
-          throw new Error(`Integrity recheck exceeds this device's transfer limit: ${entry.path}. Retry on Wi-Fi or a desktop.`);
+          throw new Error(`完整校验超过了本设备的传输限制：${entry.path}。请连接 Wi-Fi 或在桌面端重试。`);
         }
         await this.assertRemoteRecoveryForLocalContent(snapshot, check.entryId, check.contentHash);
       } else if (check.kind === "blob") {
         for (const entry of Object.values(snapshot.entries)) {
           for (const revision of retainedRevisions(entry).filter(revision => revision.blobId === check.blobId)) {
             if (this.exceedsAutomaticFileLimit(entry.path, revision.size)) {
-              throw new Error(`Integrity recheck exceeds this device's transfer limit: ${entry.path}. Retry on Wi-Fi or a desktop.`);
+              throw new Error(`完整校验超过了本设备的传输限制：${entry.path}。请连接 Wi-Fi 或在桌面端重试。`);
             }
             await this.assertRemoteRevision(revision);
           }
@@ -2295,7 +2295,7 @@ export class SyncService {
     }
     const entry = snapshot.entries[entryId];
     if (!entry) {
-      throw new Error(`Entry ${entryId} has no remote recovery for local content`);
+      throw new Error(`文件 ${entryId} 的本地内容在远端没有可用的恢复副本`);
     }
     const revisions = retainedRevisions(entry).filter((revision) => revision.contentHash === expectedContentHash);
     for (const revision of revisions) {
@@ -2311,7 +2311,7 @@ export class SyncService {
       }
     }
     throw new RemoteStateError(
-      `No authenticated remote recovery exists for local content at ${entry.path} (Entry ${entryId})`,
+      `${entry.path} 的本地内容在远端没有可核实的恢复副本（文件 ${entryId}）`,
       undefined,
       {kind: "recovery", entryId, contentHash: expectedContentHash},
     );
@@ -2326,7 +2326,7 @@ export class SyncService {
         throw error;
       }
       throw new RemoteStateError(
-        `Remote Revision ${revision.revisionId} cannot be authenticated`,
+        `无法核实远端版本 ${revision.revisionId}`,
         error,
         {kind: "blob", blobId: revision.blobId},
       );
@@ -2337,7 +2337,7 @@ export class SyncService {
       (await sha256(plaintext)) !== revision.contentHash
     ) {
       throw new RemoteStateError(
-        `Remote Revision ${revision.revisionId} failed content verification`,
+        `远端版本 ${revision.revisionId} 未通过内容校验`,
         undefined,
         {kind: "blob", blobId: revision.blobId},
       );
@@ -2356,7 +2356,7 @@ export class SyncService {
     if (serverTime < recoveryRequiredUntil) {
       if (!deleted.recovery) {
         throw new Error(
-          `Deleted Entry ${deleted.entryId} is missing its Recovery Copy`,
+          `已删除的文件 ${deleted.entryId} 缺少恢复副本`,
         );
       }
       await this.readRecoveryCopy(deleted, serverDate);

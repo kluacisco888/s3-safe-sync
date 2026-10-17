@@ -12,7 +12,7 @@ const normalizePrefix = (prefix: string): string =>
 
 const assertEnvelope = (value: unknown): KeyEnvelope => {
   if (typeof value !== "object" || value === null) {
-    throw new Error("Key Envelope is invalid");
+    throw new Error("密钥信封无效");
   }
   const record = value as Record<string, unknown>;
   if (
@@ -24,7 +24,7 @@ const assertEnvelope = (value: unknown): KeyEnvelope => {
     typeof record.iv !== "string" ||
     typeof record.salt !== "string"
   ) {
-    throw new Error("Key Envelope is invalid");
+    throw new Error("密钥信封无效");
   }
   return {
     cipher: "AES-256-GCM",
@@ -39,7 +39,7 @@ const assertEnvelope = (value: unknown): KeyEnvelope => {
 
 const assertBootstrapRecord = (value: unknown): BootstrapRecord => {
   if (typeof value !== "object" || value === null) {
-    throw new Error("Bootstrap record is invalid");
+    throw new Error("初始化记录无效");
   }
   const record = value as Record<string, unknown>;
   if (
@@ -47,7 +47,7 @@ const assertBootstrapRecord = (value: unknown): BootstrapRecord => {
     typeof record.vaultId !== "string" ||
     !("envelope" in record)
   ) {
-    throw new Error("Bootstrap record is invalid");
+    throw new Error("初始化记录无效");
   }
   return {
     envelope: assertEnvelope(record.envelope),

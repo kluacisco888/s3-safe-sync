@@ -24,7 +24,7 @@ export class VaultCryptoError extends Error {
   readonly cause: unknown;
 
   constructor(cause: unknown) {
-    super("The password is wrong or the Key Envelope is damaged");
+    super("密码错误，或密钥信封已损坏");
     this.name = "VaultCryptoError";
     this.cause = cause;
   }
@@ -136,7 +136,7 @@ export class VaultCrypto {
       );
       const vaultKey = new Uint8Array(plaintext);
       if (vaultKey.byteLength !== VAULT_KEY_BYTES) {
-        throw new Error("Key Envelope did not contain a valid Vault Key");
+        throw new Error("密钥信封里没有有效的仓库密钥");
       }
       return vaultKey;
     } catch (error) {

@@ -267,7 +267,7 @@ describe("SyncService", () => {
     if (entry.kind !== "live") throw new Error("Expected live fixture");
     const recovery = {kind: "recovery" as const, entryId: entry.entryId, contentHash: entry.revision.contentHash};
     await objects.put(`integrity/v1/blobs/${entry.revision.blobId}`, new TextEncoder().encode("damaged"));
-    await expect(service.verifyRemoteIntegrity([recovery], "vault")).rejects.toThrow("No authenticated remote recovery");
+    await expect(service.verifyRemoteIntegrity([recovery], "vault")).rejects.toThrow("在远端没有可核实的恢复副本");
     await expect(service.verifyRemoteIntegrity([{kind: "blob", blobId: entry.revision.blobId}], "vault"))
       .rejects.toMatchObject({integrityCheck: {kind: "blob", blobId: entry.revision.blobId}});
     // Repair can supply another authenticated copy without deleting the old evidence.
@@ -278,12 +278,12 @@ describe("SyncService", () => {
           history: [{...entry.revision, blobId: "alternate", revisionId: "alternate"}]}}]}});
     await expect(service.verifyRemoteIntegrity([recovery], "vault")).resolves.toBeUndefined();
     await expect(service.verifyRemoteIntegrity([{kind: "recovery", entryId: entry.entryId, contentHash: "sha256:unavailable"}], "vault"))
-      .rejects.toThrow("No authenticated remote recovery");
+      .rejects.toThrow("在远端没有可核实的恢复副本");
     const limited = new SyncService({cache, local, remote, replicaId: "phone", maxAutomaticFileBytes: 1});
     const reads: string[] = [];
     objects.onGet = key => {reads.push(key);};
     for (const check of [recovery, {kind: "blob" as const, blobId: entry.revision.blobId}]) {
-      await expect(limited.verifyRemoteIntegrity([check], "vault")).rejects.toThrow("transfer limit");
+      await expect(limited.verifyRemoteIntegrity([check], "vault")).rejects.toThrow("传输限制");
     }
     expect(reads.some(key => key.includes("/blobs/"))).toBe(false);
     // A rejected upload not referenced by accepted history must not leave an eternal blocker.
@@ -309,7 +309,7 @@ describe("SyncService", () => {
           path: entry.path, reason: "edit-edit", candidates: [], materializedContentHash: entry.revision.contentHash,
           history: [entry.revision]}}]}});
     await expect(service.verifyRemoteIntegrity([{kind: "recovery", entryId: entry.entryId, contentHash: entry.revision.contentHash}], "vault"))
-      .rejects.toThrow("no authenticated materialized candidate");
+      .rejects.toThrow("冲突没有可核实的候选版本");
   });
 
   it("rejects a cross-platform path collision before initializing Head", async () => {
@@ -330,7 +330,7 @@ describe("SyncService", () => {
     });
 
     await expect(service.initializeNew("vault-1")).rejects.toThrow(
-      "cross-platform path collision",
+      "跨平台路径撞名",
     );
 
     await expect(remote.readHead()).resolves.toBeUndefined();
@@ -493,7 +493,7 @@ describe("SyncService", () => {
     });
 
     await expect(service.initializeNew("vault-1")).rejects.toThrow(
-      "Local file changed while reading notes/example.md",
+      "读取期间本地文件被改动：notes/example.md",
     );
     expect(await remote.readHead()).toBeUndefined();
   });
@@ -780,7 +780,7 @@ describe("SyncService", () => {
         else { await source.write("article.md", new TextEncoder().encode("new S3 version")); await sourceService.synchronize(); }
         const head = await remote.readHead();
         const before = await local.list();
-        await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("changed. Review");
+        await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("有变化。请重新审查");
         expect(await remote.readHead()).toEqual(head);
         expect(await local.list()).toEqual(before);
         expect(local.readText("article.md")).toBe(changed === "local" ? "new draft" : "local article");
@@ -823,7 +823,7 @@ describe("SyncService", () => {
         await source.write("article.md", new TextEncoder().encode("concurrent remote update"));
         await sourceService.synchronize();
       };
-      await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("Head changed");
+      await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("Head 指针被改了");
       expect(local.readText("article.md")).toBe("local article");
       const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
       const entry = Object.values(snapshot.entries).find(value => value.path === "article.md");
@@ -853,7 +853,7 @@ describe("SyncService", () => {
       const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
       const entry = Object.values(snapshot.entries).find(value => value.path === "article.md")!;
       await expect(service.readHistoricalRevision(missing === "missing-entry" ? "missing" : entry.entryId, "missing"))
-        .rejects.toThrow("This historical version is no longer available");
+        .rejects.toThrow("这个历史版本已不可用");
     });
 
     it("refuses expired or corrupted backup previews and restores", async () => {
@@ -880,8 +880,8 @@ describe("SyncService", () => {
       await remote.advance({expectedHeadEtag: head.etag, head: {...head.value, commitId},
         commit: {commitId, vaultId: snapshot.vaultId, protocolVersion: 1, createdAt: head.serverDate,
           parentIds: [head.value.commitId], replicaId: "test", changes: [{kind: "set-entry", entry: expired}]}});
-      await expect(service.readHistoricalRevision(entry.entryId, backup.revisionId)).rejects.toThrow("expired");
-      await expect(service.restoreRevision(entry.entryId, backup.revisionId)).rejects.toThrow("expired");
+      await expect(service.readHistoricalRevision(entry.entryId, backup.revisionId)).rejects.toThrow("已过期");
+      await expect(service.restoreRevision(entry.entryId, backup.revisionId)).rejects.toThrow("已过期");
       expect(local.readText("article.md")).toBe("remote article");
     });
 
@@ -1060,7 +1060,7 @@ describe("SyncService", () => {
       }
       const before = (await remote.readHead())!.value.commitId;
       await expect(service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken))
-        .rejects.toThrow("changed. Review");
+        .rejects.toThrow("有变化。请重新审查");
       expect((await remote.readHead())!.value.commitId).toBe(before);
       expect((await local.list()).length).toBe(2);
       expect(local.readText("article.md")).toBe(side === "local" ? "new draft" : "local article");
@@ -1109,10 +1109,10 @@ describe("SyncService", () => {
       const service = new SyncService({remote, local, cache: new MemorySyncCache(), replicaId: "phone", maxAutomaticFileBytes: 5});
       const reads = local.readCount;
       const review = await service.reviewLocalContent("article.md");
-      expect(review.blockedReason).toContain("device's transfer limit");
+      expect(review.blockedReason).toContain("本设备的传输限制");
       expect(local.readCount).toBe(reads);
       for (const choice of ["local", "remote", "both"] as const) {
-        await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("device's transfer limit");
+        await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("本设备的传输限制");
       }
     });
 
@@ -1125,7 +1125,7 @@ describe("SyncService", () => {
         await source.write("article.md", new TextEncoder().encode("another device edited during backup"));
         await sourceService.synchronize();
       };
-      await expect(service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken)).rejects.toThrow("Head changed");
+      await expect(service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken)).rejects.toThrow("Head 指针被改了");
       expect(local.readText("article.md")).toBe("local article");
       const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
       const original = Object.values(snapshot.entries).find(entry => entry.path === "article.md");
@@ -1164,7 +1164,7 @@ describe("SyncService", () => {
       expect(previews).toContain("local article");
       expect(previews).toContain("concurrent remote edit");
       expect((await remote.readHead())!.value.commitId).toBe(previewHead);
-      await expect(service.readConflictCandidate(before.entryId, "missing-candidate")).rejects.toThrow("no longer");
+      await expect(service.readConflictCandidate(before.entryId, "missing-candidate")).rejects.toThrow("已不是冲突候选版本");
       await local.write("article.md", new TextEncoder().encode("extra local edits during conflict"));
       expect((await service.synchronize()).localIssues).toContainEqual({kind: "resolution-mismatch", path: "article.md"});
       const review = await service.reviewLocalContent("article.md");
@@ -1984,7 +1984,7 @@ describe("SyncService", () => {
 
     const synchronization = phone.synchronize();
     await expect(synchronization).rejects.toThrow(
-      "Vault Snapshot references missing blobs",
+      "仓库快照引用的数据块缺失",
     );
     await expect(synchronization).rejects.toThrow("notes/example.md");
 
@@ -2027,7 +2027,7 @@ describe("SyncService", () => {
     await local.write("notes/example.md", new TextEncoder().encode("after"));
 
     await expect(service.synchronize()).rejects.toThrow(
-      "cannot be authenticated",
+      "无法核实远端版本",
     );
 
     await expect(remote.readHead()).resolves.toMatchObject({
@@ -2086,7 +2086,7 @@ describe("SyncService", () => {
 
     const synchronization = phone.synchronize();
     await expect(synchronization).rejects.toThrow(
-      "No authenticated remote recovery exists",
+      "在远端没有可核实的恢复副本",
     );
     await expect(synchronization).rejects.toThrow("notes/example.md");
     await expect(synchronization).rejects.toBeInstanceOf(RemoteStateError);
@@ -2687,7 +2687,7 @@ describe("SyncService", () => {
         fullHashVerification: true,
         retryHashMemo,
       }),
-    ).rejects.toThrow("Head changed");
+    ).rejects.toThrow("Head 指针被改了");
     local.readCount = 0;
     local.readPaths.length = 0;
 
@@ -3321,7 +3321,7 @@ describe("SyncService", () => {
       throw new Error("Expected unsupported remote path");
     }
     await expect(phone.downloadDeferred(unsupported.entryId)).rejects.toThrow(
-      "not supported on this device",
+      "本设备不支持这个路径",
     );
   });
 
@@ -3829,7 +3829,7 @@ describe("SyncService", () => {
 
     await expect(
       service.restoreRevision(entry.entryId, entry.history[0].revisionId),
-    ).rejects.toThrow("No authenticated remote recovery exists");
+    ).rejects.toThrow("在远端没有可核实的恢复副本");
 
     expect(local.readText("notes/example.md")).toBe("version two");
     await expect(remote.readHead()).resolves.toMatchObject({
@@ -4080,7 +4080,7 @@ describe("SyncService", () => {
     objects.corruptNextBlobPut = true;
 
     await expect(phone.synchronize()).rejects.toThrow(
-      "cannot be authenticated",
+      "无法核实远端版本",
     );
 
     expect(phoneVault.readText("notes/example.md")).toBe("phone edit");
@@ -4236,7 +4236,7 @@ describe("SyncService", () => {
     };
 
     await expect(service.restoreDeleted(entryId)).rejects.toThrow(
-      "Head changed",
+      "Head 指针被改了",
     );
 
     expect(local.readText("notes/example.md")).toBeUndefined();
@@ -4306,7 +4306,7 @@ describe("SyncService", () => {
     });
 
     await expect(restoringReplica.restoreDeleted(foo.entryId)).rejects.toThrow(
-      "it is owned by Entry",
+      "这个路径已被文件",
     );
 
     expect(emptyLocal.readText("notes/foo.md")).toBeUndefined();
@@ -4824,7 +4824,7 @@ describe("SyncService", () => {
     if (entry.kind !== "live") throw new Error("Expected live fixture");
     await objects.put(`damaged-move/v1/blobs/${entry.revision.blobId}`, new TextEncoder().encode("damaged ciphertext"));
     await local.write("new.md", new TextEncoder().encode("original"));
-    await expect(phone.synchronize()).rejects.toThrow("No authenticated remote recovery");
+    await expect(phone.synchronize()).rejects.toThrow("在远端没有可核实的恢复副本");
     expect(local.readText("old.md")).toBe("original");
     expect(local.readText("new.md")).toBe("original");
   });
@@ -5315,7 +5315,7 @@ describe("SyncService", () => {
         const before = (await remote.readHead())!.value.commitId;
         await expect(service.synchronize([], {renameResolution: {
           kind: "separate", reviewToken: change === "wrong-token" ? "stale" : issue.reviewToken,
-        }})).rejects.toThrow("changed since the rename review");
+        }})).rejects.toThrow("审查挪动之后文件或远端状态有变化");
         expect((await remote.readHead())!.value.commitId).toBe(before);
         expect(local.readText("new/0.md")).toBe(change === "local-edit" ? "newer draft" : "edited 0");
       },
@@ -5325,7 +5325,7 @@ describe("SyncService", () => {
       const {service, issue} = await setupReview(2);
       await expect(service.synchronize([], {renameResolution: {kind: "moves", reviewToken: issue.reviewToken,
         pairs: issue.oldPaths.map(fromPath => ({fromPath, toPath: "new/0.md"})),
-      }})).rejects.toThrow("not one-to-one");
+      }})).rejects.toThrow("不是一对一的");
     });
 
     it("requires exact bulk-delete confirmation after separate delete/add review", async () => {
@@ -5486,7 +5486,7 @@ describe("SyncService", () => {
       const before = (await remote.readHead())!.value.commitId;
 
       await expect(service.synchronize([], {renameResolution: {kind: "separate", reviewToken: issue.reviewToken}}))
-        .rejects.toThrow("changed since the rename review");
+        .rejects.toThrow("审查挪动之后文件或远端状态有变化");
 
       expect((await remote.readHead())!.value.commitId).toBe(before);
       expect((await liveByPath(remote)).has("TM/8797-D R1.pdf")).toBe(false);
@@ -5571,7 +5571,7 @@ describe("SyncService", () => {
       const before = (await remote.readHead())!.value.commitId;
 
       await expect(service.synchronize([], {renameResolution: {kind: "moves", reviewToken: issue.reviewToken,
-        pairs: [{fromPath: "plan.pdf", toPath: "archive/memo v2.md"}]}})).rejects.toThrow("same file type");
+        pairs: [{fromPath: "plan.pdf", toPath: "archive/memo v2.md"}]}})).rejects.toThrow("同类型的新文件");
 
       expect((await remote.readHead())!.value.commitId).toBe(before);
     });

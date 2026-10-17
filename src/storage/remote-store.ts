@@ -56,7 +56,7 @@ export class HeadChangedError extends Error {
   readonly code = "HEAD_CHANGED" as const;
 
   constructor() {
-    super("Head changed while the Sync Commit was being published");
+    super("发布同步提交期间 Head 指针被改了");
     this.name = "HeadChangedError";
   }
 }
@@ -158,14 +158,14 @@ const assertHeadRecord = (value: unknown): HeadRecord => {
     typeof value.generation !== "number" ||
     ("snapshotId" in value && typeof value.snapshotId !== "string")
   ) {
-    throw new Error("Head payload is invalid");
+    throw new Error("Head 指针内容无效");
   }
   return value as HeadRecord;
 };
 
 const assertVaultSnapshot = (value: unknown): VaultSnapshot => {
   if (!isRecord(value)) {
-    throw new Error("Snapshot payload is invalid");
+    throw new Error("快照内容无效");
   }
   if (
     value.protocolVersion !== 1 ||
@@ -176,7 +176,7 @@ const assertVaultSnapshot = (value: unknown): VaultSnapshot => {
       ([entryId, entry]) => isVaultEntry(entry) && entry.entryId === entryId,
     )
   ) {
-    throw new Error("Snapshot payload is invalid");
+    throw new Error("快照内容无效");
   }
   return value as unknown as VaultSnapshot;
 };
@@ -199,7 +199,7 @@ const assertCommitRecord = (value: unknown): CommitRecord => {
         isVaultEntry(change.entry),
     )
   ) {
-    throw new Error("Sync Commit payload is invalid");
+    throw new Error("同步提交内容无效");
   }
   return value as unknown as CommitRecord;
 };
@@ -274,7 +274,7 @@ export class RemoteStore {
         value: assertHeadRecord(await this.decryptJson(stored.body)),
       };
     } catch (error) {
-      throw new RemoteStateError("Head cannot be authenticated", error);
+      throw new RemoteStateError("无法核实 Head 指针", error);
     }
   }
 
@@ -288,7 +288,7 @@ export class RemoteStore {
       );
       if (!stored) {
         throw new RemoteStateError(
-          `Head references missing Snapshot ${head.snapshotId}`,
+          `Head 指针引用的快照 ${head.snapshotId} 不存在`,
         );
       }
       baseSnapshot = await this.decryptSnapshot(
@@ -296,30 +296,30 @@ export class RemoteStore {
         stored.body,
       );
       if (baseSnapshot.vaultId !== head.vaultId) {
-        throw new RemoteStateError("Snapshot belongs to a different Vault");
+        throw new RemoteStateError("快照属于另一个仓库");
       }
     }
     let commitId: string | undefined = head.commitId;
     while (commitId && commitId !== baseSnapshot?.commitId) {
       if (visited.has(commitId)) {
-        throw new RemoteStateError("Sync Commit history contains a cycle");
+        throw new RemoteStateError("同步提交历史里有循环");
       }
       visited.add(commitId);
       const commit = await this.readCommit(commitId);
       if (!commit) {
         throw new RemoteStateError(
-          `Head references missing Sync Commit ${commitId}`,
+          `Head 指针引用的同步提交 ${commitId} 不存在`,
         );
       }
       if (commit.vaultId !== head.vaultId) {
-        throw new RemoteStateError("Sync Commit belongs to a different Vault");
+        throw new RemoteStateError("同步提交属于另一个仓库");
       }
       commits.unshift(commit);
       commitId = commit.parentIds[0];
     }
 
     if (baseSnapshot && commitId !== baseSnapshot.commitId) {
-      throw new RemoteStateError("Snapshot is not an ancestor of Head");
+      throw new RemoteStateError("快照不是 Head 指针的祖先");
     }
     const entries: Record<string, VaultEntry> = {
       ...(baseSnapshot?.entries ?? {}),
@@ -350,7 +350,7 @@ export class RemoteStore {
       return await this.cipher.decryptData(stored.body);
     } catch (error) {
       throw new RemoteStateError(
-        `Remote Blob ${blobId} cannot be authenticated`,
+        `无法核实远端数据块 ${blobId}`,
         error,
         {kind: "blob", blobId},
       );
@@ -367,7 +367,7 @@ export class RemoteStore {
       value = await this.decryptJson(stored.body);
     } catch (error) {
       throw new RemoteStateError(
-        `Sync Commit ${commitId} cannot be authenticated or decoded`,
+        `无法核实或解码同步提交 ${commitId}`,
         error,
       );
     }
@@ -375,7 +375,7 @@ export class RemoteStore {
       return assertCommitRecord(value);
     } catch (error) {
       throw new RemoteStateError(
-        `Sync Commit ${commitId} payload is invalid`,
+        `同步提交 ${commitId} 的内容无效`,
         error,
       );
     }
@@ -402,7 +402,7 @@ export class RemoteStore {
       input.commit.commitId !== input.head.commitId ||
       input.commit.vaultId !== input.head.vaultId
     ) {
-      throw new Error("Sync Commit and Head do not describe the same state");
+      throw new Error("同步提交和 Head 指针描述的状态不一致");
     }
   }
 
@@ -442,7 +442,7 @@ export class RemoteStore {
         missing.flatMap((blobId) => [...(pathsByBlobId.get(blobId) ?? [])]),
       );
       throw new RemoteStateError(
-        `Vault Snapshot references missing blobs for paths: ${[...affectedPaths].sort().join(", ")}`,
+        `仓库快照引用的数据块缺失，涉及路径：${[...affectedPaths].sort().join("、")}`,
       );
     }
   }
@@ -461,7 +461,7 @@ export class RemoteStore {
       value = await this.decryptJson(ciphertext);
     } catch (error) {
       throw new RemoteStateError(
-        `Snapshot ${snapshotId} cannot be authenticated or decoded`,
+        `无法核实或解码快照 ${snapshotId}`,
         error,
       );
     }
@@ -469,7 +469,7 @@ export class RemoteStore {
       return assertVaultSnapshot(value);
     } catch (error) {
       throw new RemoteStateError(
-        `Snapshot ${snapshotId} payload is invalid`,
+        `快照 ${snapshotId} 的内容无效`,
         error,
       );
     }

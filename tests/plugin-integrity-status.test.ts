@@ -99,7 +99,7 @@ it("keeps a known corrupt recovery actionable after an unrelated import and a no
     await plugin.syncNow();
     expect(plugin.getLocalIssues()).toEqual([{kind: "import-candidate", path: "import.md"}]);
     const damaged = corrupt("/current-blob");
-    await expect(plugin.restoreRevision("existing", "old")).rejects.toThrow("No authenticated remote recovery");
+    await expect(plugin.restoreRevision("existing", "old")).rejects.toThrow("在远端没有可核实的恢复副本");
     expect(plugin.getStatusText()).toMatch(/^需要处理：修复模式：/);
     await plugin.importCandidate("import.md");
     expect(data.get(damaged.key)!.body).toEqual(damaged.damaged);
@@ -120,7 +120,7 @@ it("keeps a known corrupt recovery actionable after an unrelated import and a no
 it("preserves integrity attention across pause, settings, reload, and a network failure during recheck", async () => {
   const {plugin, start, corrupt} = await fixture();
   const damaged = corrupt("/old-blob");
-  await expect(plugin.readHistoricalRevision("existing", "old")).rejects.toThrow("cannot be authenticated");
+  await expect(plugin.readHistoricalRevision("existing", "old")).rejects.toThrow("无法核实远端数据块");
   await plugin.togglePause();
   await plugin.saveSettings();
   expect(plugin.getStatusText()).toMatch(/^需要处理：/);
@@ -128,7 +128,7 @@ it("preserves integrity attention across pause, settings, reload, and a network 
   plugin.onunload();
   const restarted = await start();
   expect(restarted.getStatusText()).toMatch(/^需要处理：/);
-  expect(restarted.getStatusText()).toContain("cannot be authenticated");
+  expect(restarted.getStatusText()).toContain("无法核实远端数据块");
   damaged.restore();
   host.request.mockRejectedValueOnce(new Error("Network offline"));
   await restarted.togglePause();
@@ -181,7 +181,7 @@ it("clears only verified failures when two different integrity issues are pendin
   current.restore();
   await plugin.syncNow();
   expect(host.stored.pendingIntegrityChecks).toHaveLength(1);
-  expect(plugin.getStatusText()).toContain("Revision old cannot be authenticated");
+  expect(plugin.getStatusText()).toContain("无法核实远端版本 old");
   historical.restore();
   await plugin.syncNow();
   expect(host.stored.pendingIntegrityChecks).toEqual([]);
@@ -191,7 +191,7 @@ it("rechecks authenticated recovery on mobile without a separate transfer ceilin
   const {plugin, corrupt, files} = await fixture();
   const damaged = corrupt("/current-blob");
   host.mobile = true;
-  await expect(plugin.downloadDeferred("existing")).rejects.toThrow("No authenticated remote recovery");
+  await expect(plugin.downloadDeferred("existing")).rejects.toThrow("在远端没有可核实的恢复副本");
   damaged.restore();
   await plugin.syncNow();
   expect(plugin.getStatusText()).not.toContain("transfer limit");
@@ -210,7 +210,7 @@ it.each(["preview", "restore"])("clears the exact historical integrity issue aft
   const {plugin, corrupt, files} = await fixture();
   await plugin.syncNow();
   const damaged = corrupt("/old-blob");
-  await expect(plugin.readHistoricalRevision("existing", "old")).rejects.toThrow("cannot be authenticated");
+  await expect(plugin.readHistoricalRevision("existing", "old")).rejects.toThrow("无法核实远端数据块");
   damaged.restore();
   vi.spyOn(ObsidianVaultPort.prototype, "write").mockImplementation(async (path, body) => {
     files.set(path, new TextDecoder().decode(body));
@@ -230,7 +230,7 @@ it("clears a matching Entry/hash recovery issue when content review authenticate
   const {plugin, corrupt} = await fixture();
   await plugin.syncNow();
   const damaged = corrupt("/current-blob");
-  await expect(plugin.restoreRevision("existing", "old")).rejects.toThrow("No authenticated remote recovery");
+  await expect(plugin.restoreRevision("existing", "old")).rejects.toThrow("在远端没有可核实的恢复副本");
   damaged.restore();
   const review = await plugin.reviewLocalContent("existing.md");
   expect(review.remoteVersions[0]!.preview).toBe("current");

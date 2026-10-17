@@ -32,7 +32,7 @@ export class ObjectPreconditionError extends Error {
   readonly code = "OBJECT_PRECONDITION_FAILED" as const;
 
   constructor() {
-    super("The object changed before the conditional write completed");
+    super("条件写入完成前对象已被改动");
     this.name = "ObjectPreconditionError";
   }
 }

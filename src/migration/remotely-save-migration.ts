@@ -65,7 +65,7 @@ export class RemotelySaveMigration {
       }
       const stored = await this.objects.get(key);
       if (!stored) {
-        throw new Error(`Legacy object disappeared during migration: ${key}`);
+        throw new Error(`迁移期间旧对象消失了：${key}`);
       }
       remoteFiles.set(path, await this.cipher.decryptData(stored.body));
     }

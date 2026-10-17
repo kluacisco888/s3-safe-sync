@@ -24,11 +24,11 @@ export const probeObjectStore = async (
     const created = await objects.put(key, firstBody, { ifNoneMatch: true });
     const read = await objects.get(key);
     if (!read || new TextDecoder().decode(read.body) !== "probe-1") {
-      throw new Error("AWS S3 probe could not read back its test object");
+      throw new Error("AWS S3 检测无法读回测试对象");
     }
     const listed = await objects.list(`${normalized ? `${normalized}/` : ""}.s3-vault-sync-probe-`);
     if (!listed.includes(key)) {
-      throw new Error("AWS S3 probe object was not visible to ListObjectsV2");
+      throw new Error("AWS S3 检测对象在 ListObjectsV2 中不可见");
     }
     await objects.put(key, secondBody, { ifMatch: created.etag });
     let rejectedStaleWrite = false;
@@ -42,7 +42,7 @@ export const probeObjectStore = async (
       }
     }
     if (!rejectedStaleWrite) {
-      throw new Error("AWS S3 did not reject a stale If-Match write");
+      throw new Error("AWS S3 没有拒绝过期的 If-Match 写入");
     }
   } finally {
     await objects.delete(key);
