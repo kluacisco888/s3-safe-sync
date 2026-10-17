@@ -166,7 +166,7 @@ describe("safeReplaceVaultFile", () => {
 
     await expect(safeReplaceVaultFile(adapter, "notes/download.md", bytes("remote content"),
       await hash(bytes("original local content")), () => "wrong-size"))
-      .rejects.toThrow("Staged file size is inconsistent");
+      .rejects.toThrow("暂存文件大小不一致");
 
     expect(new TextDecoder().decode(adapter.files.get("notes/download.md"))).toBe("original local content");
     expect([...adapter.files.keys()]).toEqual(["notes/download.md"]);
@@ -233,7 +233,7 @@ describe("safeReplaceVaultFile", () => {
       originalHash: await hash(bytes("before")), expectedHash: await hash(bytes("remote"))})));
     adapter.beforeCopy = from => {adapter.files.set(from, bytes("new backup edit"));};
 
-    await expect(recoverPendingVaultWrites(adapter)).rejects.toThrow("Restored backup needs review");
+    await expect(recoverPendingVaultWrites(adapter)).rejects.toThrow("恢复的备份需要人工检查");
 
     expect(new TextDecoder().decode(adapter.files.get(targetPath))).toBe("new backup edit");
     expect(new TextDecoder().decode(adapter.files.get(backupPath))).toBe("new backup edit");
@@ -317,7 +317,7 @@ describe("safeReplaceVaultFile", () => {
           undefined,
           () => "write-1",
         ),
-      ).rejects.toThrow("unsafe Vault path");
+      ).rejects.toThrow("不安全的仓库路径");
 
       expect(adapter.calls).toEqual([]);
       expect(adapter.files.size).toBe(0);
@@ -420,7 +420,7 @@ describe("safeReplaceVaultFile", () => {
     );
 
     await expect(recoverPendingVaultWrites(adapter)).rejects.toThrow(
-      "Staged backup needs review",
+      "暂存的备份需要人工检查",
     );
 
     expect(adapter.files.has("notes/example.md")).toBe(false);
@@ -476,7 +476,7 @@ describe("safeReplaceVaultFile", () => {
         await hash(bytes("old local content")),
         () => "write-1",
       ),
-    ).rejects.toThrow("Local file changed during synchronization");
+    ).rejects.toThrow("同步过程中本地文件被改动");
 
     expect(new TextDecoder().decode(adapter.files.get("notes/example.md"))).toBe(
       "new local edit",
@@ -500,7 +500,7 @@ describe("safeReplaceVaultFile", () => {
         await hash(bytes("before")),
         () => "write-1",
       ),
-    ).rejects.toThrow("Local file changed during synchronization");
+    ).rejects.toThrow("同步过程中本地文件被改动");
 
     expect(new TextDecoder().decode(adapter.files.get("notes/example.md"))).toBe(
       "new local edit",
@@ -527,7 +527,7 @@ describe("safeReplaceVaultFile", () => {
         await hash(bytes("before")),
         () => "write-1",
       ),
-    ).rejects.toThrow("Staged backup needs review");
+    ).rejects.toThrow("暂存的备份需要人工检查");
 
     expect(new TextDecoder().decode(adapter.files.get("notes/example.md"))).toBe(
       "new local edit",
@@ -553,7 +553,7 @@ describe("safeReplaceVaultFile", () => {
         await hash(bytes("before")),
         () => "write-1",
       ),
-    ).rejects.toThrow("Staged write needs review");
+    ).rejects.toThrow("的暂存写入需要人工检查");
 
     expect(new TextDecoder().decode(adapter.files.get("notes/example.md"))).toBe(
       "last-moment local edit",
@@ -585,7 +585,7 @@ describe("safeReplaceVaultFile", () => {
         await hash(bytes("before")),
         () => "write-1",
       ),
-    ).rejects.toThrow("Staged backup needs review");
+    ).rejects.toThrow("暂存的备份需要人工检查");
 
     expect(new TextDecoder().decode(adapter.files.get("notes/example.md"))).toBe(
       "remote",
@@ -620,7 +620,7 @@ describe("safeReplaceVaultFile", () => {
     );
 
     await expect(recoverPendingVaultWrites(adapter)).rejects.toThrow(
-      "Staged write needs review",
+      "的暂存写入需要人工检查",
     );
 
     expect(new TextDecoder().decode(adapter.files.get("notes/example.md"))).toBe(
@@ -653,7 +653,7 @@ describe("safeReplaceVaultFile", () => {
     );
 
     await expect(recoverPendingVaultWrites(adapter)).rejects.toThrow(
-      "Staged write needs review",
+      "的暂存写入需要人工检查",
     );
 
     expect(new TextDecoder().decode(adapter.files.get("notes/example.md"))).toBe(

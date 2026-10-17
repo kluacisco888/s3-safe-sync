@@ -123,11 +123,11 @@ class MemoryVault implements LocalVaultPort {
       expectedSourceHash !== undefined &&
       sourceHash !== expectedSourceHash
     ) {
-      throw new Error(`Local file changed during synchronization: ${fromPath}`);
+      throw new Error(`同步过程中本地文件被改动：${fromPath}`);
     }
     const target = this.files.get(toPath);
     if (expectedTargetHash === null && target) {
-      throw new Error(`Local file changed during synchronization: ${toPath}`);
+      throw new Error(`同步过程中本地文件被改动：${toPath}`);
     }
     this.files.delete(fromPath);
     this.files.set(toPath, { bytes: file.bytes, modifiedAt: ++this.clock });
@@ -809,7 +809,7 @@ describe("SyncService", () => {
         objects.onPut = undefined;
         await local.write("article.md", new TextEncoder().encode("typing while saving"));
       };
-      await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("changed");
+      await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("被改动");
       expect(local.readText("article.md")).toBe("typing while saving");
       expect(await remote.readHead()).toEqual(head);
     });
@@ -839,7 +839,7 @@ describe("SyncService", () => {
         objects.onPut = undefined;
         await local.write("article.md", new TextEncoder().encode("typing during publication"));
       };
-      await expect(service.resolveLocalContent("article.md", review.reviewToken, "remote")).rejects.toThrow("changed");
+      await expect(service.resolveLocalContent("article.md", review.reviewToken, "remote")).rejects.toThrow("被改动");
       expect(local.readText("article.md")).toBe("typing during publication");
       const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
       const entry = Object.values(snapshot.entries).find(value => value.path === "article.md");
@@ -1085,7 +1085,7 @@ describe("SyncService", () => {
         objects.onPut = undefined;
         await local.write("article.md", new TextEncoder().encode("typing during upload"));
       };
-      await expect(service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken)).rejects.toThrow("changed");
+      await expect(service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken)).rejects.toThrow("被改动");
       expect(local.readText("article.md")).toBe("typing during upload");
     });
 
@@ -1706,7 +1706,7 @@ describe("SyncService", () => {
     };
 
     await expect(phone.synchronize()).rejects.toThrow(
-      "Local file changed during synchronization: notes/example.md",
+      "同步过程中本地文件被改动：notes/example.md",
     );
 
     expect(phoneVault.readText("notes/example.md")).toBe(
@@ -1873,7 +1873,7 @@ describe("SyncService", () => {
     };
 
     await expect(service.synchronize(entryIds)).rejects.toThrow(
-      "Local file changed during synchronization",
+      "同步过程中本地文件被改动",
     );
 
     expect(local.readText("notes/example.md")).toBe("recreated draft");
@@ -1926,7 +1926,7 @@ describe("SyncService", () => {
     };
 
     await expect(phone.synchronize()).rejects.toThrow(
-      "Local file changed during synchronization: notes/example.md",
+      "同步过程中本地文件被改动：notes/example.md",
     );
 
     expect(phoneVault.readText("notes/example.md")).toBe(
@@ -2975,7 +2975,7 @@ describe("SyncService", () => {
     local.listedSizeOverrides.set("notes/example.md", 100);
 
     await expect(service.synchronize()).rejects.toMatchObject({
-      message: "Local file changed during synchronization: notes/example.md",
+      message: "同步过程中本地文件被改动：notes/example.md",
       path: "notes/example.md",
     });
     expect((await remote.readHead())?.value.generation).toBe(1);
@@ -4192,7 +4192,7 @@ describe("SyncService", () => {
     };
 
     await expect(service.restoreDeleted(entryId)).rejects.toThrow(
-      "Local file changed during synchronization",
+      "同步过程中本地文件被改动",
     );
 
     expect(local.readText("notes/example.md")).toBe("new local draft");
@@ -5049,7 +5049,7 @@ describe("SyncService", () => {
     };
 
     await expect(phone.synchronize()).rejects.toThrow(
-      "Local file changed during synchronization: notes/b.md",
+      "同步过程中本地文件被改动：notes/b.md",
     );
 
     expect(phoneVault.readText("notes/a.md")).toBe("remote");

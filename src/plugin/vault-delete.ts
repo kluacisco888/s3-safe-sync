@@ -47,7 +47,7 @@ export const deleteVaultPath = async <File>(
   const indexed = vault.getAbstractFileByPath(path);
   if (indexed) {
     if (!isFile(indexed)) {
-      throw new Error(`Refusing to delete a folder at file path: ${path}`);
+      throw new Error(`拒绝删除文件路径上的文件夹：${path}`);
     }
     await vault.trash(indexed, false);
   }
@@ -62,25 +62,25 @@ export const deleteVaultPath = async <File>(
   await assertExpectedContent(vault, path, expectedContentHash);
   if (expectedContentHash !== undefined) {
     throw new Error(
-      `Local trash failed; refusing permanent deletion during synchronization: ${path}`,
+      `移到本地回收站失败，同步期间拒绝永久删除：${path}`,
     );
   }
   const remaining = vault.getAbstractFileByPath(path);
   if (remaining) {
     if (!isFile(remaining)) {
-      throw new Error(`Refusing to delete a folder at file path: ${path}`);
+      throw new Error(`拒绝删除文件路径上的文件夹：${path}`);
     }
     await assertExpectedContent(vault, path, expectedContentHash);
     await vault.delete(remaining);
   } else {
     const stat = await vault.adapter.stat(path);
     if (stat?.type !== "file") {
-      throw new Error(`Refusing to remove a non-file path: ${path}`);
+      throw new Error(`拒绝移除不是文件的路径：${path}`);
     }
     await assertExpectedContent(vault, path, expectedContentHash);
     await vault.adapter.remove(path);
   }
   if (await vault.adapter.exists(path)) {
-    throw new Error(`Local Vault path still exists after deletion: ${path}`);
+    throw new Error(`删除后本地仓库路径仍然存在：${path}`);
   }
 };
