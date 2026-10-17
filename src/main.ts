@@ -175,6 +175,8 @@ export default class S3VaultSyncPlugin
   private progressLabel: string | undefined;
   // 已自动弹过同步状态窗口的问题指纹；一次同步成功后清空
   private readonly shownStopFingerprints = new Set<string>();
+  // 当前开着的同步状态窗口
+  private readonly openStatusModals = new Set<StatusModal>();
 
   async onload(): Promise<void> {
     this.session = new SyncSession(this.app.vault);
@@ -305,7 +307,9 @@ export default class S3VaultSyncPlugin
   }
 
   openStatus(): void {
-    new StatusModal(this.app, this).open();
+    const modal: StatusModal = new StatusModal(this.app, this, () => this.openStatusModals.delete(modal));
+    this.openStatusModals.add(modal);
+    modal.open();
   }
 
   openSettings(): void {
@@ -1462,8 +1466,9 @@ export default class S3VaultSyncPlugin
   private openStatusWhenStopped(status: PluginStatus, detail: string): void {
     const fingerprint = this.stopFingerprint(status, detail);
     if (this.shownStopFingerprints.has(fingerprint)) return;
+    // 窗口已开着时问题已经展示给用户，同样记为弹过，不再叠一个新窗口
     this.shownStopFingerprints.add(fingerprint);
-    this.openStatus();
+    if (this.openStatusModals.size === 0) this.openStatus();
   }
 
   // 问题指纹 = 问题种类 + 涉及路径（排序后）或错误信息

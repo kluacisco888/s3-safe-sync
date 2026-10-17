@@ -295,6 +295,8 @@ export class StatusModal extends Modal {
   constructor(
     app: App,
     private readonly controller: StatusModalController,
+    // 窗口关闭时通知插件，用于判断同步状态窗口是否已开着
+    private readonly onClosed?: () => void,
   ) {
     super(app);
   }
@@ -334,6 +336,7 @@ export class StatusModal extends Modal {
     this.stopStatusUpdates = undefined;
     this.pauseButton = undefined;
     this.contentEl.empty();
+    this.onClosed?.();
   }
 
   private renderActions(container: HTMLElement): void {

@@ -1186,4 +1186,30 @@ describe("opening sync status when synchronization stops", () => {
     expect(host.openedModals).toHaveLength(1);
     plugin.onunload();
   });
+
+  it.each([
+    {device: "Android", android: true},
+    {device: "iOS", android: false},
+  ])("applies the same popup rules on $device", async ({android}) => {
+    host.mobile = true;
+    host.android = android;
+    const {plugin, hooks, setLocalPresent} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    await settle(plugin, 29 * 60_000);
+    expect(host.openedModals).toHaveLength(0);
+    await settle(plugin, 2 * 60_000);
+    expect(host.openedModals).toHaveLength(1);
+    host.openedModals[0]!.close();
+    hooks.headFailure = undefined;
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^Idle:/u);
+    setLocalPresent(false);
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^Action required:/u);
+    expect(host.openedModals).toHaveLength(2);
+    await plugin.syncNow();
+    expect(host.openedModals).toHaveLength(2);
+    plugin.onunload();
+  });
 });
