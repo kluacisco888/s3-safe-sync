@@ -220,6 +220,13 @@ export interface ReconcileInput {
   remote: VaultSnapshot;
 }
 
+// 文件类型 = 路径最后一段的扩展名（不区分大小写）；没有扩展名的（含点开头的隐藏文件）算同一类
+function fileType(path: string): string {
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+}
+
 export class SyncEngine {
   constructor(private readonly createId: () => string = () => crypto.randomUUID()) {}
 
@@ -719,32 +726,39 @@ export class SyncEngine {
       }
     }
 
-    const possibleRenameDeletions = remoteChanges.filter(
-      (change) => change.kind === "delete-remote",
-    );
-    const possibleRenameCreations = remoteChanges.filter(
-      (change) => change.kind === "upload-new",
-    );
-    if (
-      !allowIndependentCreatesAndDeletes &&
-      possibleRenameDeletions.length > 0 &&
-      possibleRenameCreations.length > 0
-    ) {
-      conflicts.push({
-        deletedEntries: possibleRenameDeletions.map((change) => ({
-          entryId: change.entryId,
-          path: change.path,
-        })),
-        kind: "possible-rename",
-        newFiles: possibleRenameCreations.map((change) => change.file),
-      });
-      for (let index = remoteChanges.length - 1; index >= 0; index -= 1) {
-        const change = remoteChanges[index];
-        if (
-          change?.kind === "delete-remote" ||
-          change?.kind === "upload-new"
-        ) {
-          remoteChanges.splice(index, 1);
+    // 只扣住「有同类型新文件的消失 Entry」和与它们同类型的新文件，其余删除与上传照常进行
+    const heldDeletionEntryIds: string[] = [];
+    if (!allowIndependentCreatesAndDeletes) {
+      const creationTypes = new Set(
+        remoteChanges.flatMap((change) =>
+          change.kind === "upload-new" ? [fileType(change.path)] : [],
+        ),
+      );
+      const heldDeletions = remoteChanges.filter(
+        (change): change is DeleteRemoteChange =>
+          change.kind === "delete-remote" && creationTypes.has(fileType(change.path)),
+      );
+      const heldTypes = new Set(heldDeletions.map((change) => fileType(change.path)));
+      const heldCreations = remoteChanges.filter(
+        (change): change is UploadNewChange =>
+          change.kind === "upload-new" && heldTypes.has(fileType(change.path)),
+      );
+      if (heldDeletions.length > 0) {
+        conflicts.push({
+          deletedEntries: heldDeletions.map((change) => ({
+            entryId: change.entryId,
+            path: change.path,
+          })),
+          kind: "possible-rename",
+          newFiles: heldCreations.map((change) => change.file),
+        });
+        heldDeletionEntryIds.push(...heldDeletions.map((change) => change.entryId));
+        const held = new Set<RemoteChange>([...heldDeletions, ...heldCreations]);
+        for (let index = remoteChanges.length - 1; index >= 0; index -= 1) {
+          const change = remoteChanges[index];
+          if (change && held.has(change)) {
+            remoteChanges.splice(index, 1);
+          }
         }
       }
     }
@@ -793,9 +807,13 @@ export class SyncEngine {
     const totalLiveEntries = Object.values(base?.entries ?? {}).filter(
       (entry) => entry.kind === "live",
     ).length;
-    const deletionEntryIds = remoteChanges.flatMap((change) =>
-      change.kind === "delete-remote" ? [change.entryId] : [],
-    );
+    // 被扣住的消失 Entry 按最坏情况计入删除数，防止拆批绕过 Bulk Deletion 门槛
+    const deletionEntryIds = [
+      ...remoteChanges.flatMap((change) =>
+        change.kind === "delete-remote" ? [change.entryId] : [],
+      ),
+      ...heldDeletionEntryIds,
+    ];
     const deletionCount = deletionEntryIds.length;
     const isBulkDeletion =
       deletionCount > 100 ||
