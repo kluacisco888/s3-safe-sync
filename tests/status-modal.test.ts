@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { App } from "obsidian";
 
-const { Element, opened } = vi.hoisted(() => {
+const { Element, opened, dropdowns } = vi.hoisted(() => {
   class Element {
     children: Element[] = [];
     text = "";
@@ -23,7 +23,8 @@ const { Element, opened } = vi.hoisted(() => {
     createDiv(options: {text?: string} = {}) { return this.createEl("div", options); }
     createSpan(options: {text?: string} = {}) { return this.createEl("span", options); }
   }
-  return { Element, opened: [] as Array<{contentEl: Element}> };
+  return { Element, opened: [] as Array<{contentEl: Element}>,
+    dropdowns: [] as Array<{options: Array<[string, string]>; value: string; change?: (value: string) => void}> };
 });
 
 vi.mock("obsidian", () => ({
@@ -40,7 +41,13 @@ vi.mock("obsidian", () => ({
     setName() { return this; }
     setDesc() { return this; }
     addDropdown(callback: (dropdown: unknown) => void) {
-      callback({addOption() { return this; }, setValue() { return this; }, onChange() { return this; }});
+      const record: (typeof dropdowns)[number] = {options: [], value: ""};
+      dropdowns.push(record);
+      callback({
+        addOption(value: string, label: string) { record.options.push([value, label]); return this; },
+        setValue(value: string) { record.value = value; return this; },
+        onChange(change: (value: string) => void) { record.change = change; return this; },
+      });
       return this;
     }
   },
@@ -526,5 +533,61 @@ describe("StatusModal", () => {
     expect(resolvePossibleRename).toHaveBeenCalledWith({kind: "moves", reviewToken: "review-1",
       pairs: [{fromPath: "before/a.md", toPath: "after/a.md"}, {fromPath: "before/b.md", toPath: "after/b.md"}]});
     await vi.waitFor(() => expect(resolvePossibleRename).toHaveResolved());
+  });
+
+  describe("partial move review", () => {
+    type FakeElement = InstanceType<typeof Element>;
+    const all = (root: FakeElement): FakeElement[] => [root, ...root.children.flatMap(all)];
+    const openReview = (oldPaths: string[], newPaths: string[]) => {
+      const issue = {kind: "possible-rename" as const, oldPaths, newPaths, reviewToken: "review-2"};
+      const resolvePossibleRename = vi.fn(async () => {});
+      const controller: StatusModalController = {...issueController([issue]), resolvePossibleRename};
+      const modal = new StatusModal({} as App, controller);
+      modal.onOpen();
+      dropdowns.length = 0;
+      all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Review and resolve")!.events.get("click")!();
+      const review = opened.at(-1)!;
+      const confirm = all(review.contentEl).find(node => node.text === "Confirm moves")!;
+      return {review, confirm, resolvePossibleRename};
+    };
+
+    it("lists only same-type candidates and preselects the unique same-name or only candidate", async () => {
+      const {confirm, resolvePossibleRename} = openReview(
+        ["old/report.pdf", "old/plan.pdf", "old/memo.md"],
+        ["new/report.pdf", "new/a.pdf", "new/b.pdf", "new/memo v2.md"],
+      );
+      const [report, plan, memo] = dropdowns;
+      expect(plan!.options).toEqual([["", "Treat as deleted"], ["new/report.pdf", "report.pdf"],
+        ["new/a.pdf", "a.pdf"], ["new/b.pdf", "b.pdf"]]);
+      expect(memo!.options).toEqual([["", "Treat as deleted"], ["new/memo v2.md", "memo v2.md"]]);
+      expect(report!.value).toBe("new/report.pdf");
+      expect(plan!.value).toBe("");
+      expect(memo!.value).toBe("new/memo v2.md");
+      expect(confirm.disabled).toBe(false);
+      confirm.events.get("click")!();
+      expect(resolvePossibleRename).toHaveBeenCalledWith({kind: "moves", reviewToken: "review-2",
+        pairs: [{fromPath: "old/report.pdf", toPath: "new/report.pdf"}, {fromPath: "old/memo.md", toPath: "new/memo v2.md"}]});
+      await vi.waitFor(() => expect(resolvePossibleRename).toHaveResolved());
+    });
+
+    it("keeps confirm available for one missing file with three candidates", () => {
+      const {confirm} = openReview(["old/report.pdf"], ["new/a.pdf", "new/b.pdf", "new/c.pdf"]);
+      expect(dropdowns[0]!.value).toBe("");
+      expect(confirm.disabled).toBe(false);
+    });
+
+    it("blocks confirmation while two missing files choose the same new file", () => {
+      const {review, confirm, resolvePossibleRename} = openReview(["old/a.pdf", "old/b.pdf"], ["new/x.pdf", "new/y.pdf"]);
+      dropdowns[0]!.change!("new/x.pdf");
+      dropdowns[1]!.change!("new/x.pdf");
+      expect(confirm.disabled).toBe(true);
+      expect(all(review.contentEl).some(node => node.text === "Two missing files cannot move to the same new file.")).toBe(true);
+      dropdowns[1]!.change!("new/y.pdf");
+      expect(confirm.disabled).toBe(false);
+      expect(all(review.contentEl).some(node => node.text === "Two missing files cannot move to the same new file.")).toBe(false);
+      confirm.events.get("click")!();
+      expect(resolvePossibleRename).toHaveBeenCalledWith({kind: "moves", reviewToken: "review-2",
+        pairs: [{fromPath: "old/a.pdf", toPath: "new/x.pdf"}, {fromPath: "old/b.pdf", toPath: "new/y.pdf"}]});
+    });
   });
 });

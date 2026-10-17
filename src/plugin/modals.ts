@@ -7,6 +7,7 @@ import type {
   LiveEntry,
   RevisionRef,
 } from "../sync/sync-engine";
+import { fileType } from "../sync/sync-engine";
 import type {
   DeferredDownloadEntry,
   LocalSyncIssue,
@@ -85,7 +86,7 @@ const localIssueHelp = (issue: LocalSyncIssue): string => {
     case "unsupported-path": return "This filename cannot be created on this device. Copy the path and rename the file on a compatible desktop, then sync both devices. The original remains on the remote; changing the cache cannot fix a filesystem filename restriction.";
     case "unsynced-local": return "This local file exceeds this device's automatic limit and has not been uploaded. Open it to inspect it. Connect to Wi-Fi if it is an attachment below the mobile limit, or copy it to a desktop and sync there. Split or reduce large files before syncing on mobile.";
     case "import-candidate": return "This local file has no remote identity. Upload as new file sends it to S3 after checking that its path is still available. If it was moved from another folder, first check whether the old remote path is the same note; importing does not reconnect its old identity.";
-    case "possible-rename": return "Review and resolve lets you confirm one-to-one moves or explicitly choose separate deletions and additions. Every decision is checked again before publishing.";
+    case "possible-rename": return "Review and resolve lets you choose, for each missing file, the new file it moved to or treat it as deleted; new files that are not chosen are uploaded as new files. Every decision is checked again before publishing.";
   }
 };
 
@@ -125,40 +126,45 @@ class RenameReviewModal extends Modal {
     this.contentEl.addClass("s3-vault-sync-rename-review");
     this.contentEl.createEl("h2", { text: "Review missing and new files" });
     this.contentEl.createEl("p", { text:
-      "If these are the same files moved or renamed, select each matching new path and confirm the moves. " +
-      "Their existing history will be kept, and content changes will be reconciled normally.",
+      "For each missing file, choose the new file it moved to, or treat it as deleted. " +
+      "Moved files keep their existing history; new files that are not chosen are uploaded as new files.",
     });
     const oldFolder = commonFolder(this.issue.oldPaths);
     const newFolder = commonFolder(this.issue.newPaths);
     this.contentEl.createDiv({ cls: "s3-vault-sync-selectable-path", text:
       `${oldFolder || "Vault root"} → ${newFolder || "Vault root"}`,
     });
+    // 每个消失路径对应的选择；空字符串表示「按删除处理」
     const pairs = new Map<string, string>();
     const details = this.contentEl.createEl("details");
     details.open = this.issue.oldPaths.length <= 5;
     details.createEl("summary", { text: `Review ${this.issue.oldPaths.length} path mappings` });
     let updateButton = (): void => {};
+    const baseName = (path: string): string => path.slice(path.lastIndexOf("/") + 1).normalize("NFC");
     for (const fromPath of this.issue.oldPaths) {
-      const proposed = this.issue.oldPaths.length === 1 && this.issue.newPaths.length === 1
-        ? this.issue.newPaths[0]!
-        : `${newFolder}${fromPath.slice(oldFolder.length)}`;
-      const initial = this.issue.newPaths.includes(proposed) ? proposed : "";
+      // 只列同类型的被扣住新文件；默认：唯一同名候选 → 唯一候选 → 按删除处理
+      const candidates = this.issue.newPaths.filter(toPath => fileType(toPath) === fileType(fromPath));
+      const sameName = candidates.filter(toPath => baseName(toPath) === baseName(fromPath));
+      const initial = sameName.length === 1 ? sameName[0]! : candidates.length === 1 ? candidates[0]! : "";
       pairs.set(fromPath, initial);
       new Setting(details)
         .setName(fromPath.slice(oldFolder.length))
         .setDesc(fromPath)
         .addDropdown(dropdown => {
-          dropdown.addOption("", "Choose the matching new path");
-          for (const toPath of this.issue.newPaths) dropdown.addOption(toPath, toPath.slice(newFolder.length));
+          dropdown.addOption("", "Treat as deleted");
+          for (const toPath of candidates) dropdown.addOption(toPath, toPath.slice(newFolder.length));
           dropdown.setValue(initial).onChange(value => { pairs.set(fromPath, value); updateButton(); });
         });
     }
     const message = this.contentEl.createEl("p");
+    const duplicateNotice = this.contentEl.createEl("p");
     const actions = this.contentEl.createDiv({ cls: "s3-vault-sync-toolbar" });
     const confirmMoves = actions.createEl("button", { text: "Confirm moves", cls: "mod-cta" });
     updateButton = () => {
-      confirmMoves.disabled = pairs.size !== this.issue.newPaths.length ||
-        [...pairs.values()].some(value => !value) || new Set(pairs.values()).size !== pairs.size;
+      const chosen = [...pairs.values()].filter(Boolean);
+      const duplicated = new Set(chosen).size !== chosen.length;
+      confirmMoves.disabled = duplicated;
+      duplicateNotice.setText(duplicated ? "Two missing files cannot move to the same new file." : "");
     };
     updateButton();
     this.contentEl.createEl("p", { text:
@@ -185,7 +191,7 @@ class RenameReviewModal extends Modal {
     };
     confirmMoves.addEventListener("click", () => { void run({
       kind: "moves", reviewToken: this.issue.reviewToken,
-      pairs: [...pairs].map(([fromPath, toPath]) => ({ fromPath, toPath })),
+      pairs: [...pairs].filter(([, toPath]) => toPath).map(([fromPath, toPath]) => ({ fromPath, toPath })),
     }); });
     separate.addEventListener("click", () => { void run({ kind: "separate", reviewToken: this.issue.reviewToken }); });
     actions.createEl("button", { text: "Cancel" }).addEventListener("click", () => this.close());
