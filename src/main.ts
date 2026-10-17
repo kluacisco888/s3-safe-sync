@@ -778,6 +778,7 @@ export default class S3VaultSyncPlugin
       this.setStatus(needsRenameReview ? "Action required" : "Idle", needsRenameReview
         ? "已解锁。请打开同步状态审查中断的改名。"
         : "加密的远端存储已就绪。");
+      if (needsRenameReview) this.openStatusWhenStopped(this.actionFingerprint());
       new Notice(needsRenameReview ? "仓库已解锁。审查完中断的改名后即可继续同步。" : "S3 Vault Sync 已就绪");
     } catch (error) {
       await this.rememberIntegrityFailure(error, integrityTarget);
@@ -1177,6 +1178,7 @@ export default class S3VaultSyncPlugin
             ? "请审查并确认这次批量删除。"
             : "请打开同步状态，查看需要处理的项目。",
         );
+        this.openStatusWhenStopped(this.actionFingerprint());
       } else {
         this.pendingBulkDeletion = undefined;
         // 同步成功一次后清空弹窗记录，同一问题再出现时会再弹
@@ -1217,9 +1219,13 @@ export default class S3VaultSyncPlugin
       } else {
         diagnostic.outcome = "error";
         await this.rememberIntegrityFailure(error, integrityTarget);
+        this.showError(error);
         // 网络类可重试错误未连续满 30 分钟时，只显示状态栏和通知，不自动弹窗
-        this.showError(error, retryableNetwork &&
-          Date.now() - (this.networkFailureSince ?? Date.now()) < NETWORK_FAILURE_POPUP_DELAY_MS);
+        if (!retryableNetwork ||
+          Date.now() - (this.networkFailureSince ?? Date.now()) >= NETWORK_FAILURE_POPUP_DELAY_MS) {
+          this.openStatusWhenStopped(this.repairFingerprint() ??
+            `error:${error instanceof Error ? error.message : String(error)}`);
+        }
       }
     } finally {
       diagnostic.nextRetryAt = this.networkRetryAt ?? this.headRetryAt;
@@ -1444,7 +1450,6 @@ export default class S3VaultSyncPlugin
     status: PluginStatus,
     detail: string,
     progressLabel?: string,
-    holdErrorPopup = false,
   ): void {
     const integrityChecks = this.data ? this.currentIntegrityChecks() : [];
     if (integrityChecks.length && status !== "Checking" && status !== "Syncing") {
@@ -1468,42 +1473,44 @@ export default class S3VaultSyncPlugin
       status === "Action required" || status === "Error",
     );
     this.emitStatus();
-    if (status === "Action required" || (status === "Error" && !holdErrorPopup)) {
-      this.openStatusWhenStopped(status, detail);
-    }
   }
 
-  // 停住就弹窗：状态进入「需要处理」或「出错」时自动打开同步状态窗口；同一问题指纹只弹一次
-  private openStatusWhenStopped(status: PluginStatus, detail: string): void {
-    const fingerprint = this.stopFingerprint(status, detail);
-    if (this.shownStopFingerprints.has(fingerprint)) return;
+  // 停住就弹窗：只在一次同步运行结束后、或解锁时发现中断的改名时调用；同一问题指纹只弹一次
+  private openStatusWhenStopped(fingerprint: string | undefined): void {
+    if (fingerprint === undefined || this.shownStopFingerprints.has(fingerprint)) return;
     // 窗口已开着时问题已经展示给用户，同样记为弹过，不再叠一个新窗口
     this.shownStopFingerprints.add(fingerprint);
     if (this.openStatusModals.size === 0) this.openStatus();
   }
 
-  // 问题指纹 = 问题种类 + 涉及路径（排序后）或错误信息
-  private stopFingerprint(status: PluginStatus, detail: string): string {
+  // 修复模式的问题指纹；没有待完成的校验时返回 undefined
+  private repairFingerprint(): string | undefined {
     const integrityChecks = this.data ? this.currentIntegrityChecks() : [];
-    if (integrityChecks.length) {
-      return `repair:${integrityChecks.map(issue => JSON.stringify(issue.check)).sort().join("\n")}`;
-    }
-    if (status === "Error") return `error:${detail}`;
+    return integrityChecks.length
+      ? `repair:${integrityChecks.map(issue => JSON.stringify(issue.check)).sort().join("\n")}`
+      : undefined;
+  }
+
+  // 需要用户做决定的问题指纹 = 问题种类 + 涉及路径（排序后）；
+  // 纯信息类问题（未同步的本地文件、暂缓的本地编辑、不支持的路径）不计入，只有它们时返回 undefined
+  private actionFingerprint(): string | undefined {
+    const repair = this.repairFingerprint();
+    if (repair) return repair;
     const items = [
-      ...this.pendingLocalIssues.map(issue => {
+      ...this.pendingLocalIssues.flatMap(issue => {
+        if (issue.kind === "unsynced-local" || issue.kind === "deferred-local-edit" ||
+          issue.kind === "unsupported-path") return [];
         const paths = issue.kind === "path-collision" ? issue.paths
           : issue.kind === "possible-rename" ? [...issue.oldPaths, ...issue.newPaths]
           : [issue.path];
-        return `${issue.kind}:${[...paths].sort().join("|")}`;
+        return [`${issue.kind}:${[...paths].sort().join("|")}`];
       }),
       ...this.getConflicts().map(entry => `conflict:${entry.path}`),
-      ...this.pendingDeferredDownloads.flatMap(entry =>
-        entry.reason === "unsupported-path" ? [`unsupported-path:${entry.path}`] : []),
       ...(this.pendingBulkDeletion ? [`bulk-deletion:${[...this.pendingBulkDeletion.entryIds].sort().join("|")}`] : []),
       ...(this.data?.pendingCollisionRename
         ? [`collision-rename:${this.data.pendingCollisionRename.from}|${this.data.pendingCollisionRename.to}`] : []),
     ].sort();
-    return items.length ? `action:${items.join("\n")}` : `action:${detail}`;
+    return items.length ? `action:${items.join("\n")}` : undefined;
   }
 
   private emitStatus(): void {
@@ -1530,7 +1537,7 @@ export default class S3VaultSyncPlugin
     this.setStatus("Syncing", formatted.detail, formatted.label);
   }
 
-  private showError(error: unknown, holdErrorPopup = false): void {
+  private showError(error: unknown): void {
     if (this.session.signal.aborted || error instanceof SyncStoppedError) return;
     const message = error instanceof Error ? error.message : "未知的同步错误";
     this.setStatus(
@@ -1540,8 +1547,6 @@ export default class S3VaultSyncPlugin
       error instanceof RepairModeError || error instanceof RemoteStateError
         ? `修复模式：${message}`
         : message,
-      undefined,
-      holdErrorPopup,
     );
     const notice = new Notice(`S3 Vault Sync：${message}`, 12_000);
     notice.messageEl.createEl("button", {text: "打开同步状态", cls: "s3-vault-sync-notice-action"}).addEventListener("click", event => {

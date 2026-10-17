@@ -80,6 +80,7 @@ import type { ObsidianRequestExecutor } from "../src/storage/obsidian-request-ad
 import { RemoteStore } from "../src/storage/remote-store";
 import { ObsidianVaultPort } from "../src/plugin/obsidian-vault-port";
 import { withVaultMutationLock } from "../src/plugin/safe-vault-write";
+import { SyncService, type LocalSyncIssue } from "../src/sync/sync-service";
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -1148,6 +1149,56 @@ describe("opening sync status when synchronization stops", () => {
     host.openedModals[0]!.close();
     await plugin.syncNow();
     expect(host.openedModals).toHaveLength(1);
+    plugin.onunload();
+  });
+
+  it("does not open sync status for settings validation or unlock errors", async () => {
+    const {plugin} = await setup();
+    await expect(plugin.saveAwsCredentials({accessKeyId: "test-key", secretAccessKey: ""})).rejects.toThrow();
+    await expect(plugin.initializeOrUnlock("")).rejects.toThrow();
+    expect(plugin.getStatusText()).toMatch(/^出错：/u);
+    expect(host.notices).toHaveLength(2);
+    expect(host.openedModals).toHaveLength(0);
+    plugin.onunload();
+  });
+
+  const stubSyncResult = (localIssues: LocalSyncIssue[]) =>
+    vi.spyOn(SyncService.prototype, "synchronize").mockResolvedValue({
+      cacheUpdated: false, deferredDownloadEntries: [], deferredDownloads: 0, deleted: 0, downloaded: 0,
+      localIssues, status: "action-required", unsyncedLocalEntries: 0, uploaded: 0,
+    });
+
+  it("does not open sync status when a sync only reports unsynced local files", async () => {
+    const {plugin} = await setup();
+    const synchronize = stubSyncResult([{kind: "unsynced-local", path: "notes/example.md"}]);
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
+    expect(host.openedModals).toHaveLength(0);
+    synchronize.mockRestore();
+    plugin.onunload();
+  });
+
+  it("opens sync status once for a possible rename review", async () => {
+    const {plugin} = await setup();
+    const synchronize = stubSyncResult([
+      {kind: "possible-rename", oldPaths: ["notes/example.md"], newPaths: ["notes/moved.md"], reviewToken: "token-1"},
+      {kind: "unsynced-local", path: "notes/other.md"},
+    ]);
+    await plugin.togglePause();
+    expect(host.openedModals).toHaveLength(1);
+    host.openedModals[0]!.close();
+    synchronize.mockResolvedValue({
+      cacheUpdated: false, deferredDownloadEntries: [], deferredDownloads: 0, deleted: 0, downloaded: 0,
+      localIssues: [
+        {kind: "possible-rename", oldPaths: ["notes/example.md"], newPaths: ["notes/moved.md"], reviewToken: "token-1"},
+        {kind: "unsynced-local", path: "notes/third.md"},
+      ],
+      status: "action-required", unsyncedLocalEntries: 0, uploaded: 0,
+    });
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
+    expect(host.openedModals).toHaveLength(1);
+    synchronize.mockRestore();
     plugin.onunload();
   });
 

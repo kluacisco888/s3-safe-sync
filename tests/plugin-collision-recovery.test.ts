@@ -183,7 +183,9 @@ describe("plugin collision recovery persistence", () => {
     const secrets = new Map([["s3-vault-sync-access-key-id", "fixture-access"], ["s3-vault-sync-secret-access-key", "fixture-secret"]]);
     const files = new Map([["target.md", "changed"]]);
     const plugin = await start(files, secrets);
+    const openStatus = vi.spyOn(plugin, "openStatus").mockImplementation(() => {});
     await plugin.initializeOrUnlock(password);
+    expect(openStatus).toHaveBeenCalledOnce();
     expect(secrets.has("s3-vault-sync-vault-key")).toBe(true);
     expect(host.stored.pendingCollisionRename).toBeDefined();
     expect(host.stored.pendingProbes).toEqual(pendingProbes);
