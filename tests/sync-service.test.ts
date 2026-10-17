@@ -5587,6 +5587,42 @@ describe("SyncService", () => {
       expect((await remote.readHead())!.value.commitId).toBe(before);
     });
 
+    it("keeps another Replica's edit of a held Entry and the local moved file without publishing a deletion", async () => {
+      const {remote, local, cache, service} = await setupVault({"plan.pdf": "plan v1", ...notesVault(5)});
+      const pdfEntryId = cache.state!.files["plan.pdf"]!.entryId;
+      await local.delete("plan.pdf");
+      await local.write("archive/plan v2.pdf", encode("plan v2"));
+      const first = await service.synchronize();
+      expect(first.localIssues.some(issue => issue.kind === "possible-rename")).toBe(true);
+      const phoneFiles = new MemoryVault();
+      const phone = new SyncService({cache: new MemorySyncCache(), local: phoneFiles, remote, replicaId: "phone"});
+      await phone.synchronize();
+      await phoneFiles.write("plan.pdf", encode("plan v1 edited on phone"));
+      await phone.synchronize();
+      const phoneHash = await sha256Content(encode("plan v1 edited on phone"));
+
+      // 实际结果：被扣住的 Entry 在远端被改后，本机下一次同步把它当作 delete-edit 冲突发布到冲突中心，
+      // 新位置的文件作为新文件上传；两份内容都在，不发布删除
+      const second = await service.synchronize();
+      expect(second.status).toBe("action-required");
+      expect(second.localIssues).toEqual([]);
+      for (let round = 0; round < 2; round += 1) await service.synchronize();
+      await phone.synchronize();
+
+      const entries = await entriesById(remote);
+      expect(entries[pdfEntryId]).toMatchObject({kind: "conflicted", path: "plan.pdf", reason: "delete-edit"});
+      const conflicted = entries[pdfEntryId];
+      if (conflicted?.kind !== "conflicted") throw new Error("Expected conflicted Entry");
+      expect(conflicted.candidates.map(candidate => candidate.contentHash)).toContain(phoneHash);
+      expect(Object.values(entries).filter(entry => entry.kind === "deleted")).toEqual([]);
+      const moved = (await liveByPath(remote)).get("archive/plan v2.pdf");
+      expect(moved?.entryId).toBeDefined();
+      expect(moved!.entryId).not.toBe(pdfEntryId);
+      expect(local.readText("archive/plan v2.pdf")).toBe("plan v2");
+      expect(phoneFiles.readText("plan.pdf")).toBe("plan v1 edited on phone");
+      expect(phoneFiles.readText("archive/plan v2.pdf")).toBe("plan v2");
+    });
+
     it("counts held missing Entries toward the bulk deletion threshold", async () => {
       const {remote, local, cache, service} = await setupVault({"drawing.pdf": "drawing", ...notesVault(10)});
       const pdfEntryId = cache.state!.files["drawing.pdf"]!.entryId;
