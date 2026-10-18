@@ -6793,6 +6793,8 @@ describe("cleaning expired content out of the remote record", () => {
     const preview = await fixture.desktop.previewExpiredContentCleanup("vault");
 
     expect(preview).toEqual({
+      // 数据块部分由「deleting unreferenced blobs」一组测试覆盖
+      blobs: expect.any(Object),
       missingExpiry: [{ kind: "recovery", path: "missing-recovery.md" }, { kind: "history", path: "missing.md" }],
       removedHistory: 2,
       // 按删除时间排序

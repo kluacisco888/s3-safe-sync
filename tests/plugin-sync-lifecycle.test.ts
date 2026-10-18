@@ -86,6 +86,8 @@ import { withVaultMutationLock } from "../src/plugin/safe-vault-write";
 import { SyncService, type LocalSyncIssue } from "../src/sync/sync-service";
 
 const cleanups: Array<() => Promise<void>> = [];
+// 数据块名和真实仓库一样是 UUID
+const ORIGINAL_BLOB_ID = "5f0c2b1a-8e3d-4c7f-9a6b-1d2e3f4a5b6c";
 
 const setup = async (initialized = true, configDir = ".obsidian", initialFile = {path: "notes/example.md", text: "Original article."}, loopback = false) => {
   vi.useFakeTimers();
@@ -98,7 +100,8 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
   host.beforeLoad = undefined;
   host.registrationCount = 0;
   host.domEvents.clear();
-  const objects = new Map<string, { body: Uint8Array; etag: string }>();
+  // lastModified：写入时的（假）时间，列表和读取都按它报 LastModified
+  const objects = new Map<string, { body: Uint8Array; etag: string; lastModified?: number }>();
   const diagnosticFiles = new Map<string, string>();
   let sequence = 0;
   const hooks: {
@@ -118,10 +121,12 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
     let status = 200;
     let body: Uint8Array = new Uint8Array();
     let etag: string | undefined;
+    let lastModified: number | undefined;
     if (request.method === "GET" && url.searchParams.has("list-type")) {
       const prefix = url.searchParams.get("prefix") ?? "";
       body = new TextEncoder().encode(`<ListBucketResult><IsTruncated>false</IsTruncated>${
-        [...objects.keys()].filter(k => k.startsWith(prefix)).map(k => `<Contents><Key>${k}</Key></Contents>`).join("")
+        [...objects].filter(([k]) => k.startsWith(prefix)).map(([k, v]) => `<Contents><Key>${k}</Key><LastModified>${
+          new Date(v.lastModified ?? Date.now()).toISOString()}</LastModified><Size>${v.body.byteLength}</Size></Contents>`).join("")
       }</ListBucketResult>`);
     } else if (request.method === "GET") {
       if (key.includes("/blobs/")) hooks.beforeBlobRead?.();
@@ -129,6 +134,7 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
       status = stored ? 200 : 404;
       body = stored?.body ?? body;
       etag = stored?.etag;
+      lastModified = stored?.lastModified;
       if (key.endsWith("/head") && hooks.headFailure) {
         status = hooks.headFailure === "network" ? 503 : hooks.headFailure === "forbidden" ? 403 : 200;
         body = new TextEncoder().encode("invalid remote response");
@@ -143,7 +149,7 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
         status = 412;
       } else {
         etag = `"etag-${++sequence}"`;
-        objects.set(key, { body: new Uint8Array(request.body ?? new ArrayBuffer(0)), etag });
+        objects.set(key, { body: new Uint8Array(request.body ?? new ArrayBuffer(0)), etag, lastModified: Date.now() });
       }
     } else if (request.method === "DELETE") {
       objects.delete(key);
@@ -155,7 +161,7 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
     if (request.method === "PUT" && key.endsWith("/head") && status === 200) hooks.afterHeadPut?.();
     return {
       arrayBuffer: body.slice().buffer,
-      headers: { date: new Date().toUTCString(), "last-modified": new Date().toUTCString(), ...(etag ? { etag } : {}) },
+      headers: { date: new Date().toUTCString(), "last-modified": new Date(lastModified ?? Date.now()).toUTCString(), ...(etag ? { etag } : {}) },
       status,
     };
   });
@@ -229,11 +235,11 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
     prefix: "test-prefix", vaultKey,
   });
   const initialBytes = new TextEncoder().encode(initialFile.text);
-  await remote.writeBlob("original-blob", initialBytes);
+  await remote.writeBlob(ORIGINAL_BLOB_ID, initialBytes);
   const entry = {
     entryId: "entry-1", kind: "live" as const, path: initialFile.path,
     revision: {
-      blobId: "original-blob", contentHash: "", createdAt: new Date().toUTCString(),
+      blobId: ORIGINAL_BLOB_ID, contentHash: "", createdAt: new Date().toUTCString(),
       revisionId: "revision-1", size: initialBytes.byteLength,
     },
   };
