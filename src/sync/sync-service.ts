@@ -1560,28 +1560,41 @@ export class SyncService {
       lastDownloadSave = Date.now();
       await this.options.cache.save(structuredClone(downloadProgress));
     };
+    // 上一次接受的状态里每个路径的拥有者和每个 Entry 的本地记录；每个 Entry 在一次计划里至多下载一次
+    let acceptedOwnersByCanonicalPath: Map<string, string[]> | undefined;
+    let acceptedPathsByEntryId: Map<string, string[]> | undefined;
     const recordMaterializedDownload = async (entryId: string, path: string, revision: RevisionRef): Promise<void> => {
       const entry = remote.entries[entryId];
       // 只记落在远端当前路径、且不牵涉改名记录的下载；挪动和改名仍由最后的重建与既有恢复规则处理
       if (entry?.kind !== "live" || entry.path !== path || entry.revision.revisionId !== revision.revisionId ||
         pendingRenameEntryIds.has(entryId) || pendingRenamePaths.has(path)) return;
+      if (!acceptedOwnersByCanonicalPath || !acceptedPathsByEntryId) {
+        acceptedOwnersByCanonicalPath = new Map();
+        acceptedPathsByEntryId = new Map();
+        for (const accepted of Object.values(cached?.snapshot.entries ?? {})) {
+          if (accepted.kind === "deleted") continue;
+          const key = canonicalVaultPath(accepted.path);
+          acceptedOwnersByCanonicalPath.set(key, [...(acceptedOwnersByCanonicalPath.get(key) ?? []), accepted.entryId]);
+        }
+        for (const file of Object.values(cached?.files ?? {})) {
+          acceptedPathsByEntryId.set(file.entryId, [...(acceptedPathsByEntryId.get(file.entryId) ?? []), file.path]);
+        }
+      }
+      if ((acceptedOwnersByCanonicalPath.get(canonicalVaultPath(path)) ?? []).some(id => id !== entryId)) return;
       const progress = downloadProgress ??= cached ? structuredClone(cached) : {
         bootstrapPending: true,
         files: {},
         snapshot: {commitId: remote.commitId, entries: {}, protocolVersion: 1, vaultId: remote.vaultId},
         unmaterializedEntryIds: [],
       };
-      const canonical = canonicalVaultPath(path);
       const owner = progress.files[path];
       if (owner && owner.entryId !== entryId) return;
-      if (Object.values(progress.snapshot.entries).some(other => other.entryId !== entryId &&
-        other.kind !== "deleted" && canonicalVaultPath(other.path) === canonical)) return;
       // 同一 Entry 在别的路径还有记录时，只有那个路径本次已经挪走或删掉才能改记到新路径
-      const elsewhere = Object.values(progress.files).filter(file => file.entryId === entryId && file.path !== path);
-      if (elsewhere.some(file => !retiredLocalPaths.has(file.path))) return;
+      const elsewhere = (acceptedPathsByEntryId.get(entryId) ?? []).filter(other => other !== path);
+      if (elsewhere.some(other => !retiredLocalPaths.has(other))) return;
       const file = await this.verifiedMaterializedFile(path, revision);
       if (!file) return;
-      for (const stale of elsewhere) delete progress.files[stale.path];
+      for (const stale of elsewhere) delete progress.files[stale];
       progress.files[path] = {...file, contentHash: revision.contentHash, entryId};
       progress.snapshot.entries[entryId] = entry;
       progress.unmaterializedEntryIds = progress.unmaterializedEntryIds?.filter(id => id !== entryId);
