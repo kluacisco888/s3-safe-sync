@@ -6996,6 +6996,127 @@ describe("cleaning expired content out of the remote record", () => {
     // 本机旧内容交给安全写入挪进本机回收站
     expect(write).toHaveBeenCalledWith("note.md", expect.any(Uint8Array), await sha256Content(text("v0")));
   });
+
+  // 三台设备都在 v0；电脑改成 v1，40 天后清理提交去掉 v0；电脑另改一篇无关笔记；
+  // 手机删除这篇得到 delete-edit 冲突，再选「保留删除」：得到一条不满 30 天、没有恢复副本的删除记录
+  const keptDeletionAfterPurgedBase = async () => {
+    const fixture = await setup({ "note.md": "v0" });
+    const tabletVault = new MemoryVault();
+    const tablet = new SyncService({
+      cache: new MemorySyncCache(), local: tabletVault, remote: await fixture.open(), replicaId: "tablet",
+    });
+    await tablet.synchronize();
+    fixture.objects.serverDate = at(1);
+    await fixture.desktopVault.write("note.md", text("v1"));
+    await fixture.desktop.synchronize();
+    fixture.objects.serverDate = at(40);
+    await expect(fixture.desktop.cleanupExpiredContent("vault")).resolves.toMatchObject({ kind: "committed", removedHistory: 1 });
+    await fixture.desktopVault.write("a.md", text("desktop a1"));
+    await expect(fixture.desktop.synchronize()).resolves.toMatchObject({ status: "complete", uploaded: 1 });
+    await fixture.phoneVault.delete("note.md");
+    await expect(fixture.phone.synchronize()).resolves.toMatchObject({ status: "action-required" });
+    const conflicted = await entryAt(fixture.observer, "note.md");
+    expect(conflicted).toMatchObject({ kind: "conflicted", reason: "delete-edit" });
+    await fixture.phone.resolveConflict(conflicted.entryId, { kind: "keep-deleted" });
+    const kept = await entryAt(fixture.observer, "note.md");
+    expect(kept).toMatchObject({ kind: "deleted", lastContentHash: await sha256Content(text("v0")) });
+    expect((kept as DeletedEntry).recovery).toBeUndefined();
+    fixture.objects.serverDate = at(41);
+    return { ...fixture, tablet, tabletVault };
+  };
+
+  it("deletes an unchanged copy on a third device when the kept Deletion Record has no Recovery Copy because its base was cleaned", async () => {
+    const fixture = await keptDeletionAfterPurgedBase();
+    const remove = vi.spyOn(fixture.tabletVault, "delete");
+
+    const result = await fixture.tablet.synchronize();
+
+    expect(result).toMatchObject({ deleted: 1, downloaded: 1, status: "complete" });
+    // 本机旧内容交给本机删除，带上被删内容的哈希，由它挪进本地回收站
+    expect(remove).toHaveBeenCalledWith("note.md", await sha256Content(text("v0")));
+    expect(fixture.tabletVault.readText("note.md")).toBeUndefined();
+    // 其他文件照常同步
+    expect(fixture.tabletVault.readText("a.md")).toBe("desktop a1");
+    expect(await entryAt(fixture.observer, "note.md")).toMatchObject({ kind: "deleted" });
+  });
+
+  it("keeps the edited copy on the device that edited it when the kept Deletion Record has no Recovery Copy", async () => {
+    const fixture = await keptDeletionAfterPurgedBase();
+
+    // 不走「远端已删、本机没改」的删除；照旧进 edit-delete 冲突，本机 v1 作为冲突候选上传保存
+    await expect(fixture.desktop.synchronize()).resolves.toMatchObject({ deleted: 0, status: "action-required" });
+
+    const conflict = await entryAt(fixture.observer, "note.md");
+    expect(conflict).toMatchObject({ kind: "conflicted", reason: "edit-delete" });
+    const candidates = conflict.kind === "conflicted" ? conflict.candidates : [];
+    expect(candidates.map((candidate) => candidate.contentHash)).toEqual([await sha256Content(text("v1"))]);
+    expect(new TextDecoder().decode(await fixture.observer.readBlob(candidates[0]!.blobId))).toBe("v1");
+  });
+
+  it("keeps a copy that differs from the deleted content when the kept Deletion Record has no Recovery Copy", async () => {
+    const fixture = await keptDeletionAfterPurgedBase();
+    await fixture.tabletVault.write("note.md", text("tablet edit"));
+
+    await expect(fixture.tablet.synchronize()).resolves.toMatchObject({ deleted: 0, status: "action-required" });
+
+    const conflict = await entryAt(fixture.observer, "note.md");
+    expect(conflict).toMatchObject({ kind: "conflicted", reason: "edit-delete" });
+    const candidates = conflict.kind === "conflicted" ? conflict.candidates : [];
+    expect(candidates.map((candidate) => candidate.contentHash)).toEqual([await sha256Content(text("tablet edit"))]);
+    expect(new TextDecoder().decode(await fixture.observer.readBlob(candidates[0]!.blobId))).toBe("tablet edit");
+  });
+
+  it("still refuses to delete when a recent Deletion Record has no Recovery Copy but the record still holds that content", async () => {
+    const fixture = await setup({ "note.md": "v0" });
+    const live = await entryAt(fixture.observer, "note.md") as LiveEntry;
+    // 记录本身有问题：同内容的 Revision 还在记录里，删除记录却没带恢复副本
+    await publish(fixture.observer, [{
+      deletedAt: at(0), entryId: live.entryId, history: [live.revision], kind: "deleted",
+      lastContentHash: live.revision.contentHash, lastRevisionId: live.revision.revisionId, path: "note.md",
+    }]);
+    fixture.objects.serverDate = at(1);
+    const remove = vi.spyOn(fixture.phoneVault, "delete");
+
+    await expect(fixture.phone.synchronize()).rejects.toThrow(/缺少恢复副本/u);
+
+    expect(remove).not.toHaveBeenCalled();
+    expect(fixture.phoneVault.readText("note.md")).toBe("v0");
+  });
+
+  it("deletes a copy only after its Recovery Copy reads back intact", async () => {
+    const fixture = await setup({ "note.md": "v0" });
+    fixture.objects.serverDate = at(1);
+    await fixture.desktopVault.delete("note.md");
+    await fixture.desktop.synchronize();
+    expect(await entryAt(fixture.observer, "note.md")).toMatchObject({ kind: "deleted", recovery: expect.any(Object) });
+    const remove = vi.spyOn(fixture.phoneVault, "delete");
+    fixture.objects.serverDate = at(2);
+
+    await expect(fixture.phone.synchronize()).resolves.toMatchObject({ deleted: 1, status: "complete" });
+
+    expect(remove).toHaveBeenCalledWith("note.md", await sha256Content(text("v0")));
+    expect(fixture.phoneVault.readText("note.md")).toBeUndefined();
+  });
+
+  it.each([
+    ["missing", /仓库快照引用的数据块缺失/u],
+    ["fails verification", /恢复副本已损坏/u],
+  ])("does not delete a copy whose Recovery Copy is %s", async (state, error) => {
+    const fixture = await setup({ "note.md": "v0" });
+    fixture.objects.serverDate = at(1);
+    await fixture.desktopVault.delete("note.md");
+    await fixture.desktop.synchronize();
+    const recovery = (await entryAt(fixture.observer, "note.md") as DeletedEntry).recovery!;
+    await fixture.objects.delete(`${prefix}/v1/blobs/${recovery.blobId}`);
+    if (state === "fails verification") await fixture.observer.writeBlob(recovery.blobId, text("other content"));
+    const remove = vi.spyOn(fixture.phoneVault, "delete");
+    fixture.objects.serverDate = at(2);
+
+    await expect(fixture.phone.synchronize()).rejects.toThrow(error);
+
+    expect(remove).not.toHaveBeenCalled();
+    expect(fixture.phoneVault.readText("note.md")).toBe("v0");
+  });
 });
 
 describe("deleting unreferenced blobs from this vault's folder", () => {

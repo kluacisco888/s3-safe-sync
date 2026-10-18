@@ -101,6 +101,16 @@ const acceptedContentHash = (base: VaultSnapshot | undefined, entryId: string): 
     : entry?.kind === "conflicted" ? entry.materializedContentHash : undefined;
 };
 
+// 不变量 9 的例外：本机内容等于已接受的内容，而远端当前记录里这个 Entry 已没有任何同内容的 Revision
+// （旧版本已过期并被清理出记录）。这时不再要求远端恢复副本，本机旧字节进本机回收站
+const acceptedContentPurgedFromRecord = (
+  entry: VaultEntry,
+  localContentHash: string,
+  acceptedContentHash: string | undefined,
+): boolean =>
+  acceptedContentHash === localContentHash &&
+  !retainedRevisions(entry).some((revision) => revision.contentHash === localContentHash);
+
 export interface LocalFileInfo {
   modifiedAt: number;
   path: string;
@@ -1821,6 +1831,7 @@ export class SyncService {
           if (remoteEntry?.kind === "deleted") {
             await this.assertRecoveryBeforeDelete(
               remoteEntry,
+              expectedLocalContentByPath.get(action.path) ?? null,
               versionedHead.serverDate,
             );
           }
@@ -2663,10 +2674,10 @@ export class SyncService {
     if (!entry) {
       throw new Error(`文件 ${entryId} 的本地内容在远端没有可用的恢复副本`);
     }
-    const revisions = retainedRevisions(entry).filter((revision) => revision.contentHash === expectedContentHash);
-    if (revisions.length === 0 && acceptedBaseContentHash === expectedContentHash) {
+    if (acceptedContentPurgedFromRecord(entry, expectedContentHash, acceptedBaseContentHash)) {
       return;
     }
+    const revisions = retainedRevisions(entry).filter((revision) => revision.contentHash === expectedContentHash);
     for (const revision of revisions) {
       try {
         await this.assertRemoteRevision(revision);
@@ -2714,8 +2725,13 @@ export class SyncService {
     await this.options.onIntegrityVerified?.({kind: "blob", blobId: revision.blobId});
   }
 
+  // localContentHash 是本机要删的内容。删除不满 30 天必须有恢复副本，例外同不变量 9：
+  // 本机要删的正是这条删除记录的 lastContentHash，而远端当前记录里已没有同内容的 Revision
+  // （delete-edit 冲突的 base 已被清理、用户选了「保留删除」），这时照常删，旧字节进本地回收站。
+  // 记录里仍有同内容的 Revision 却没有恢复副本，说明记录本身有问题，照旧报错。
   private async assertRecoveryBeforeDelete(
     deleted: DeletedEntry,
+    localContentHash: string | null,
     serverDate: string,
   ): Promise<void> {
     const recoveryRequiredUntil = Date.parse(
@@ -2724,6 +2740,12 @@ export class SyncService {
     const serverTime = Date.parse(serverDate);
     if (serverTime < recoveryRequiredUntil) {
       if (!deleted.recovery) {
+        if (
+          localContentHash !== null &&
+          acceptedContentPurgedFromRecord(deleted, localContentHash, deleted.lastContentHash)
+        ) {
+          return;
+        }
         throw new Error(
           `已删除的文件 ${deleted.entryId} 缺少恢复副本`,
         );
