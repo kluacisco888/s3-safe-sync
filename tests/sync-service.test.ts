@@ -6304,6 +6304,8 @@ describe("a base Revision purged from the remote record", () => {
     const open = () => RemoteStore.open({ objects, prefix, vaultKey });
     const desktopVault = new MemoryVault();
     await desktopVault.write(path, text(initial));
+    // 另有几篇无关笔记，删除一篇不会被当成 Bulk Deletion
+    for (const other of ["a.md", "b.md", "c.md", "d.md"]) await desktopVault.write(other, text(other));
     const desktop = new SyncService({
       cache: new MemorySyncCache(), local: desktopVault, remote: await open(), replicaId: "desktop",
     });
@@ -6399,5 +6401,26 @@ describe("a base Revision purged from the remote record", () => {
 
     expect(fixture.phoneVault.readText("note.md")).toBe(big);
     await expect(fixture.unlimitedPhone.synchronize()).resolves.toMatchObject({ downloaded: 0, status: "complete", uploaded: 0 });
+  });
+
+  it("publishes a local deletion with the remote history when the cached history still lists purged content", async () => {
+    const fixture = await setup();
+    const first = await fixture.liveEntry();
+    await fixture.desktopVault.write("note.md", text("v1"));
+    await fixture.desktop.synchronize();
+    // 手机接受了带 v0 旧版本的记录，之后缓存一直停在清理之前
+    await fixture.phone.synchronize();
+    expect(fixture.phoneCache.state?.snapshot.entries[first.entryId]?.history?.map((revision) => revision.revisionId))
+      .toContain(first.revision.revisionId);
+    await purgeRevisions(fixture.observer, fixture.objects, [first.revision.revisionId], true);
+    await fixture.phoneVault.delete("note.md");
+
+    await expect(fixture.phone.synchronize()).resolves.toMatchObject({ status: "complete", uploaded: 1 });
+
+    const { snapshot } = await readCurrent(await fixture.open());
+    const deleted = snapshot.entries[first.entryId];
+    expect(deleted).toMatchObject({ kind: "deleted", recovery: { contentHash: await sha256Content(text("v1")) } });
+    expect(deleted?.history?.map((revision) => revision.revisionId) ?? []).not.toContain(first.revision.revisionId);
+    await expect(fixture.desktop.synchronize()).resolves.toMatchObject({ deleted: 1, status: "complete" });
   });
 });
