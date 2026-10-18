@@ -6376,7 +6376,7 @@ describe("a base Revision purged from the remote record", () => {
     // 之后 v0 过期被清理出记录、数据块也被删掉
     await purgeRevisions(fixture.observer, fixture.objects, [base.revision.revisionId], true);
 
-    await expect(fixture.phone.verifyRemoteIntegrity([check!], "vault")).resolves.toBeUndefined();
+    await expect(fixture.phone.verifyRemoteIntegrity([check], "vault")).resolves.toBeUndefined();
     await expect(fixture.phone.synchronize()).resolves.toMatchObject({ downloaded: 1, status: "complete" });
     expect(fixture.phoneVault.readText("note.md")).toBe("v1");
   });
@@ -6407,8 +6407,8 @@ describe("a base Revision purged from the remote record", () => {
       .toBe("phone edit");
     // 没有走下载覆盖：本机文件只在本机修改已作为冲突候选发布之后，按冲突的照旧规则显示远端版本，
     // 且改写以本机修改的哈希为前提
-    expect(write.mock.calls.filter(([path]) => path === "note.md").map(([, , expected]) => expected))
-      .toEqual([await sha256Content(text("phone edit"))]);
+    expect(write.mock.calls.filter(([path]) => path === "note.md")).toHaveLength(1);
+    expect(write).toHaveBeenCalledWith("note.md", expect.any(Uint8Array), await sha256Content(text("phone edit")));
     expect(fixture.phoneVault.readText("note.md")).toBe("v1");
   });
 
