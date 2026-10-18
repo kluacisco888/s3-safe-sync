@@ -627,5 +627,11 @@ describe("StatusModal", () => {
       expect(texts).toContain("fresh.md");
       expect(texts).toContain("candidate.md");
     });
+
+    it("shows each deletion time in the device time zone with the days left", () => {
+      const texts = openWith([fresh, candidateOnly]).map(node => node.text).filter(text => text.startsWith("删除于"));
+      // fresh 还剩 17 天 23 小时 11 分，向下取整；candidate 只剩 10 小时
+      expect(texts).toEqual(["删除于 2026-10-06 09:11 · 还剩 17 天", "删除于 2026-09-10 08:00 · 不到 1 天"]);
+    });
   });
 });

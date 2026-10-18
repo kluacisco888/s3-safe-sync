@@ -108,6 +108,31 @@ const unexpiredRecoveries = (entry: DeletedEntry, now: number): RevisionRef[] =>
   [...(entry.recovery ? [entry.recovery] : []), ...(entry.history ?? [])]
     .filter(revision => isUnexpired(revision, now));
 
+const twoDigits = (value: number): string => String(value).padStart(2, "0");
+
+/** 按本机时区显示为 YYYY-MM-DD HH:mm；无法解析时原样显示 */
+const formatLocalTime = (value: string): string => {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return value;
+  return `${date.getFullYear()}-${twoDigits(date.getMonth() + 1)}-${twoDigits(date.getDate())} ${twoDigits(date.getHours())}:${twoDigits(date.getMinutes())}`;
+};
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** 剩余天数向下取整，不足 1 天单独说明 */
+const formatDaysLeft = (expiresAt: number, now: number): string => {
+  const days = Math.floor((expiresAt - now) / DAY_MS);
+  return days < 1 ? "不到 1 天" : `还剩 ${days} 天`;
+};
+
+/** 已删除列表每行的说明：删除时间，以及最晚一项可恢复内容的剩余天数 */
+const deletedRowSummary = (entry: DeletedEntry, now: number): string => {
+  const deadlines = unexpiredRecoveries(entry, now)
+    .flatMap(revision => revision.expiresAt === undefined ? [] : [Date.parse(revision.expiresAt)]);
+  const deletedAt = `删除于 ${formatLocalTime(entry.deletedAt)}`;
+  return deadlines.length === 0 ? deletedAt : `${deletedAt} · ${formatDaysLeft(Math.max(...deadlines), now)}`;
+};
+
 const renderIssueGuidance = (container: HTMLElement, issue: LocalSyncIssue): void => {
   const detail = container.createEl("details");
   detail.createEl("summary", {text: "为什么需要处理"});
@@ -529,6 +554,10 @@ export class StatusModal extends Modal {
       previewTarget.createDiv({
         cls: "s3-vault-sync-selectable-path",
         text: entry.path,
+      });
+      previewTarget.createDiv({
+        cls: "s3-vault-sync-muted",
+        text: deletedRowSummary(entry, now),
       });
       previewTarget.createDiv({
         cls: "s3-vault-sync-muted",
