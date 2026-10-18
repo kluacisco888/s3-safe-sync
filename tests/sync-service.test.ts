@@ -7146,6 +7146,8 @@ describe("deleting unreferenced blobs from this vault's folder", () => {
     const first = await checkAt(fixture, at(60));
     await checkAt(fixture, at(61), first.marks);
 
+    // 被引用的连第一次判定都不记
+    expect(Object.keys(first.marks)).toEqual([unused]);
     expect(fixture.objects.deleted).toEqual([blobKey(unused)]);
     await expect(readCurrent(fixture.observer)).resolves.toBeDefined();
   });
