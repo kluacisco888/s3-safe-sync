@@ -789,6 +789,102 @@ describe("SyncService", () => {
     });
   });
 
+  describe("downloads materialized before an interrupted synchronization", () => {
+    const x = "notes/x.txt";
+    const encode = (text: string) => new TextEncoder().encode(text);
+    // 电脑发布 R1 后手机建立（或不建立）base；电脑再发布 R2 和新文件，手机下载到一半被打断；电脑随后发布 R3
+    const setup = async (options: {phoneHasBase: boolean}) => {
+      const objects = new MemoryObjectStore();
+      const remote = await RemoteStore.open({objects, prefix: "resume", vaultKey: new Uint8Array(32)});
+      const desktopVault = new MemoryVault();
+      const desktop = new SyncService({cache: new MemorySyncCache(), local: desktopVault, remote, replicaId: "desktop"});
+      await desktopVault.write(x, encode("R1 x"));
+      await desktopVault.write("notes/gone.txt", encode("gone"));
+      await desktopVault.write("notes/y.txt", encode("R1 y"));
+      await desktop.initializeNew("vault");
+      const phoneVault = new MemoryVault();
+      const phoneCache = new MemorySyncCache();
+      const hooks: {onProgress?: (progress: SyncProgress) => void} = {};
+      const phone = new SyncService({
+        cache: phoneCache, local: phoneVault, remote, replicaId: "phone",
+        onProgress: progress => hooks.onProgress?.(progress),
+      });
+      if (options.phoneHasBase) await phone.synchronize();
+      await desktopVault.write(x, encode("R2 x"));
+      await desktopVault.delete("notes/gone.txt");
+      await desktopVault.write("notes/z.md", encode("new z"));
+      // 删除 1 个文件超过 20% 的阈值，按确认后的集合发布
+      const pending = await desktop.synchronize();
+      await desktop.synchronize(pending.bulkDeletion?.entryIds ?? []);
+      const entryAt = async (path: string) => {
+        const head = (await remote.readHead())!;
+        return Object.values((await remote.readSnapshot(head.value)).entries).find(entry => entry.path === path)!;
+      };
+      // 第 n 个文件下载完成后，下一次读取数据块时网络中断
+      const interruptAfterDownloads = (count: number) => {
+        let armed = false;
+        hooks.onProgress = progress => {
+          if (progress.phase === "downloading" && progress.completed >= count) armed = true;
+        };
+        objects.onGet = key => {
+          if (!armed || !key.includes("/blobs/")) return;
+          armed = false;
+          hooks.onProgress = undefined;
+          objects.onGet = undefined;
+          throw new Error("network lost");
+        };
+      };
+      // 规划阶段读不出这个历史版本（票 07 的旧副本规则因此不生效），进入下载阶段后恢复可读
+      const hideRevisionWhilePlanning = async (path: string, content: string) => {
+        const entry = await entryAt(path);
+        const hash = await sha256Content(encode(content));
+        const revision = (entry.history ?? []).find(value => value.contentHash === hash)!;
+        const key = `resume/v1/blobs/${revision.blobId}`;
+        const original = (await objects.get(key))!;
+        await objects.put(key, encode("damaged"));
+        hooks.onProgress = progress => {
+          if (progress.phase !== "downloading") return;
+          hooks.onProgress = undefined;
+          void objects.put(key, original.body);
+        };
+      };
+      const publishR3 = async () => {
+        await desktopVault.write(x, encode("R3 x"));
+        await desktop.synchronize();
+      };
+      return {objects, remote, phone, phoneVault, phoneCache, desktopVault, desktop, hooks,
+        entryAt, interruptAfterDownloads, hideRevisionWhilePlanning, publishR3};
+    };
+
+    it("treats a file downloaded before the interruption as unmodified", async () => {
+      const {phone, phoneVault, phoneCache, entryAt, interruptAfterDownloads, hideRevisionWhilePlanning, publishR3} =
+        await setup({phoneHasBase: true});
+      interruptAfterDownloads(1);
+      await expect(phone.synchronize()).rejects.toThrow("network lost");
+      expect(phoneVault.readText(x)).toBe("R2 x");
+      expect(phoneVault.readText("notes/z.md")).toBeUndefined();
+      // 只记下已落地的 x：还没下载的 z 不进 base，远端的删除也不提前写成 Deletion Record
+      const accepted = phoneCache.state!;
+      const xEntry = Object.values(accepted.snapshot.entries).find(entry => entry.path === x);
+      expect(xEntry?.kind === "live" && xEntry.revision.contentHash).toBe(await sha256Content(encode("R2 x")));
+      expect(accepted.files[x]?.contentHash).toBe(await sha256Content(encode("R2 x")));
+      expect(Object.values(accepted.snapshot.entries).some(entry => entry.path === "notes/z.md")).toBe(false);
+      expect(accepted.files["notes/z.md"]).toBeUndefined();
+      expect(Object.values(accepted.snapshot.entries).find(entry => entry.path === "notes/gone.txt")?.kind).toBe("live");
+
+      await publishR3();
+      await hideRevisionWhilePlanning(x, "R2 x");
+      await expect(phone.synchronize()).resolves.toMatchObject({
+        status: "complete", downloaded: 2, uploaded: 0, localIssues: [],
+      });
+
+      expect(phoneVault.readText(x)).toBe("R3 x");
+      expect(phoneVault.readText("notes/z.md")).toBe("new z");
+      expect(await entryAt(x)).toMatchObject({kind: "live"});
+      await expect(phone.synchronize()).resolves.toMatchObject({status: "complete", downloaded: 0, uploaded: 0});
+    });
+  });
+
   describe("reviewing local content without a trusted base", () => {
     const setup = async (reverseOrder = false) => {
       const objects = new MemoryObjectStore();

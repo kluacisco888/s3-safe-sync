@@ -27,6 +27,9 @@ import { canonicalVaultPath } from "./canonical-path";
 import { PathCollisionReviewer, type PathCollisionReview, type PathCollisionResolution } from "./path-collision-review";
 import type { CollisionRenameJournal } from "./collision-rename-journal";
 
+// 下载阶段最多每隔这么久把已落地的文件写进 Sync Cache 一次；打断前和开始上传前另外各写一次
+const DOWNLOAD_PROGRESS_SAVE_INTERVAL_MS = 2_000;
+
 const retainedRevisions = (entry: VaultEntry): RevisionRef[] => [
   ...(entry.kind === "live" ? [entry.revision] : []),
   ...(entry.kind === "conflicted" ? entry.candidates : []),
@@ -1542,98 +1545,148 @@ export class SyncService {
     let deleted = 0;
     let downloaded = 0;
     let downloadedBytes = 0;
-    for (const action of plan.localActions) {
-      if (action.kind === "delete-local") {
-        const remoteEntry = remote.entries[action.entryId];
-        if (remoteEntry?.kind === "deleted") {
-          await this.assertRecoveryBeforeDelete(
-            remoteEntry,
-            versionedHead.serverDate,
+    // 下载落地后就把「这个 Entry 的本地 base = 刚落地的 Revision」记进 Sync Cache，
+    // 同步在之后被打断时，下一次同步把这些文件当成没改过，而不是本机修改或首次连接不一致。
+    // 与手动审查一样只接受这些 Entry：其余 Entry、Deletion Record 和 Conflict 仍保留上一次接受的状态。
+    let downloadProgress: CachedSyncState | undefined;
+    let unsavedDownloads = 0;
+    let lastDownloadSave = Date.now();
+    const pendingRenames = [...(syncOptions.pathRenames ?? new Map<string, PersistedPathRename>()).entries()];
+    const pendingRenamePaths = new Set(pendingRenames.flatMap(([fromPath, rename]) => [fromPath, rename.toPath]));
+    const pendingRenameEntryIds = new Set(pendingRenames.map(([, rename]) => rename.entryId));
+    const saveDownloadProgress = async (): Promise<void> => {
+      if (!downloadProgress || unsavedDownloads === 0) return;
+      unsavedDownloads = 0;
+      lastDownloadSave = Date.now();
+      await this.options.cache.save(structuredClone(downloadProgress));
+    };
+    const recordMaterializedDownload = async (entryId: string, path: string, revision: RevisionRef): Promise<void> => {
+      const entry = remote.entries[entryId];
+      // 只记落在远端当前路径、且不牵涉改名记录的下载；挪动和改名仍由最后的重建与既有恢复规则处理
+      if (entry?.kind !== "live" || entry.path !== path || entry.revision.revisionId !== revision.revisionId ||
+        pendingRenameEntryIds.has(entryId) || pendingRenamePaths.has(path)) return;
+      const progress = downloadProgress ??= cached ? structuredClone(cached) : {
+        bootstrapPending: true,
+        files: {},
+        snapshot: {commitId: remote.commitId, entries: {}, protocolVersion: 1, vaultId: remote.vaultId},
+        unmaterializedEntryIds: [],
+      };
+      const canonical = canonicalVaultPath(path);
+      const owner = progress.files[path];
+      if (owner && owner.entryId !== entryId) return;
+      if (Object.values(progress.snapshot.entries).some(other => other.entryId !== entryId &&
+        other.kind !== "deleted" && canonicalVaultPath(other.path) === canonical)) return;
+      // 同一 Entry 在别的路径还有记录时，只有那个路径本次已经挪走或删掉才能改记到新路径
+      const elsewhere = Object.values(progress.files).filter(file => file.entryId === entryId && file.path !== path);
+      if (elsewhere.some(file => !retiredLocalPaths.has(file.path))) return;
+      const file = await this.verifiedMaterializedFile(path, revision);
+      if (!file) return;
+      for (const stale of elsewhere) delete progress.files[stale.path];
+      progress.files[path] = {...file, contentHash: revision.contentHash, entryId};
+      progress.snapshot.entries[entryId] = entry;
+      progress.unmaterializedEntryIds = progress.unmaterializedEntryIds?.filter(id => id !== entryId);
+      unsavedDownloads += 1;
+      if (Date.now() - lastDownloadSave >= DOWNLOAD_PROGRESS_SAVE_INTERVAL_MS) await saveDownloadProgress();
+    };
+    try {
+      for (const action of plan.localActions) {
+        if (action.kind === "delete-local") {
+          const remoteEntry = remote.entries[action.entryId];
+          if (remoteEntry?.kind === "deleted") {
+            await this.assertRecoveryBeforeDelete(
+              remoteEntry,
+              versionedHead.serverDate,
+            );
+          }
+          await this.assertLocalContent(
+            action.path,
+            expectedLocalContentByPath.get(action.path) ?? null,
           );
+          const expectedContentHash =
+            expectedLocalContentByPath.get(action.path) ?? null;
+          await this.options.local.delete(action.path, expectedContentHash);
+          locallyMutatedPaths.add(action.path);
+          retiredLocalPaths.add(action.path);
+          expectedLocalContentByPath.delete(action.path);
+          deleted += 1;
+        } else if (action.kind === "move-local") {
+          const expectedContentHash =
+            expectedLocalContentByPath.get(action.fromPath) ?? null;
+          const expectedTargetHash = expectedLocalContentByPath.get(action.toPath) ?? null;
+          if (expectedTargetHash !== null) {
+            await this.assertRemoteRecoveryForLocalContent(remote, action.entryId, expectedContentHash);
+            await this.assertLocalContent(action.toPath, expectedTargetHash);
+          }
+          await this.assertLocalContent(action.fromPath, expectedContentHash);
+          await this.options.local.move(
+            action.fromPath,
+            action.toPath,
+            expectedContentHash ?? undefined,
+            expectedTargetHash,
+          );
+          locallyMutatedPaths.add(action.fromPath);
+          retiredLocalPaths.add(action.fromPath);
+          locallyMutatedPaths.add(action.toPath);
+          expectedLocalContentByPath.delete(action.fromPath);
+          if (expectedContentHash) {
+            expectedLocalContentByPath.set(action.toPath, expectedContentHash);
+          }
+        } else {
+          this.reportProgress({
+            completed: downloaded,
+            currentPath: action.path,
+            phase: "downloading",
+            total: downloadingActions.length,
+            totalBytes: downloadTotalBytes,
+            transferredBytes: downloadedBytes,
+          });
+          const plaintext = await this.options.remote.readBlob(
+            action.revision.blobId,
+          );
+          if (!plaintext) {
+            throw new Error(`远端缺少数据块 ${action.revision.blobId}`);
+          }
+          if (
+            plaintext.byteLength !== action.revision.size ||
+            (await sha256(plaintext)) !== action.revision.contentHash
+          ) {
+            throw new Error(`远端数据块 ${action.revision.blobId} 未通过哈希校验`);
+          }
+          const expectedContentHash =
+            expectedLocalContentByPath.get(action.path) ?? null;
+          await this.assertRemoteRecoveryForLocalContent(
+            remote,
+            action.entryId,
+            expectedContentHash,
+          );
+          await this.assertLocalContent(action.path, expectedContentHash);
+          await this.options.local.write(
+            action.path,
+            plaintext,
+            expectedContentHash,
+          );
+          locallyMutatedPaths.add(action.path);
+          expectedLocalContentByPath.set(
+            action.path,
+            action.revision.contentHash,
+          );
+          await recordMaterializedDownload(action.entryId, action.path, action.revision);
+          downloaded += 1;
+          downloadedBytes += action.revision.size;
+          this.reportProgress({
+            completed: downloaded,
+            currentPath: action.path,
+            phase: "downloading",
+            total: downloadingActions.length,
+            totalBytes: downloadTotalBytes,
+            transferredBytes: downloadedBytes,
+          });
         }
-        await this.assertLocalContent(
-          action.path,
-          expectedLocalContentByPath.get(action.path) ?? null,
-        );
-        const expectedContentHash =
-          expectedLocalContentByPath.get(action.path) ?? null;
-        await this.options.local.delete(action.path, expectedContentHash);
-        locallyMutatedPaths.add(action.path);
-        retiredLocalPaths.add(action.path);
-        expectedLocalContentByPath.delete(action.path);
-        deleted += 1;
-      } else if (action.kind === "move-local") {
-        const expectedContentHash =
-          expectedLocalContentByPath.get(action.fromPath) ?? null;
-        const expectedTargetHash = expectedLocalContentByPath.get(action.toPath) ?? null;
-        if (expectedTargetHash !== null) {
-          await this.assertRemoteRecoveryForLocalContent(remote, action.entryId, expectedContentHash);
-          await this.assertLocalContent(action.toPath, expectedTargetHash);
-        }
-        await this.assertLocalContent(action.fromPath, expectedContentHash);
-        await this.options.local.move(
-          action.fromPath,
-          action.toPath,
-          expectedContentHash ?? undefined,
-          expectedTargetHash,
-        );
-        locallyMutatedPaths.add(action.fromPath);
-        retiredLocalPaths.add(action.fromPath);
-        locallyMutatedPaths.add(action.toPath);
-        expectedLocalContentByPath.delete(action.fromPath);
-        if (expectedContentHash) {
-          expectedLocalContentByPath.set(action.toPath, expectedContentHash);
-        }
-      } else {
-        this.reportProgress({
-          completed: downloaded,
-          currentPath: action.path,
-          phase: "downloading",
-          total: downloadingActions.length,
-          totalBytes: downloadTotalBytes,
-          transferredBytes: downloadedBytes,
-        });
-        const plaintext = await this.options.remote.readBlob(
-          action.revision.blobId,
-        );
-        if (!plaintext) {
-          throw new Error(`远端缺少数据块 ${action.revision.blobId}`);
-        }
-        if (
-          plaintext.byteLength !== action.revision.size ||
-          (await sha256(plaintext)) !== action.revision.contentHash
-        ) {
-          throw new Error(`远端数据块 ${action.revision.blobId} 未通过哈希校验`);
-        }
-        const expectedContentHash =
-          expectedLocalContentByPath.get(action.path) ?? null;
-        await this.assertRemoteRecoveryForLocalContent(
-          remote,
-          action.entryId,
-          expectedContentHash,
-        );
-        await this.assertLocalContent(action.path, expectedContentHash);
-        await this.options.local.write(
-          action.path,
-          plaintext,
-          expectedContentHash,
-        );
-        locallyMutatedPaths.add(action.path);
-        expectedLocalContentByPath.set(
-          action.path,
-          action.revision.contentHash,
-        );
-        downloaded += 1;
-        downloadedBytes += action.revision.size;
-        this.reportProgress({
-          completed: downloaded,
-          currentPath: action.path,
-          phase: "downloading",
-          total: downloadingActions.length,
-          totalBytes: downloadTotalBytes,
-          transferredBytes: downloadedBytes,
-        });
       }
+    } catch (error) {
+      // 被打断前先记下已经落地的文件；这次保存失败时仍报告原来的错误
+      await saveDownloadProgress().catch(() => undefined);
+      throw error;
     }
 
     const uploadingChanges = plan.remoteChanges.filter(
@@ -1670,6 +1723,8 @@ export class SyncService {
         .length;
     let publishedChanges = plan.remoteChanges.length;
     if (plan.remoteChanges.length > 0 || sharedConflicts.length > 0) {
+      // 上传和发布 Head 也可能被打断，先把已落地的下载记下来
+      await saveDownloadProgress();
       const createdAt = versionedHead.serverDate;
       const changedEntries: VaultEntry[] = [];
       const nextEntries = { ...remote.entries };
@@ -2173,6 +2228,20 @@ export class SyncService {
       entries[entry.entryId] = priorEntry;
     }
     return { ...cached.snapshot, entries };
+  }
+
+  // 读回刚落地的文件：前后两次元数据一致、内容哈希等于该 Revision 才算已落地。
+  // 落地后马上被编辑的文件不记，交给最后的重建或下一次同步按本机修改处理。
+  private async verifiedMaterializedFile(path: string, revision: RevisionRef): Promise<LocalFileInfo | undefined> {
+    const before = await this.options.local.stat(path);
+    if (!before || before.size !== revision.size) return undefined;
+    const contentHash = this.options.local.hashContent
+      ? (await this.options.local.hashContent(path, {yieldToHost: this.options.yieldDuringHashing})).contentHash
+      : await sha256(await this.options.local.read(path));
+    const after = await this.options.local.stat(path);
+    if (!after || after.modifiedAt !== before.modifiedAt || after.size !== before.size ||
+      contentHash !== revision.contentHash) return undefined;
+    return {modifiedAt: before.modifiedAt, path, size: before.size};
   }
 
   private async assertLocalContent(
