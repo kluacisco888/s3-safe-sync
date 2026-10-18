@@ -1463,3 +1463,32 @@ describe("expired content cleanup on the desktop", () => {
     plugin.onunload();
   });
 });
+
+describe("expired content cleanup that keeps losing the Head race", () => {
+  it("gives up quietly after the retries and tries again after the next sync", async () => {
+    host.desktop = true;
+    const { plugin } = await setup();
+    await plugin.previewExpiredContentCleanup();
+    await plugin.setExpiredContentCleanupEnabled(true, true);
+    const { HeadChangedError } = await import("../src/storage/remote-store");
+    const cleanup = vi.spyOn(SyncService.prototype, "cleanupExpiredContent").mockRejectedValue(new HeadChangedError());
+
+    // 重试之间的等待用的是假计时器，一点点往前拨直到这次同步结束
+    const settle = async (run: Promise<void>) => {
+      let done = false;
+      void run.finally(() => { done = true; });
+      for (let step = 0; step < 200 && !done; step++) await vi.advanceTimersByTimeAsync(250);
+      await run;
+    };
+    await settle(plugin.togglePause());
+
+    expect(cleanup).toHaveBeenCalledTimes(5);
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+    expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({ outcome: "complete" });
+    expect(plugin.getDiagnostics().records.at(-1)!.expiredContentCleanup).toBeUndefined();
+    await settle(plugin.syncNow());
+    expect(cleanup).toHaveBeenCalledTimes(10);
+    cleanup.mockRestore();
+    plugin.onunload();
+  });
+});
