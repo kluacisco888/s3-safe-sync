@@ -6489,4 +6489,36 @@ describe("a base Revision purged from the remote record", () => {
     expect(conflicted.candidates.map((candidate) => candidate.contentHash).sort())
       .toEqual([await sha256Content(text(big)), await sha256Content(text("phone"))].sort());
   });
+
+  it("refuses to publish a commit that references content outside the Head it replaces", async () => {
+    const fixture = await setup();
+    const first = await fixture.liveEntry();
+    await fixture.desktopVault.write("note.md", text("v1"));
+    await fixture.desktop.synchronize();
+    await fixture.phone.synchronize();
+    // 数据块还在、但已不被记录引用：正是票 04 下一步可能删掉的那一类
+    await purgeRevisions(fixture.observer, fixture.objects, [first.revision.revisionId], false);
+    const before = await readCurrent(fixture.observer);
+    const keysBefore = await fixture.objects.list("");
+    await fixture.phoneVault.delete("note.md");
+    // 人为构造违规提交：让删除记录带回已被清理的旧版本
+    const reconcile = SyncEngine.prototype.reconcile;
+    const spy = vi.spyOn(SyncEngine.prototype, "reconcile").mockImplementation(function (this: SyncEngine, input) {
+      const plan = reconcile.call(this, input);
+      return {
+        ...plan,
+        remoteChanges: plan.remoteChanges.map((change) =>
+          change.kind === "delete-remote" ? { ...change, history: [...(change.history ?? []), first.revision] } : change),
+      };
+    });
+    try {
+      await expect(fixture.phone.synchronize()).rejects.toThrow("不在远端当前记录里");
+    } finally {
+      spy.mockRestore();
+    }
+
+    const after = await readCurrent(fixture.observer);
+    expect(after.head.etag).toBe(before.head.etag);
+    expect(await fixture.objects.list("")).toEqual(keysBefore);
+  });
 });

@@ -1770,6 +1770,8 @@ export class SyncService {
       const createdAt = versionedHead.serverDate;
       const changedEntries: VaultEntry[] = [];
       const nextEntries = { ...remote.entries };
+      // 本次尝试新上传并核实过的数据块；新提交只能引用它们或 Head 已引用的数据块
+      const uploadedBlobIds = new Set<string>();
       const deleteAfterCommit: Array<{
         expectedContentHash: string;
         path: string;
@@ -1812,6 +1814,7 @@ export class SyncService {
           }
           const blobId = crypto.randomUUID();
           await this.options.remote.writeBlob(blobId, plaintext);
+          uploadedBlobIds.add(blobId);
           reportUpload(change.path, change.file.size);
           const current = remote.entries[change.entryId];
           const previousRevisions =
@@ -1877,6 +1880,7 @@ export class SyncService {
         }
         const blobId = crypto.randomUUID();
         await this.options.remote.writeBlob(blobId, plaintext);
+        uploadedBlobIds.add(blobId);
         const localRevision = {
           blobId,
           contentHash: conflict.localFile.contentHash,
@@ -1955,6 +1959,7 @@ export class SyncService {
           if (merged) {
             const mergedBlobId = crypto.randomUUID();
             await this.options.remote.writeBlob(mergedBlobId, merged);
+            uploadedBlobIds.add(mergedBlobId);
             const mergedRevision: RevisionRef = {
               blobId: mergedBlobId,
               contentHash: await sha256(merged),
@@ -2035,6 +2040,8 @@ export class SyncService {
         changedEntries.push(changedEntry);
       }
       publishedChanges = changedEntries.length;
+      // 发布前总检查：放在写快照和发布 Head 之前、提交后的本地删除和改写之前
+      this.assertCommitReferencesAcceptedOrUploaded(remote, changedEntries, uploadedBlobIds);
       const commitId = crypto.randomUUID();
       const commit: CommitRecord = {
         changes: changedEntries.map((entry) => ({
@@ -2349,6 +2356,26 @@ export class SyncService {
     }
     for (const revision of revisions.values()) {
       await this.assertRemoteRevision(revision);
+    }
+  }
+
+  // 发布前总检查：新提交里引用的每个数据块，必须已被本次 CAS 所对的 Head 的快照引用，
+  // 或者是本次尝试新上传的。从本机缓存带出来的旧版本可能已被过期清理、数据块正被删除，
+  // 有了 Head CAS 的先后顺序，这条规则保证被删除的数据块不会再被引用回来
+  private assertCommitReferencesAcceptedOrUploaded(
+    head: VaultSnapshot,
+    entries: readonly VaultEntry[],
+    uploadedBlobIds: ReadonlySet<string>,
+  ): void {
+    const referenced = new Set(
+      Object.values(head.entries).flatMap((entry) => retainedRevisions(entry).map((revision) => revision.blobId)),
+    );
+    for (const entry of entries) {
+      for (const revision of retainedRevisions(entry)) {
+        if (!referenced.has(revision.blobId) && !uploadedBlobIds.has(revision.blobId)) {
+          throw new Error(`新提交引用了 ${entry.path} 一个不在远端当前记录里的版本，已停止发布。请重新同步。`);
+        }
+      }
     }
   }
 
