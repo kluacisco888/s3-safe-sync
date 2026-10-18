@@ -79,6 +79,49 @@ export class RemoteStateError extends Error {
 const normalizePrefix = (prefix: string): string =>
   prefix.replace(/^\/+|\/+$/gu, "");
 
+// 数据块名一律是小写 UUID（crypto.randomUUID 生成），整串匹配，后面不能再有 /
+const BLOB_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+
+export interface RemoteBlobObject {
+  blobId: string;
+  key: string;
+  lastModified: string;
+  size: number;
+}
+
+/**
+ * 当前记录引用的数据块（blobId → 引用它的路径）。读 Head 时的存在性检查和
+ * 数据块删除用的是这同一套：当前 Revision、冲突候选、Recovery Copy、Version History。
+ */
+export const snapshotBlobReferences = (
+  snapshot: VaultSnapshot,
+): Map<string, Set<string>> => {
+  const pathsByBlobId = new Map<string, Set<string>>();
+  const addReference = (blobId: string, path: string): void => {
+    const paths = pathsByBlobId.get(blobId) ?? new Set<string>();
+    paths.add(path);
+    pathsByBlobId.set(blobId, paths);
+  };
+  for (const entry of Object.values(snapshot.entries)) {
+    if (entry.kind === "live") {
+      addReference(entry.revision.blobId, entry.path);
+    } else if (entry.kind === "conflicted") {
+      for (const candidate of entry.candidates) {
+        addReference(candidate.blobId, entry.path);
+      }
+      if (entry.recovery) {
+        addReference(entry.recovery.blobId, entry.path);
+      }
+    } else if (entry.recovery) {
+      addReference(entry.recovery.blobId, entry.path);
+    }
+    for (const revision of entry.history ?? []) {
+      addReference(revision.blobId, entry.path);
+    }
+  }
+  return pathsByBlobId;
+};
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
@@ -381,6 +424,43 @@ export class RemoteStore {
     }
   }
 
+  /**
+   * 列出 `<前缀>/v1/blobs/` 下的全部对象。路径只用 key("blobs/") 拼；每个对象名都必须整串是
+   * `<前缀>/v1/blobs/<UUID>`，有一个对不上（Head、提交、快照、Key Envelope、别的前缀、子路径、
+   * 非 UUID、重复）就整批作废并报错，调用方这次一个也不删。规范化后前缀为空时拒绝。
+   */
+  async listBlobObjects(): Promise<RemoteBlobObject[]> {
+    const blobPrefix = this.blobScope();
+    const listed = await this.objects.listObjects(blobPrefix);
+    const seen = new Set<string>();
+    const unexpected: string[] = [];
+    const objects: RemoteBlobObject[] = [];
+    for (const object of listed) {
+      const blobId = object.key.startsWith(blobPrefix) ? object.key.slice(blobPrefix.length) : "";
+      if (!BLOB_ID_PATTERN.test(blobId) || seen.has(object.key)) {
+        unexpected.push(object.key);
+        continue;
+      }
+      seen.add(object.key);
+      objects.push({ blobId, key: object.key, lastModified: object.lastModified, size: object.size });
+    }
+    if (unexpected.length > 0) {
+      throw new Error(
+        `数据块目录 ${blobPrefix} 的列表里有 ${unexpected.length} 个对象名不符合预期（例如 ${unexpected[0]}），这次不删除任何数据块。`,
+      );
+    }
+    return objects;
+  }
+
+  // 删除一个数据块：只接受 UUID，路径只用 key("blobs/") 拼；DELETE 不带 versionId
+  async deleteBlob(blobId: string): Promise<void> {
+    const blobPrefix = this.blobScope();
+    if (!BLOB_ID_PATTERN.test(blobId)) {
+      throw new Error("要删除的数据块名字不是 UUID，已停止删除。");
+    }
+    await this.objects.delete(`${blobPrefix}${blobId}`);
+  }
+
   async writeBlob(blobId: string, plaintext: Uint8Array): Promise<void> {
     await this.objects.put(
       this.key(`blobs/${blobId}`),
@@ -411,29 +491,7 @@ export class RemoteStore {
   ): Promise<void> {
     const blobPrefix = this.key("blobs/");
     const available = new Set(await this.objects.list(blobPrefix));
-    const pathsByBlobId = new Map<string, Set<string>>();
-    const addReference = (blobId: string, path: string): void => {
-      const paths = pathsByBlobId.get(blobId) ?? new Set<string>();
-      paths.add(path);
-      pathsByBlobId.set(blobId, paths);
-    };
-    for (const entry of Object.values(snapshot.entries)) {
-      if (entry.kind === "live") {
-        addReference(entry.revision.blobId, entry.path);
-      } else if (entry.kind === "conflicted") {
-        for (const candidate of entry.candidates) {
-          addReference(candidate.blobId, entry.path);
-        }
-        if (entry.recovery) {
-          addReference(entry.recovery.blobId, entry.path);
-        }
-      } else if (entry.recovery) {
-        addReference(entry.recovery.blobId, entry.path);
-      }
-      for (const revision of entry.history ?? []) {
-        addReference(revision.blobId, entry.path);
-      }
-    }
+    const pathsByBlobId = snapshotBlobReferences(snapshot);
     const missing = [...pathsByBlobId.keys()].filter(
       (blobId) => !available.has(`${blobPrefix}${blobId}`),
     );
@@ -483,6 +541,14 @@ export class RemoteStore {
 
   private key(suffix: string): string {
     return `${this.prefix}/v1/${suffix}`;
+  }
+
+  // 数据块删除的范围；前缀为空（比如设置里填了 /）时拒绝，免得范围落到桶的根上
+  private blobScope(): string {
+    if (this.prefix === "") {
+      throw new Error("同步前缀为空，不清理数据块。");
+    }
+    return this.key("blobs/");
   }
 
   private writeImmutableCommit(commit: CommitRecord): Promise<unknown> {
