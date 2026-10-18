@@ -301,7 +301,7 @@ class DeletedFilePreviewModal extends Modal {
       cls: "s3-vault-sync-muted",
       text: `${this.revision.size} 字节${
         this.revision.expiresAt
-          ? ` · 可恢复至 ${this.revision.expiresAt}`
+          ? ` · 可恢复至 ${formatLocalTime(this.revision.expiresAt)}`
           : ""
       }`,
     });
@@ -546,7 +546,8 @@ export class StatusModal extends Modal {
     }
     container.createEl("h3", { text: "已删除的文件（30 天内可恢复）" });
     for (const entry of deleted) {
-      const recovery = entry.recovery;
+      // 恢复副本已过期时按不可用处理，只提供历史版本
+      const recovery = entry.recovery && isUnexpired(entry.recovery, now) ? entry.recovery : undefined;
       const item = container.createDiv({ cls: "s3-vault-sync-deleted-row" });
       const previewTarget = item.createDiv({
         cls: "s3-vault-sync-deleted-preview",
@@ -761,7 +762,7 @@ export class VersionHistoryModal extends Modal {
     this.contentEl.createEl("p", {text: "被替换或手动选择后保留下来的版本可在 30 天内恢复。恢复前请先预览；恢复时也会保留当前版本。"});
     for (const revision of history) {
       const row = this.contentEl.createDiv({ cls: "s3-vault-sync-history" });
-      row.createSpan({ text: `版本记录时间：${revision.createdAt} · ${revision.size} 字节${revision.expiresAt ? ` · 可恢复至 ${revision.expiresAt}` : ""}` });
+      row.createSpan({ text: `版本记录时间：${revision.createdAt} · ${revision.size} 字节${revision.expiresAt ? ` · 可恢复至 ${formatLocalTime(revision.expiresAt)}` : ""}` });
       row.createEl("button", {text: "预览"}).addEventListener("click", () => {
         new DeletedFilePreviewModal(this.app, this.entry, revision,
           () => this.controller.readHistoricalRevision(this.entry.entryId, revision.revisionId), "历史版本预览").open();
