@@ -26,6 +26,28 @@ import { sha256Content as sha256 } from "./content-hash";
 import { canonicalVaultPath } from "./canonical-path";
 import { PathCollisionReviewer, type PathCollisionReview, type PathCollisionResolution } from "./path-collision-review";
 import type { CollisionRenameJournal } from "./collision-rename-journal";
+import {
+  planExpiredContentCleanup,
+  type ExpiredRecoveryRemoval,
+  type MissingExpiryItem,
+} from "./expired-content-cleanup";
+
+export interface ExpiredContentPreview {
+  missingExpiry: MissingExpiryItem[];
+  removedHistory: number;
+  removedRecoveries: ExpiredRecoveryRemoval[];
+  serverDate: string;
+}
+
+export type ExpiredContentCleanupResult =
+  | { kind: "no-head" }
+  | {
+      commitId?: string;
+      kind: "committed" | "nothing-to-clean";
+      removedHistory: number;
+      removedRecoveries: number;
+      serverDate: string;
+    };
 
 // 下载阶段最多每隔这么久把已落地的文件写进 Sync Cache 一次；打断前和开始上传前另外各写一次
 const DOWNLOAD_PROGRESS_SAVE_INTERVAL_MS = 2_000;
@@ -1035,6 +1057,88 @@ export class SyncService {
       entry.revision.contentHash,
     );
     await this.acceptReviewedEntries({...snapshot, commitId}, [restoredEntry]);
+  }
+
+  // 预览只读：只读远端 Head 和它的快照，不写 S3、不改本机缓存
+  async previewExpiredContentCleanup(vaultId: string): Promise<ExpiredContentPreview> {
+    const versionedHead = await this.options.remote.readHead();
+    if (!versionedHead || versionedHead.value.vaultId !== vaultId) {
+      throw new Error("远端 Head 指针缺失，或属于另一个仓库");
+    }
+    const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
+    const plan = planExpiredContentCleanup(snapshot, versionedHead.serverDate);
+    return {
+      missingExpiry: plan.missingExpiry,
+      removedHistory: plan.removedHistory,
+      removedRecoveries: plan.removedRecoveries,
+      serverDate: versionedHead.serverDate,
+    };
+  }
+
+  // 清理提交：只用同一次 readHead 读到的 Head 和它的快照计算，CAS 也对这个 Head，绝不拿本机缓存构造
+  // （否则会把别的设备的新改动覆盖回旧版本）。被别的设备抢先时抛 HeadChangedError，由调用方重读重算。
+  async cleanupExpiredContent(vaultId: string): Promise<ExpiredContentCleanupResult> {
+    const versionedHead = await this.options.remote.readHead();
+    if (!versionedHead || versionedHead.value.vaultId !== vaultId) {
+      return { kind: "no-head" };
+    }
+    const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
+    const plan = planExpiredContentCleanup(snapshot, versionedHead.serverDate);
+    const counts = {
+      removedHistory: plan.removedHistory,
+      removedRecoveries: plan.removedRecoveries.length,
+      serverDate: versionedHead.serverDate,
+    };
+    if (plan.changedEntries.length === 0) {
+      return { kind: "nothing-to-clean", ...counts };
+    }
+    // 清理只去掉引用；发布前总检查照样适用
+    this.assertCommitReferencesAcceptedOrUploaded(snapshot, plan.changedEntries, new Set());
+    const createdAt = versionedHead.serverDate;
+    const commitId = crypto.randomUUID();
+    const nextSnapshot: VaultSnapshot = {
+      commitId,
+      entries: {
+        ...snapshot.entries,
+        ...Object.fromEntries(plan.changedEntries.map((entry) => [entry.entryId, entry])),
+      },
+      protocolVersion: 1,
+      vaultId: snapshot.vaultId,
+    };
+    const head: HeadRecord = {
+      commitId,
+      generation: versionedHead.value.generation + 1,
+      protocolVersion: 1,
+      snapshotId: versionedHead.value.snapshotId,
+      vaultId: snapshot.vaultId,
+    };
+    // 与同步提交同一条规则：每 100 次写一份完整快照
+    if (head.generation % 100 === 0) {
+      const snapshotId = crypto.randomUUID();
+      await this.options.remote.writeSnapshot(snapshotId, nextSnapshot);
+      head.snapshotId = snapshotId;
+    }
+    await this.options.remote.advance({
+      commit: {
+        changes: plan.changedEntries.map((entry) => ({ entry, kind: "set-entry" })),
+        commitId,
+        createdAt,
+        parentIds: [versionedHead.value.commitId],
+        protocolVersion: 1,
+        replicaId: this.options.replicaId,
+        vaultId: snapshot.vaultId,
+      },
+      expectedHeadEtag: versionedHead.etag,
+      head,
+    });
+    this.options.onRemotePublished?.(commitId);
+    // 本机缓存正好停在这次读到的 Head 时才直接接受清理后的记录（清理不改任何当前版本和路径，
+    // 本机文件记录照旧有效）；缓存落后或超前都不碰，留给下一次同步
+    const cached = await this.options.cache.load();
+    if (cached?.snapshot.commitId === versionedHead.value.commitId && cached.snapshot.vaultId === snapshot.vaultId) {
+      await this.options.cache.save({ ...cached, snapshot: nextSnapshot });
+    }
+    return { commitId, kind: "committed", ...counts };
   }
 
   async readDeletedRecovery(

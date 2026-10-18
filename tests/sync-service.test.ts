@@ -19,7 +19,8 @@ import {
   RemoteStore,
 } from "../src/storage/remote-store";
 import { SyncRequestQueue } from "../src/sync/sync-request-queue";
-import { SyncEngine, type LiveEntry, type VaultEntry } from "../src/sync/sync-engine";
+import { SyncEngine, type DeletedEntry, type LiveEntry, type RevisionRef, type VaultEntry } from "../src/sync/sync-engine";
+import { retryHeadChanges } from "../src/sync/head-change-retry";
 import { sha256Content } from "../src/sync/content-hash";
 import { LocalStateChangedError } from "../src/sync/errors";
 import { PathRenameTracker } from "../src/sync/path-rename-tracker";
@@ -6613,5 +6614,376 @@ describe("a base Revision purged from the remote record", () => {
     await expect(synchronization).rejects.toBeInstanceOf(RemoteStateError);
     await expect(synchronization).rejects.toMatchObject({ integrityCheck: { kind: "recovery" } });
     expect(fixture.phoneVault.readText("note.md")).toBe("v0");
+  });
+});
+
+describe("cleaning expired content out of the remote record", () => {
+  const prefix = "expired";
+  const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+  const text = (value: string): Uint8Array => new TextEncoder().encode(value);
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const T0 = "2026-09-05T00:00:00.000Z";
+  // 以 T0 为起点的第 days 天（AWS 时间）
+  const at = (days: number): string => new Date(Date.parse(T0) + days * DAY_MS).toISOString();
+
+  // 读 Head 时带上可控的 AWS 时间；设备时间与它无关
+  class ClockedObjectStore extends MemoryObjectStore {
+    serverDate = T0;
+    puts: string[] = [];
+
+    override async get(key: string): Promise<StoredObject | undefined> {
+      const stored = await super.get(key);
+      return stored && key.endsWith("/head") ? { ...stored, serverDate: this.serverDate } : stored;
+    }
+
+    override async put(key: string, body: Uint8Array, options: ObjectPutOptions = {}): Promise<StoredObject> {
+      this.puts.push(key);
+      return super.put(key, body, options);
+    }
+  }
+
+  const readCurrent = async (remote: RemoteStore) => {
+    const head = await remote.readHead();
+    if (!head) throw new Error("Expected initialized Head");
+    return { head, snapshot: await remote.readSnapshot(head.value) };
+  };
+
+  const entryAt = async (remote: RemoteStore, path: string): Promise<VaultEntry> => {
+    const entry = Object.values((await readCurrent(remote)).snapshot.entries).find((value) => value.path === path);
+    if (!entry) throw new Error(`Expected an Entry at ${path}`);
+    return entry;
+  };
+
+  const setup = async (files: Record<string, string>) => {
+    const objects = new ClockedObjectStore();
+    const open = () => RemoteStore.open({ objects, prefix, vaultKey });
+    const desktopVault = new MemoryVault();
+    for (const [path, body] of Object.entries(files)) await desktopVault.write(path, text(body));
+    // 另有几篇无关笔记，删除一篇不会被当成 Bulk Deletion
+    for (const other of ["a.md", "b.md", "c.md", "d.md", "e.md", "f.md"]) await desktopVault.write(other, text(other));
+    const desktopCache = new MemorySyncCache();
+    const desktop = new SyncService({ cache: desktopCache, local: desktopVault, remote: await open(), replicaId: "desktop" });
+    await desktop.initializeNew("vault");
+    await desktop.synchronize();
+    const phoneVault = new MemoryVault();
+    const phoneCache = new MemorySyncCache();
+    const phone = new SyncService({ cache: phoneCache, local: phoneVault, remote: await open(), replicaId: "phone" });
+    await phone.synchronize();
+    const observer = await open();
+    return { desktop, desktopCache, desktopVault, objects, observer, open, phone, phoneCache, phoneVault };
+  };
+
+  // 直接发一个提交，造出指定形状的记录（数据块真实写入，读 Head 的存在性检查能通过）
+  const revisionOf = async (remote: RemoteStore, body: string, expiresAt?: string): Promise<RevisionRef> => {
+    const blobId = crypto.randomUUID();
+    await remote.writeBlob(blobId, text(body));
+    return {
+      blobId, contentHash: await sha256Content(text(body)), createdAt: at(-1), revisionId: crypto.randomUUID(),
+      size: text(body).byteLength, ...(expiresAt ? { expiresAt } : {}),
+    };
+  };
+
+  const publish = async (remote: RemoteStore, entries: VaultEntry[]): Promise<void> => {
+    const { head, snapshot } = await readCurrent(remote);
+    const commitId = crypto.randomUUID();
+    await remote.advance({
+      commit: {
+        changes: entries.map((entry) => ({ entry, kind: "set-entry" as const })), commitId, createdAt: head.serverDate,
+        parentIds: [head.value.commitId], protocolVersion: 1, replicaId: "fixture", vaultId: snapshot.vaultId,
+      },
+      expectedHeadEtag: head.etag,
+      head: { ...head.value, commitId, generation: head.value.generation + 1 },
+    });
+  };
+
+  // 判据用的记录：每种情况一个 Entry
+  const judgedRecord = async (remote: RemoteStore) => {
+    const live: VaultEntry = {
+      entryId: "live", kind: "live", path: "live.md", revision: await revisionOf(remote, "live current"),
+      history: [await revisionOf(remote, "live h1", at(50)), await revisionOf(remote, "live h0", at(30))],
+    };
+    const gone: VaultEntry = {
+      deletedAt: at(0), entryId: "gone", kind: "deleted", lastContentHash: "sha256:gone", lastRevisionId: "gone-last",
+      path: "gone.md", recovery: { ...(await revisionOf(remote, "gone")), expiresAt: at(30) },
+    };
+    const deletedWithHistory: VaultEntry = {
+      deletedAt: at(20), entryId: "deleted-history", kind: "deleted", lastContentHash: "sha256:dh",
+      lastRevisionId: "dh-last", path: "deleted-history.md",
+      recovery: { ...(await revisionOf(remote, "dh recovery")), expiresAt: at(50) },
+      history: [await revisionOf(remote, "dh old", at(30))],
+    };
+    const keptConflictHistory: VaultEntry = {
+      deletedAt: at(-5), entryId: "kept-deleted", kind: "deleted", lastContentHash: "sha256:kd",
+      lastRevisionId: "kd-last", path: "kept-deleted.md",
+      recovery: { ...(await revisionOf(remote, "kd recovery")), expiresAt: at(30) },
+      history: [await revisionOf(remote, "kd candidate", at(60))],
+    };
+    const conflicted: VaultEntry = {
+      candidates: [await revisionOf(remote, "candidate one"), await revisionOf(remote, "candidate two")],
+      entryId: "conflicted", kind: "conflicted", path: "conflicted.md", reason: "edit-edit",
+      history: [await revisionOf(remote, "conflict old", at(30))],
+    };
+    const missing: VaultEntry = {
+      entryId: "missing", kind: "live", path: "missing.md", revision: await revisionOf(remote, "missing current"),
+      history: [await revisionOf(remote, "missing old")],
+    };
+    const missingRecovery: VaultEntry = {
+      deletedAt: at(1), entryId: "missing-recovery", kind: "deleted", lastContentHash: "sha256:mr",
+      lastRevisionId: "mr-last", path: "missing-recovery.md",
+      // 恢复副本的到期时间在格式上必填，这里用一个无法解析的值代表「缺到期时间」
+      recovery: { ...(await revisionOf(remote, "missing recovery")), expiresAt: "unknown" },
+    };
+    const entries = [live, gone, deletedWithHistory, keptConflictHistory, conflicted, missing, missingRecovery];
+    await publish(remote, entries);
+    return Object.fromEntries(entries.map((entry) => [entry.entryId, entry])) as Record<string, VaultEntry>;
+  };
+
+  it("removes only expired Recovery Copies and expired Version History items and keeps every Deletion Record", async () => {
+    const fixture = await setup({});
+    const before = await judgedRecord(fixture.observer);
+    fixture.objects.serverDate = at(40);
+    const generationBefore = (await readCurrent(fixture.observer)).head.value.generation;
+
+    const result = await fixture.desktop.cleanupExpiredContent("vault");
+
+    expect(result).toMatchObject({ kind: "committed", removedHistory: 2, removedRecoveries: 2 });
+    const { head, snapshot } = await readCurrent(fixture.observer);
+    expect(head.value.generation).toBe(generationBefore + 1);
+    const after = snapshot.entries;
+    // Live：过期的旧版本去掉，未过期的保留，当前版本不动
+    const live = before.live as LiveEntry;
+    expect(after.live).toEqual({ ...live, history: [live.history![0]] });
+    // Deleted：恢复副本过期就去掉，删除记录的其他字段原样保留
+    const { recovery: _goneRecovery, ...goneRecord } = before.gone as DeletedEntry;
+    expect(after.gone).toEqual(goneRecord);
+    // Deleted：恢复副本未过期，只去掉过期的旧版本
+    const { history: _oldHistory, ...deletedWithHistory } = before["deleted-history"] as DeletedEntry;
+    expect(after["deleted-history"]).toEqual(deletedWithHistory);
+    // 恢复副本过期但还有未过期的冲突候选历史：只去掉恢复副本
+    const { recovery: _keptRecovery, ...keptDeleted } = before["kept-deleted"] as DeletedEntry;
+    expect(after["kept-deleted"]).toEqual(keptDeleted);
+    // Conflicted 一律不动；缺到期时间的项不算过期
+    expect(after.conflicted).toEqual(before.conflicted);
+    expect(after.missing).toEqual(before.missing);
+    expect(after["missing-recovery"]).toEqual(before["missing-recovery"]);
+    // 清理提交是普通的 v1 set-entry 提交，只改写受影响的 Entry
+    const commit = await fixture.observer.readCommit(head.value.commitId);
+    expect(commit).toMatchObject({ protocolVersion: 1, parentIds: [expect.any(String)] });
+    expect(commit!.changes.map((change) => [change.kind, change.entry.entryId]).sort()).toEqual([
+      ["set-entry", "deleted-history"], ["set-entry", "gone"], ["set-entry", "kept-deleted"], ["set-entry", "live"],
+    ]);
+  });
+
+  it("previews the cleanup without writing to S3 or the local cache", async () => {
+    const fixture = await setup({});
+    await judgedRecord(fixture.observer);
+    fixture.objects.serverDate = at(40);
+    const cacheBefore = structuredClone(fixture.desktopCache.state);
+    const putsBefore = fixture.objects.puts.length;
+    const generationBefore = (await readCurrent(fixture.observer)).head.value.generation;
+
+    const preview = await fixture.desktop.previewExpiredContentCleanup("vault");
+
+    expect(preview).toEqual({
+      missingExpiry: [{ kind: "recovery", path: "missing-recovery.md" }, { kind: "history", path: "missing.md" }],
+      removedHistory: 2,
+      // 按删除时间排序
+      removedRecoveries: [{ deletedAt: at(-5), path: "kept-deleted.md" }, { deletedAt: at(0), path: "gone.md" }],
+      serverDate: at(40),
+    });
+    expect(fixture.objects.puts.length).toBe(putsBefore);
+    expect(fixture.desktopCache.state).toEqual(cacheBefore);
+    expect((await readCurrent(fixture.observer)).head.value.generation).toBe(generationBefore);
+  });
+
+  it("leaves a file uploaded 60 days ago and never changed untouched", async () => {
+    const fixture = await setup({ "old.md": "written once" });
+    const before = await entryAt(fixture.observer, "old.md");
+    const generationBefore = (await readCurrent(fixture.observer)).head.value.generation;
+    fixture.objects.serverDate = at(60);
+
+    const result = await fixture.desktop.cleanupExpiredContent("vault");
+
+    expect(result).toMatchObject({ kind: "nothing-to-clean", removedHistory: 0, removedRecoveries: 0 });
+    expect(await entryAt(fixture.observer, "old.md")).toEqual(before);
+    expect((await readCurrent(fixture.observer)).head.value.generation).toBe(generationBefore);
+  });
+
+  it("judges expiry by AWS time even when the device clock is 60 days ahead", async () => {
+    const fixture = await setup({});
+    const before = await judgedRecord(fixture.observer);
+    fixture.objects.serverDate = at(20);
+    const generationBefore = (await readCurrent(fixture.observer)).head.value.generation;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date(at(80)));
+      const result = await fixture.desktop.cleanupExpiredContent("vault");
+      expect(result).toMatchObject({ kind: "nothing-to-clean" });
+    } finally {
+      vi.useRealTimers();
+    }
+    const { head, snapshot } = await readCurrent(fixture.observer);
+    expect(head.value.generation).toBe(generationBefore);
+    expect(snapshot.entries.gone).toEqual(before.gone);
+    expect(snapshot.entries.live).toEqual(before.live);
+  });
+
+  it("builds the cleanup from the remote Head only, keeping a phone edit the desktop cache has not seen", async () => {
+    const fixture = await setup({ "note.md": "v0" });
+    await fixture.desktopVault.write("note.md", text("v1"));
+    await fixture.desktop.synchronize();
+    await fixture.phone.synchronize();
+    // 40 天后手机改了这篇；电脑缓存还停在之前
+    fixture.objects.serverDate = at(40);
+    await fixture.phoneVault.write("note.md", text("phone v2"));
+    await fixture.phone.synchronize();
+    const phoneEntry = await entryAt(fixture.observer, "note.md") as LiveEntry;
+    expect(phoneEntry.history).toHaveLength(2);
+    const desktopCacheBefore = structuredClone(fixture.desktopCache.state);
+
+    const result = await fixture.desktop.cleanupExpiredContent("vault");
+
+    expect(result).toMatchObject({ kind: "committed", removedHistory: 1, removedRecoveries: 0 });
+    // 手机那次改动原样保留，只有过期的旧版本去掉了
+    expect(await entryAt(fixture.observer, "note.md")).toEqual({ ...phoneEntry, history: [phoneEntry.history![0]] });
+    // 电脑缓存落后于远端：不拿缓存构造、也不改缓存，本机文件不动
+    expect(fixture.desktopCache.state).toEqual(desktopCacheBefore);
+    expect(fixture.desktopVault.readText("note.md")).toBe("v1");
+    await expect(fixture.desktop.synchronize()).resolves.toMatchObject({ downloaded: 1, status: "complete" });
+    expect(fixture.desktopVault.readText("note.md")).toBe("phone v2");
+  });
+
+  it("accepts the cleaned record into a cache that is exactly at the Head it read", async () => {
+    const fixture = await setup({ "note.md": "v0" });
+    await fixture.desktopVault.write("note.md", text("v1"));
+    await fixture.desktop.synchronize();
+    fixture.objects.serverDate = at(40);
+
+    const result = await fixture.desktop.cleanupExpiredContent("vault");
+
+    const { head, snapshot } = await readCurrent(fixture.observer);
+    expect(result).toMatchObject({ commitId: head.value.commitId, kind: "committed" });
+    expect(fixture.desktopCache.state?.snapshot).toEqual(snapshot);
+  });
+
+  it("recomputes from the newer Head after another device wins the race", async () => {
+    const fixture = await setup({ "note.md": "v0", "other.md": "o0" });
+    await fixture.desktopVault.write("note.md", text("v1"));
+    await fixture.desktop.synchronize();
+    await fixture.phone.synchronize();
+    fixture.objects.serverDate = at(40);
+    let raced = false;
+    fixture.objects.onPut = async (key) => {
+      if (raced || !key.includes("/commits/")) return;
+      raced = true;
+      // 清理提交写好、发布 Head 之前，手机抢先发布了一次改动
+      await fixture.phoneVault.write("other.md", text("phone o1"));
+      await fixture.phone.synchronize();
+    };
+
+    const result = await retryHeadChanges(() => fixture.desktop.cleanupExpiredContent("vault"), { sleep: async () => {} });
+
+    expect(raced).toBe(true);
+    expect(result).toMatchObject({ kind: "committed", removedHistory: 1 });
+    const other = await entryAt(fixture.observer, "other.md") as LiveEntry;
+    expect(other.revision.contentHash).toBe(await sha256Content(text("phone o1")));
+    expect((await entryAt(fixture.observer, "note.md") as LiveEntry).history ?? []).toEqual([]);
+  });
+
+  it("sends no commit when nothing has expired", async () => {
+    const fixture = await setup({ "note.md": "v0" });
+    await fixture.desktopVault.write("note.md", text("v1"));
+    await fixture.desktop.synchronize();
+    fixture.objects.serverDate = at(29);
+    const putsBefore = fixture.objects.puts.length;
+
+    await expect(fixture.desktop.cleanupExpiredContent("vault")).resolves.toMatchObject({ kind: "nothing-to-clean" });
+
+    expect(fixture.objects.puts.length).toBe(putsBefore);
+  });
+
+  it("does nothing when the remote Head does not exist", async () => {
+    const objects = new ClockedObjectStore();
+    const service = new SyncService({
+      cache: new MemorySyncCache(), local: new MemoryVault(), remote: await RemoteStore.open({ objects, prefix, vaultKey }),
+      replicaId: "desktop",
+    });
+
+    await expect(service.cleanupExpiredContent("vault")).resolves.toEqual({ kind: "no-head" });
+
+    expect(objects.puts).toEqual([]);
+  });
+
+  it("writes a full snapshot when the cleanup commit lands on a hundredth generation", async () => {
+    const fixture = await setup({ "note.md": "v0" });
+    await fixture.desktopVault.write("note.md", text("v1"));
+    await fixture.desktop.synchronize();
+    // 把 Head 推到第 99 代，清理提交就是第 100 代
+    const { head, snapshot } = await readCurrent(fixture.observer);
+    const commitId = crypto.randomUUID();
+    const note = await entryAt(fixture.observer, "note.md");
+    await fixture.observer.advance({
+      commit: { changes: [{ entry: note, kind: "set-entry" }], commitId, createdAt: head.serverDate,
+        parentIds: [head.value.commitId], protocolVersion: 1, replicaId: "fixture", vaultId: snapshot.vaultId },
+      expectedHeadEtag: head.etag,
+      head: { ...head.value, commitId, generation: 99 },
+    });
+    fixture.objects.serverDate = at(40);
+
+    await fixture.desktop.cleanupExpiredContent("vault");
+
+    const after = await readCurrent(fixture.observer);
+    expect(after.head.value.generation).toBe(100);
+    expect(after.head.value.snapshotId).toBeDefined();
+    expect(after.head.value.snapshotId).not.toBe(head.value.snapshotId);
+    expect(fixture.objects.puts).toContain(`${prefix}/v1/snapshots/${after.head.value.snapshotId}`);
+    expect((after.snapshot.entries[note.entryId] as LiveEntry).history ?? []).toEqual([]);
+  });
+
+  it("lets every device sync after the cleanup and still applies an old deletion on a device that kept the file", async () => {
+    const fixture = await setup({ "gone.md": "gone", "edited.md": "edited" });
+    await fixture.desktopVault.delete("gone.md");
+    await fixture.desktop.synchronize();
+    await fixture.desktopVault.delete("edited.md");
+    await fixture.desktop.synchronize();
+    // 手机 40 天没同步：一篇没改，一篇改过
+    fixture.objects.serverDate = at(40);
+    await fixture.phoneVault.write("edited.md", text("phone edit"));
+    const deletedList = (state: CachedSyncState | undefined) => Object.values(state?.snapshot.entries ?? {})
+      .filter((entry) => entry.kind === "deleted" && (entry.recovery !== undefined || (entry.history?.length ?? 0) > 0))
+      .map((entry) => entry.path);
+    expect(deletedList(fixture.desktopCache.state).sort()).toEqual(["edited.md", "gone.md"]);
+
+    await expect(fixture.desktop.cleanupExpiredContent("vault")).resolves.toMatchObject({ removedRecoveries: 2 });
+
+    // 读 Head 的存在性检查照常通过
+    await expect(readCurrent(fixture.observer)).resolves.toBeDefined();
+    expect(deletedList(fixture.desktopCache.state)).toEqual([]);
+    const remove = vi.spyOn(fixture.phoneVault, "delete");
+    const result = await fixture.phone.synchronize();
+    // 没改的照旧删到回收站，改过的照旧进 edit-delete 冲突
+    expect(remove).toHaveBeenCalledWith("gone.md", await sha256Content(text("gone")));
+    expect(fixture.phoneVault.readText("gone.md")).toBeUndefined();
+    const conflict = await entryAt(fixture.observer, "edited.md");
+    expect(conflict).toMatchObject({ kind: "conflicted", reason: "edit-delete" });
+    expect(conflict.kind === "conflicted" && conflict.candidates.map((candidate) => candidate.contentHash))
+      .toEqual([await sha256Content(text("phone edit"))]);
+    expect(result.status).toBe("action-required");
+    expect(deletedList(fixture.phoneCache.state)).toEqual([]);
+  });
+
+  it("lets a phone that went 40 days without syncing download the newer Revision after its base was cleaned", async () => {
+    const fixture = await setup({ "note.md": "v0" });
+    await fixture.desktopVault.write("note.md", text("v1"));
+    await fixture.desktop.synchronize();
+    fixture.objects.serverDate = at(40);
+    await expect(fixture.desktop.cleanupExpiredContent("vault")).resolves.toMatchObject({ removedHistory: 1 });
+    const write = vi.spyOn(fixture.phoneVault, "write");
+
+    await expect(fixture.phone.synchronize()).resolves.toMatchObject({ downloaded: 1, status: "complete" });
+
+    expect(fixture.phoneVault.readText("note.md")).toBe("v1");
+    // 本机旧内容交给安全写入挪进本机回收站
+    expect(write).toHaveBeenCalledWith("note.md", expect.any(Uint8Array), await sha256Content(text("v0")));
   });
 });
