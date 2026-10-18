@@ -689,6 +689,106 @@ describe("SyncService", () => {
     expect((await remote.readHead())?.value.generation).toBe(1);
   });
 
+  describe("a stale local copy that matches Version History", () => {
+    const path = "notes/stale.md";
+    const encode = (text: string) => new TextEncoder().encode(text);
+    // 电脑依次发布 R1、R2、R3；手机的 base 停在 R1（或没有 base），本地内容另行写入
+    const setup = async (options: {phoneHasBase: boolean; phoneContent: string}) => {
+      const objects = new MemoryObjectStore();
+      const remote = await RemoteStore.open({objects, prefix: "stale", vaultKey: new Uint8Array(32)});
+      const desktopVault = new MemoryVault();
+      const desktop = new SyncService({cache: new MemorySyncCache(), local: desktopVault, remote, replicaId: "desktop"});
+      await desktopVault.write(path, encode("R1 first draft"));
+      await desktop.initializeNew("vault");
+      const phoneVault = new MemoryVault();
+      const phone = new SyncService({cache: new MemorySyncCache(), local: phoneVault, remote, replicaId: "phone"});
+      if (options.phoneHasBase) await phone.synchronize();
+      await desktopVault.write(path, encode("R2 second draft"));
+      await desktop.synchronize();
+      await desktopVault.write(path, encode("R3 current"));
+      await desktop.synchronize();
+      await phoneVault.write(path, encode(options.phoneContent));
+      const entryOf = async () => {
+        const head = (await remote.readHead())!;
+        return Object.values((await remote.readSnapshot(head.value)).entries).find(entry => entry.path === path)!;
+      };
+      const damageRevision = async (content: string) => {
+        const entry = await entryOf();
+        const hash = await sha256Content(encode(content));
+        const revision = (entry.history ?? []).find(value => value.contentHash === hash)!;
+        await objects.put(`stale/v1/blobs/${revision.blobId}`, encode("damaged"));
+      };
+      return {remote, phone, phoneVault, entryOf, damageRevision};
+    };
+
+    it("replaces a stale copy with the current Revision instead of conflicting", async () => {
+      const {remote, phone, phoneVault, entryOf} = await setup({phoneHasBase: true, phoneContent: "R2 second draft"});
+      const generation = (await remote.readHead())!.value.generation;
+
+      await expect(phone.synchronize()).resolves.toMatchObject({
+        status: "complete", downloaded: 1, uploaded: 0, localIssues: [],
+      });
+
+      expect(phoneVault.readText(path)).toBe("R3 current");
+      const entry = await entryOf();
+      expect(entry.kind).toBe("live");
+      expect(entry.kind === "live" && entry.revision.contentHash).toBe(await sha256Content(encode("R3 current")));
+      expect((await remote.readHead())!.value.generation).toBe(generation);
+      await expect(phone.synchronize()).resolves.toMatchObject({
+        status: "complete", downloaded: 0, uploaded: 0,
+      });
+    });
+
+    it("replaces a stale copy without a base instead of asking for review", async () => {
+      const {phone, phoneVault} = await setup({phoneHasBase: false, phoneContent: "R1 first draft"});
+
+      await expect(phone.synchronize()).resolves.toMatchObject({
+        status: "complete", downloaded: 1, uploaded: 0, localIssues: [],
+      });
+
+      expect(phoneVault.readText(path)).toBe("R3 current");
+      await expect(phone.synchronize()).resolves.toMatchObject({
+        status: "complete", downloaded: 0, uploaded: 0,
+      });
+    });
+
+    it("keeps conflicting when local content is not a recorded Revision", async () => {
+      const {phone, entryOf} = await setup({phoneHasBase: true, phoneContent: "phone edit"});
+
+      await phone.synchronize();
+
+      expect(await entryOf()).toMatchObject({kind: "conflicted", reason: "edit-edit"});
+    });
+
+    it("keeps bootstrap review when local content is not a recorded Revision", async () => {
+      const {phone, phoneVault} = await setup({phoneHasBase: false, phoneContent: "phone edit"});
+
+      await expect(phone.synchronize()).resolves.toMatchObject({
+        status: "action-required", localIssues: [{kind: "bootstrap-mismatch", path}],
+      });
+      expect(phoneVault.readText(path)).toBe("phone edit");
+    });
+
+    it("conflicts when the matching Revision can no longer be authenticated", async () => {
+      const {phone, entryOf, damageRevision} = await setup({phoneHasBase: true, phoneContent: "R2 second draft"});
+      await damageRevision("R2 second draft");
+
+      await phone.synchronize();
+
+      expect(await entryOf()).toMatchObject({kind: "conflicted", reason: "edit-edit"});
+    });
+
+    it("asks for bootstrap review when the matching Revision can no longer be authenticated", async () => {
+      const {phone, phoneVault, damageRevision} = await setup({phoneHasBase: false, phoneContent: "R1 first draft"});
+      await damageRevision("R1 first draft");
+
+      await expect(phone.synchronize()).resolves.toMatchObject({
+        status: "action-required", localIssues: [{kind: "bootstrap-mismatch", path}],
+      });
+      expect(phoneVault.readText(path)).toBe("R1 first draft");
+    });
+  });
+
   describe("reviewing local content without a trusted base", () => {
     const setup = async (reverseOrder = false) => {
       const objects = new MemoryObjectStore();

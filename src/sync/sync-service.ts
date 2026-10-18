@@ -6,8 +6,10 @@ import {
   type BulkDeletionPlan,
   type DeletedEntry,
   type LiveEntry,
+  type ReconcileInput,
   type ReplicaObservation,
   type RevisionRef,
+  type SyncPlan,
   type VaultEntry,
   type VaultSnapshot,
 } from "./sync-engine";
@@ -1381,7 +1383,7 @@ export class SyncService {
     const locallyMutatedPaths = new Set<string>();
     const retiredLocalPaths = new Set<string>();
     const reconciliationBase = this.buildReconciliationBase(cached);
-    let plan = this.engine.reconcile({
+    let plan = await this.reconcileWithRecoverableStaleCopies({
       base: reconciliationBase,
       local: observation,
       remote,
@@ -1425,7 +1427,7 @@ export class SyncService {
           ? { ...file, entryId: assignments.get(file.path)! } : file);
       }
       // 配对之外剩下的消失与新增都已由用户审查过，按独立的删除和新增执行
-      plan = this.engine.reconcile({
+      plan = await this.reconcileWithRecoverableStaleCopies({
         base: reconciliationBase, local: observation, remote,
         allowIndependentCreatesAndDeletes: true,
       });
@@ -2285,6 +2287,24 @@ export class SyncService {
     if (entry.kind === "conflicted" && entry.materializedContentHash &&
       !entry.candidates.some(candidate => candidate.contentHash === entry.materializedContentHash)) return;
     await this.options.onIntegrityVerified?.({kind: "recovery", entryId: entry.entryId, contentHash: revision.contentHash});
+  }
+
+  // 旧副本只有在被替换的本地内容于远端有可认证的恢复副本时才直接取远端；
+  // 核实不了（数据块损坏或校验不过）就退回原有的冲突或审查，网络错误照常抛出
+  private async reconcileWithRecoverableStaleCopies(input: ReconcileInput): Promise<SyncPlan> {
+    const plan = this.engine.reconcile(input);
+    const rejected = new Set<string>();
+    for (const staleCopy of plan.staleCopies ?? []) {
+      try {
+        await this.assertRemoteRecoveryForLocalContent(input.remote, staleCopy.entryId, staleCopy.contentHash);
+      } catch (error) {
+        if (!(error instanceof RemoteStateError)) throw error;
+        rejected.add(staleCopy.entryId);
+      }
+    }
+    return rejected.size > 0
+      ? this.engine.reconcile({...input, rejectedStaleCopyEntryIds: rejected})
+      : plan;
   }
 
   private async assertRemoteRecoveryForLocalContent(

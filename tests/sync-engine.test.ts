@@ -1039,4 +1039,85 @@ describe("SyncEngine", () => {
       },
     ]);
   });
+
+  describe("stale local copies", () => {
+    const revision = (name: string, size = 2) => ({
+      blobId: `blob-${name}`,
+      contentHash: `sha256:${name}`,
+      createdAt: "2026-09-01T00:00:00.000Z",
+      revisionId: `revision-${name}`,
+      size,
+    });
+    const snapshot = (entry: VaultSnapshot["entries"][string], commitId = "commit-remote"): VaultSnapshot => ({
+      commitId, entries: { [entry.entryId]: entry }, protocolVersion: 1, vaultId: "vault-1",
+    });
+    const path = "notes/stale.md";
+    const base = snapshot({ entryId: "entry-1", kind: "live", path, revision: revision("r1") }, "commit-base");
+    const local = (contentHash: string, size = 2): ReplicaObservation => ({
+      basedOnCommitId: "commit-base",
+      files: [{ contentHash, entryId: "entry-1", path, size }],
+      replicaId: "phone",
+    });
+    const liveRemote = snapshot({
+      entryId: "entry-1", history: [revision("r2"), revision("r1")], kind: "live", path, revision: revision("r3"),
+    });
+
+    it("downloads the current Revision over a copy recorded in Version History", () => {
+      const plan = new SyncEngine().reconcile({ base, local: local("sha256:r2"), remote: liveRemote });
+
+      expect(plan.conflicts).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+      expect(plan.localActions).toEqual([
+        { entryId: "entry-1", kind: "download-remote", path, revision: revision("r3") },
+      ]);
+      expect(plan.staleCopies).toEqual([{ contentHash: "sha256:r2", entryId: "entry-1" }]);
+    });
+
+    it("keeps an edit-edit Conflict when the recorded Revision has a different size", () => {
+      const plan = new SyncEngine().reconcile({ base, local: local("sha256:r2", 3), remote: liveRemote });
+
+      expect(plan.conflicts).toMatchObject([{ kind: "edit-edit", entryId: "entry-1" }]);
+      expect(plan.staleCopies).toBeUndefined();
+    });
+
+    it("keeps an edit-edit Conflict for a stale copy whose recovery was rejected", () => {
+      const plan = new SyncEngine().reconcile({
+        base, local: local("sha256:r2"), remote: liveRemote, rejectedStaleCopyEntryIds: new Set(["entry-1"]),
+      });
+
+      expect(plan.conflicts).toMatchObject([{ kind: "edit-edit", entryId: "entry-1" }]);
+      expect(plan.localActions).toEqual([]);
+    });
+
+    it("keeps an edit-delete Conflict when the deleted Entry recorded the local copy", () => {
+      const plan = new SyncEngine().reconcile({
+        base,
+        local: local("sha256:r2"),
+        remote: snapshot({
+          deletedAt: "2026-09-02T00:00:00.000Z", entryId: "entry-1", history: [revision("r2"), revision("r1")],
+          kind: "deleted", lastContentHash: "sha256:r3", lastRevisionId: "revision-r3", path,
+          recovery: { ...revision("r3"), expiresAt: "2026-10-02T00:00:00.000Z" },
+        }),
+      });
+
+      expect(plan.conflicts).toMatchObject([{ kind: "edit-delete", entryId: "entry-1" }]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.staleCopies).toBeUndefined();
+    });
+
+    it("does not replace a copy recorded by a conflicted Entry", () => {
+      const plan = new SyncEngine().reconcile({
+        base,
+        local: local("sha256:r2"),
+        remote: snapshot({
+          candidates: [revision("r3"), revision("r4")], entryId: "entry-1", history: [revision("r2"), revision("r1")],
+          kind: "conflicted", materializedContentHash: "sha256:r3", path, reason: "edit-edit",
+        }),
+      });
+
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+      expect(plan.staleCopies).toBeUndefined();
+    });
+  });
 });

@@ -205,6 +205,13 @@ export interface SyncPlan {
   conflicts: SyncConflict[];
   localActions: LocalAction[];
   remoteChanges: RemoteChange[];
+  // 按旧副本规则改成下载的 Entry 及被替换的本地内容；执行前要核实远端有它的恢复副本
+  staleCopies?: StaleCopy[];
+}
+
+export interface StaleCopy {
+  contentHash: string;
+  entryId: string;
 }
 
 export interface BulkDeletionPlan {
@@ -217,8 +224,16 @@ export interface ReconcileInput {
   allowIndependentCreatesAndDeletes?: boolean;
   base?: VaultSnapshot;
   local: ReplicaObservation;
+  // 恢复副本核实不了的 Entry 不按旧副本处理，退回原有的冲突或审查
+  rejectedStaleCopyEntryIds?: ReadonlySet<string>;
   remote: VaultSnapshot;
 }
+
+// 本地内容与远端 Entry Version History 里某个版本字节一致（哈希和大小都相同），说明只是没改过的旧副本
+const matchesRecordedRevision = (entry: LiveEntry, file: ObservedFile): boolean =>
+  (entry.history ?? []).some(
+    (revision) => revision.contentHash === file.contentHash && revision.size === file.size,
+  );
 
 // 文件类型 = 路径最后一段的扩展名（不区分大小写）；没有扩展名的（含点开头的隐藏文件）算同一类
 export function fileType(path: string): string {
@@ -230,7 +245,9 @@ export function fileType(path: string): string {
 export class SyncEngine {
   constructor(private readonly createId: () => string = () => crypto.randomUUID()) {}
 
-  reconcile({ base, local, remote, allowIndependentCreatesAndDeletes = false }: ReconcileInput): SyncPlan {
+  reconcile({
+    base, local, remote, allowIndependentCreatesAndDeletes = false, rejectedStaleCopyEntryIds,
+  }: ReconcileInput): SyncPlan {
     // Resume only identity-proven remote moves whose verified target already exists.
     // Equal hashes alone never establish identity for unrelated local files.
     if (base && !local.bootstrapPending) {
@@ -387,6 +404,11 @@ export class SyncEngine {
     const unmaterializedEntryIds = new Set(
       local.unmaterializedEntryIds ?? [],
     );
+    const staleCopies: StaleCopy[] = [];
+    const isStaleCopy = (entry: LiveEntry, file: ObservedFile): boolean =>
+      !rejectedStaleCopyEntryIds?.has(entry.entryId) &&
+      !deferredEntryIds.has(entry.entryId) &&
+      matchesRecordedRevision(entry, file);
 
     for (const file of local.files) {
       const remoteEntry = file.entryId
@@ -402,6 +424,17 @@ export class SyncEngine {
           (unmaterializedEntryIds.has(remoteEntry.entryId) && !file.entryId)) &&
         file.contentHash !== remoteEntry.revision.contentHash
       ) {
+        // 没有可信 base，但本地是远端记录过的旧版本：直接取远端当前版本，不必审查
+        if (file.path === remoteEntry.path && isStaleCopy(remoteEntry, file)) {
+          staleCopies.push({ contentHash: file.contentHash, entryId: remoteEntry.entryId });
+          localActions.push({
+            entryId: remoteEntry.entryId,
+            kind: "download-remote",
+            path: remoteEntry.path,
+            revision: remoteEntry.revision,
+          });
+          continue;
+        }
         conflicts.push({
           kind: "bootstrap-mismatch",
           localFile: file,
@@ -434,6 +467,14 @@ export class SyncEngine {
           path: remoteEntry.path,
         });
       } else if (remoteEntry?.kind === "live") {
+        // 本地和 base、远端当前都不同，却等于远端历史里的某个版本：当作本地没改过，走「远端改了」的下载路径
+        const staleCopy =
+          baseEntry?.kind === "live" &&
+          file.path === baseEntry.path &&
+          file.contentHash !== baseEntry.revision.contentHash &&
+          remoteEntry.revision.contentHash !== baseEntry.revision.contentHash &&
+          file.contentHash !== remoteEntry.revision.contentHash &&
+          isStaleCopy(remoteEntry, file);
         if (
           baseEntry?.kind === "live" &&
           file.path !== baseEntry.path &&
@@ -478,6 +519,7 @@ export class SyncEngine {
           });
         } else if (
           baseEntry?.kind === "live" &&
+          !staleCopy &&
           file.contentHash !== baseEntry.revision.contentHash &&
           remoteEntry.revision.contentHash !== baseEntry.revision.contentHash &&
           file.contentHash !== remoteEntry.revision.contentHash
@@ -515,9 +557,12 @@ export class SyncEngine {
           });
         } else if (
           baseEntry?.kind === "live" &&
-          file.contentHash === baseEntry.revision.contentHash &&
+          (file.contentHash === baseEntry.revision.contentHash || staleCopy) &&
           remoteEntry.revision.contentHash !== baseEntry.revision.contentHash
         ) {
+          if (staleCopy) {
+            staleCopies.push({ contentHash: file.contentHash, entryId: remoteEntry.entryId });
+          }
           if (file.path !== remoteEntry.path) {
             if (
               file.path !== baseEntry.path &&
@@ -830,6 +875,7 @@ export class SyncEngine {
       conflicts,
       localActions,
       remoteChanges,
+      ...(staleCopies.length > 0 ? { staleCopies } : {}),
     };
   }
 }
