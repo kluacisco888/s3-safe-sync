@@ -129,11 +129,25 @@ interface PersistedPluginData {
   // 清理过期内容的开关：只对打开时的仓库目标（桶、区域、前缀、vaultId）有效；
   // lastRunServerDate 是上一次清理读到的 AWS 时间，用来做到每天最多一次
   expiredContentCleanup?: { target: string; lastRunServerDate?: string };
+  // 数据块删除的第一次判定记录（blobId → 判定没人用时的 AWS 时间），绑定仓库目标（桶、区域、前缀、vaultId）；
+  // 丢了或目标不同就从下一次检查重新计时
+  unreferencedBlobMarks?: { target: string; firstSeen: Record<string, string> };
   settings: S3VaultSyncSettings;
 }
 
 const normalizePrefix = (prefix: string): string =>
   prefix.replace(/^\/+|\/+$/gu, "");
+
+// 读回本地保存的第一次判定记录；形状不对就当没有（只会让删除更晚，不会更早）
+const parseUnreferencedBlobMarks = (value: unknown): PersistedPluginData["unreferencedBlobMarks"] => {
+  if (typeof value !== "object" || value === null) return undefined;
+  const { target, firstSeen } = value as Record<string, unknown>;
+  if (typeof target !== "string" || typeof firstSeen !== "object" || firstSeen === null || Array.isArray(firstSeen)) return undefined;
+  return {
+    firstSeen: Object.fromEntries(Object.entries(firstSeen).filter((pair): pair is [string, string] => typeof pair[1] === "string")),
+    target,
+  };
+};
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const ANDROID_DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
@@ -425,9 +439,15 @@ export default class S3VaultSyncPlugin
     const vaultId = this.data.settings.vaultId;
     if (!vaultId || !this.credentials.loadVaultKey()) throw new Error("请先初始化或解锁加密仓库。");
     const target = this.integrityTarget();
-    const preview = await this.runExclusiveSyncService(service => service.previewExpiredContentCleanup(vaultId));
+    const preview = await this.runExclusiveSyncService(service =>
+      service.previewExpiredContentCleanup(vaultId, this.currentUnreferencedBlobMarks(target)));
     if (this.integrityTarget() === target) this.expiredContentPreviewTarget = target;
     return preview;
+  }
+
+  private currentUnreferencedBlobMarks(target: string): Record<string, string> | undefined {
+    const marks = this.data.unreferencedBlobMarks;
+    return marks?.target === target ? marks.firstSeen : undefined;
   }
 
   async setExpiredContentCleanupEnabled(enabled: boolean, allDevicesUpdated: boolean): Promise<void> {
@@ -990,6 +1010,7 @@ export default class S3VaultSyncPlugin
       pendingInitialization: stored?.pendingInitialization,
       pendingProbes: stored?.pendingProbes ?? [],
       expiredContentCleanup: stored?.expiredContentCleanup,
+      unreferencedBlobMarks: parseUnreferencedBlobMarks(stored?.unreferencedBlobMarks),
       settings,
     };
     this.acceptedCommit = this.data.cache?.snapshot.commitId;
@@ -1326,6 +1347,16 @@ export default class S3VaultSyncPlugin
     diagnostic.expiredContentCleanup = {at: Date.now(), removedHistory: cleanup.removedHistory,
       removedRecoveries: cleanup.removedRecoveries};
     this.data.expiredContentCleanup = {target, lastRunServerDate: cleanup.serverDate};
+    await this.savePluginData();
+    // 清理提交之后删除没人用的数据块：同一个 remote（同一个独占队列、同一个目标守卫），
+    // 目标一变 createObjectStore 的守卫就拦下之后的每个请求，不再发出 DELETE。
+    // 出错直接抛出、在同步状态里报告；上面已记下今天跑过，不会每次同步都重试
+    const blobs = await this.createSyncService(remote).deleteUnreferencedBlobs(vaultId, this.currentUnreferencedBlobMarks(target));
+    this.session.assertActive();
+    assertTarget();
+    if (blobs.kind === "no-head" || this.integrityTarget() !== target) return;
+    diagnostic.blobCleanup = {deletedBlobs: blobs.deletedBlobs, deletedBytes: blobs.deletedBytes};
+    this.data.unreferencedBlobMarks = {target, firstSeen: blobs.marks};
     await this.savePluginData();
   }
 
