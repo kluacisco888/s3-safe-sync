@@ -1914,22 +1914,26 @@ export class SyncService {
           ) {
             throw new Error(`文件 ${conflict.entryId} 应为当前版本或已恢复`);
           }
-          const baseContent =
+          // base 已被过期清理出记录时不读取它（数据块可能已删），也就不合并：两份都进冲突中心
+          const mergeBase =
             baseEntry.kind === "live"
-              ? await this.options.remote.readBlob(baseEntry.revision.blobId)
+              ? retainedInRecord(remote, conflict.entryId, baseEntry.revision)
               : undefined;
+          const baseContent = mergeBase
+            ? await this.options.remote.readBlob(mergeBase.blobId)
+            : undefined;
           const remoteContent = await this.options.remote.readBlob(
             remoteEntry.revision.blobId,
           );
-          if ((baseEntry.kind === "live" && !baseContent) || !remoteContent) {
+          if ((mergeBase && !baseContent) || !remoteContent) {
             throw new Error(`${conflict.path} 的冲突历史不完整`);
           }
           if (
-            (baseEntry.kind === "live" &&
+            (mergeBase &&
               (!baseContent ||
-                baseContent.byteLength !== baseEntry.revision.size ||
+                baseContent.byteLength !== mergeBase.size ||
                 (await sha256(baseContent)) !==
-                  baseEntry.revision.contentHash)) ||
+                  mergeBase.contentHash)) ||
             remoteContent.byteLength !== remoteEntry.revision.size ||
             (await sha256(remoteContent)) !== remoteEntry.revision.contentHash
           ) {

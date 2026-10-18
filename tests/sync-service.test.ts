@@ -6448,4 +6448,45 @@ describe("a base Revision purged from the remote record", () => {
     expect(conflicted?.kind === "conflicted" ? conflicted.recovery : "missing").toBeUndefined();
     await expect(fixture.desktop.synchronize()).resolves.toMatchObject({ status: "action-required" });
   });
+
+  it.each([
+    ["purged from the record", false],
+    ["purged and its blob deleted", true],
+  ])("keeps both edits in the Conflict Center instead of merging over a base that was %s", async (_label, deleteBlobs) => {
+    const fixture = await setup("note.md", "a\nb\nc");
+    const base = await fixture.liveEntry();
+    await fixture.desktopVault.write("note.md", text("a\nb\nC"));
+    await fixture.desktop.synchronize();
+    const remoteEdit = await fixture.liveEntry();
+    await purgeRevisions(fixture.observer, fixture.objects, [base.revision.revisionId], deleteBlobs);
+    // 本机真的改过（与 base 不同），而且和远端的改动本可以干净合并
+    await fixture.phoneVault.write("note.md", text("A\nb\nc"));
+
+    await expect(fixture.phone.synchronize()).resolves.toMatchObject({ status: "action-required" });
+
+    const conflicted = (await readCurrent(await fixture.open())).snapshot.entries[base.entryId];
+    if (conflicted?.kind !== "conflicted") throw new Error("Expected a Conflict");
+    expect(conflicted).toMatchObject({ reason: "edit-edit" });
+    expect(conflicted.candidates.map((candidate) => candidate.revisionId)).toContain(remoteEdit.revision.revisionId);
+    const localCandidate = conflicted.candidates.find((candidate) => candidate.revisionId !== remoteEdit.revision.revisionId);
+    if (!localCandidate) throw new Error("Expected the local edit as a candidate");
+    const preserved = await fixture.phone.readConflictCandidate(base.entryId, localCandidate.revisionId);
+    expect(new TextDecoder().decode(preserved)).toBe("A\nb\nc");
+  });
+
+  it("keeps an edit made while deferred in the Conflict Center after the old local base was purged", async () => {
+    const fixture = await deferredWithPurgedBase(true);
+    await fixture.phoneVault.write("note.md", text("phone"));
+    await expect(fixture.phone.synchronize()).resolves.toMatchObject({
+      localIssues: [{ kind: "deferred-local-edit", path: "note.md" }],
+      status: "action-required",
+    });
+
+    await expect(fixture.unlimitedPhone.synchronize()).resolves.toMatchObject({ status: "action-required" });
+
+    const conflicted = (await readCurrent(await fixture.open())).snapshot.entries[fixture.base.entryId];
+    if (conflicted?.kind !== "conflicted") throw new Error("Expected a Conflict");
+    expect(conflicted.candidates.map((candidate) => candidate.contentHash).sort())
+      .toEqual([await sha256Content(text(big)), await sha256Content(text("phone"))].sort());
+  });
 });
