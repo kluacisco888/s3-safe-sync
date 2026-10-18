@@ -884,6 +884,22 @@ describe("SyncService", () => {
       await expect(phone.synchronize()).resolves.toMatchObject({status: "complete", downloaded: 0, uploaded: 0});
     });
 
+    it("stops without a Conflict when the downloaded Revision has no recovery copy left", async () => {
+      const {objects, phone, phoneVault, entryAt, interruptAfterDownloads, publishR3} = await setup({phoneHasBase: true});
+      interruptAfterDownloads(1);
+      await expect(phone.synchronize()).rejects.toThrow("network lost");
+      await publishR3();
+      const entry = await entryAt(x);
+      const hash = await sha256Content(encode("R2 x"));
+      const r2 = (entry.history ?? []).find(value => value.contentHash === hash)!;
+      await objects.put(`resume/v1/blobs/${r2.blobId}`, encode("damaged"));
+
+      // 不变量 9：替换本地 R2 之前必须有可核实的恢复副本，没有就停下，不把它当成本机修改发布 Conflict
+      await expect(phone.synchronize()).rejects.toBeInstanceOf(RemoteStateError);
+      expect(phoneVault.readText(x)).toBe("R2 x");
+      expect(await entryAt(x)).toMatchObject({kind: "live"});
+    });
+
     it("does not ask for bootstrap review of a file downloaded before the interruption", async () => {
       const {phone, phoneVault, phoneCache, interruptAfterDownloads, hideRevisionWhilePlanning, publishR3} =
         await setup({phoneHasBase: false});
