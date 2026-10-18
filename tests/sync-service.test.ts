@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   SyncService,
@@ -882,6 +882,104 @@ describe("SyncService", () => {
       expect(phoneVault.readText("notes/z.md")).toBe("new z");
       expect(await entryAt(x)).toMatchObject({kind: "live"});
       await expect(phone.synchronize()).resolves.toMatchObject({status: "complete", downloaded: 0, uploaded: 0});
+    });
+
+    it("does not ask for bootstrap review of a file downloaded before the interruption", async () => {
+      const {phone, phoneVault, phoneCache, interruptAfterDownloads, hideRevisionWhilePlanning, publishR3} =
+        await setup({phoneHasBase: false});
+      interruptAfterDownloads(1);
+      await expect(phone.synchronize()).rejects.toThrow("network lost");
+      expect(phoneVault.readText(x)).toBe("R2 x");
+      expect(phoneCache.state).toMatchObject({bootstrapPending: true});
+      expect(Object.keys(phoneCache.state!.files)).toEqual([x]);
+
+      await publishR3();
+      await hideRevisionWhilePlanning(x, "R2 x");
+      await expect(phone.synchronize()).resolves.toMatchObject({
+        status: "complete", uploaded: 0, localIssues: [],
+      });
+
+      expect(phoneVault.readText(x)).toBe("R3 x");
+      expect(phoneVault.readText("notes/z.md")).toBe("new z");
+      expect(phoneCache.state?.bootstrapPending).toBeUndefined();
+    });
+
+    it("keeps a download materialized before an interrupted upload while real local edits still conflict", async () => {
+      const {objects, phone, phoneVault, desktopVault, desktop, entryAt, hooks, hideRevisionWhilePlanning, publishR3} =
+        await setup({phoneHasBase: true});
+      // 下载前就存在的本机修改：y 不等于任何远端版本，另有一个本机新文件
+      await phoneVault.write("notes/y.txt", encode("phone y edit"));
+      await phoneVault.write("notes/new.txt", encode("phone new"));
+      await desktopVault.write("notes/y.txt", encode("desktop y edit"));
+      await desktop.synchronize();
+      let uploadsStarted = false;
+      hooks.onProgress = progress => {
+        if (progress.phase === "uploading") uploadsStarted = true;
+      };
+      objects.onPut = key => {
+        if (!uploadsStarted || !key.includes("/blobs/")) return;
+        objects.onPut = undefined;
+        throw new Error("network lost");
+      };
+      await expect(phone.synchronize()).rejects.toThrow("network lost");
+      hooks.onProgress = undefined;
+      expect(phoneVault.readText(x)).toBe("R2 x");
+
+      await publishR3();
+      await hideRevisionWhilePlanning(x, "R2 x");
+      await expect(phone.synchronize()).resolves.toMatchObject({status: "action-required", uploaded: 2});
+
+      expect(phoneVault.readText(x)).toBe("R3 x");
+      expect(await entryAt(x)).toMatchObject({kind: "live"});
+      expect(await entryAt("notes/y.txt")).toMatchObject({kind: "conflicted", reason: "edit-edit"});
+      expect(await entryAt("notes/new.txt")).toMatchObject({kind: "live"});
+    });
+
+    it("does not record a file edited right after it was downloaded", async () => {
+      const {phone, phoneVault, phoneCache, entryAt, interruptAfterDownloads, publishR3} =
+        await setup({phoneHasBase: true});
+      const write = phoneVault.write.bind(phoneVault);
+      phoneVault.write = async (path: string, body: Uint8Array) => {
+        await write(path, body);
+        if (path === x) {
+          phoneVault.write = write;
+          await write(x, encode("phone edit after download"));
+        }
+      };
+      interruptAfterDownloads(1);
+      await expect(phone.synchronize()).rejects.toThrow("network lost");
+      expect(phoneCache.state!.files[x]?.contentHash).toBe(await sha256Content(encode("R1 x")));
+
+      await publishR3();
+      await phone.synchronize();
+
+      expect(await entryAt(x)).toMatchObject({kind: "conflicted", reason: "edit-edit"});
+    });
+
+    it("saves downloaded files periodically so a killed run keeps them", async () => {
+      const {objects, phone, phoneCache, hooks} = await setup({phoneHasBase: true});
+      vi.useFakeTimers({toFake: ["Date"]});
+      try {
+        // 第一个下载开始时时钟走过保存间隔；进程在下一个下载中途被杀，来不及走错误处理
+        let savedBeforeKill: CachedSyncState | undefined;
+        hooks.onProgress = progress => {
+          if (progress.phase !== "downloading") return;
+          if (progress.completed === 0) vi.setSystemTime(Date.now() + 5_000);
+          if (progress.completed === 1) {
+            hooks.onProgress = undefined;
+            objects.onGet = key => {
+              if (!key.includes("/blobs/")) return;
+              objects.onGet = undefined;
+              savedBeforeKill = structuredClone(phoneCache.state);
+              throw new Error("process killed");
+            };
+          }
+        };
+        await expect(phone.synchronize()).rejects.toThrow("process killed");
+        expect(savedBeforeKill?.files[x]?.contentHash).toBe(await sha256Content(encode("R2 x")));
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
