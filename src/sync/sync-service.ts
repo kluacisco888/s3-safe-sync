@@ -2241,10 +2241,16 @@ export class SyncService {
           ? entry.revision
           : entry.history?.find(
               (revision) => revision.contentHash === cachedFile.contentHash,
-            );
-      if (!priorRevision) {
-        continue;
-      }
+            ) ?? {
+              // 旧 Revision 已被过期清理出记录（缓存接受了清理后的快照）时，仍以缓存记下的本机内容为 base，
+              // 否则本机旧内容会被当成本机修改上传。这个 Revision 不在远端记录里、不对应任何数据块：
+              // 只用于比对内容，下载覆盖按已清理的 base 处理，合并时不读取它，也不会写进新提交
+              blobId: `purged-local-base:${entry.entryId}`,
+              contentHash: cachedFile.contentHash,
+              createdAt: entry.revision.createdAt,
+              revisionId: `purged-local-base:${entry.entryId}`,
+              size: cachedFile.size,
+            };
       const priorEntry: LiveEntry = {
         ...entry,
         path: cachedFile.path,

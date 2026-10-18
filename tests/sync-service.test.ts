@@ -6299,7 +6299,7 @@ describe("a base Revision purged from the remote record", () => {
     }
   };
 
-  const setup = async (path = "note.md", initial = "v0") => {
+  const setup = async (path = "note.md", initial = "v0", maxAutomaticFileBytes?: number) => {
     const objects = new MemoryObjectStore();
     const open = () => RemoteStore.open({ objects, prefix, vaultKey });
     const desktopVault = new MemoryVault();
@@ -6310,15 +6310,19 @@ describe("a base Revision purged from the remote record", () => {
     await desktop.initializeNew("vault");
     const phoneVault = new MemoryVault();
     const phoneCache = new MemorySyncCache();
-    const phone = new SyncService({ cache: phoneCache, local: phoneVault, remote: await open(), replicaId: "phone" });
+    const phoneRemote = await open();
+    const phone = new SyncService({
+      cache: phoneCache, local: phoneVault, maxAutomaticFileBytes, remote: phoneRemote, replicaId: "phone",
+    });
     await phone.synchronize();
+    const unlimitedPhone = new SyncService({ cache: phoneCache, local: phoneVault, remote: phoneRemote, replicaId: "phone" });
     const observer = await open();
     const liveEntry = async (): Promise<LiveEntry> => {
       const entry = Object.values((await readCurrent(observer)).snapshot.entries).find((value) => value.path === path);
       if (entry?.kind !== "live") throw new Error("Expected a live Entry");
       return entry;
     };
-    return { desktop, desktopVault, liveEntry, objects, observer, open, phone, phoneCache, phoneVault };
+    return { desktop, desktopVault, liveEntry, objects, observer, open, phone, phoneCache, phoneVault, unlimitedPhone };
   };
 
   it.each([
@@ -6353,5 +6357,47 @@ describe("a base Revision purged from the remote record", () => {
     await expect(fixture.phone.verifyRemoteIntegrity([check], "vault")).resolves.toBeUndefined();
     await expect(fixture.phone.synchronize()).resolves.toMatchObject({ downloaded: 1, status: "complete" });
     expect(fixture.phoneVault.readText("note.md")).toBe("v1");
+  });
+
+  const big = "remote content above limit";
+
+  // 手机限 10 字节：电脑改成大文件后手机暂缓下载，本机留着旧的 v0；之后 v0 被清理出记录
+  const deferredWithPurgedBase = async (acceptPurgedRecordWhileDeferred: boolean) => {
+    const fixture = await setup("note.md", "v0", 10);
+    const base = await fixture.liveEntry();
+    await fixture.desktopVault.write("note.md", text(big));
+    await fixture.desktop.synchronize();
+    await expect(fixture.phone.synchronize()).resolves.toMatchObject({ deferredDownloads: 1, downloaded: 0 });
+    await purgeRevisions(fixture.observer, fixture.objects, [base.revision.revisionId], true);
+    if (acceptPurgedRecordWhileDeferred) {
+      // 仍在暂缓时同步一次：缓存接受了已清理的记录，里面再也找不到 v0 这个旧 Revision
+      await expect(fixture.phone.synchronize()).resolves.toMatchObject({ deferredDownloads: 1, downloaded: 0 });
+    }
+    expect(fixture.phoneVault.readText("note.md")).toBe("v0");
+    return { ...fixture, base };
+  };
+
+  it.each([
+    ["while the cache still lists it", false],
+    ["after the cache accepted the purged record", true],
+  ])("downloads a deferred update after the limit is raised when the old local base was purged %s", async (_label, acceptPurged) => {
+    const fixture = await deferredWithPurgedBase(acceptPurged);
+    const generationBefore = (await readCurrent(fixture.observer)).head.value.generation;
+
+    const result = await fixture.unlimitedPhone.synchronize();
+
+    expect(result).toMatchObject({ downloaded: 1, status: "complete", uploaded: 0 });
+    expect(fixture.phoneVault.readText("note.md")).toBe(big);
+    expect((await readCurrent(fixture.observer)).head.value.generation).toBe(generationBefore);
+    expect((await fixture.liveEntry()).revision.contentHash).toBe(await sha256Content(text(big)));
+  });
+
+  it("manually downloads a deferred update whose old local base was purged", async () => {
+    const fixture = await deferredWithPurgedBase(true);
+
+    await fixture.phone.downloadDeferred(fixture.base.entryId);
+
+    expect(fixture.phoneVault.readText("note.md")).toBe(big);
+    await expect(fixture.unlimitedPhone.synchronize()).resolves.toMatchObject({ downloaded: 0, status: "complete", uploaded: 0 });
   });
 });
