@@ -205,6 +205,13 @@ export interface SyncPlan {
   conflicts: SyncConflict[];
   localActions: LocalAction[];
   remoteChanges: RemoteChange[];
+  // 按旧副本规则改成下载的 Entry 及被替换的本地内容；执行前要核实远端有它的恢复副本
+  staleCopies?: StaleCopy[];
+}
+
+export interface StaleCopy {
+  contentHash: string;
+  entryId: string;
 }
 
 export interface BulkDeletionPlan {
@@ -217,13 +224,30 @@ export interface ReconcileInput {
   allowIndependentCreatesAndDeletes?: boolean;
   base?: VaultSnapshot;
   local: ReplicaObservation;
+  // 恢复副本核实不了的 Entry 不按旧副本处理，退回原有的冲突或审查
+  rejectedStaleCopyEntryIds?: ReadonlySet<string>;
   remote: VaultSnapshot;
+}
+
+// 本地内容与远端 Entry Version History 里某个版本字节一致（哈希和大小都相同），说明只是没改过的旧副本
+const matchesRecordedRevision = (entry: LiveEntry, file: ObservedFile): boolean =>
+  (entry.history ?? []).some(
+    (revision) => revision.contentHash === file.contentHash && revision.size === file.size,
+  );
+
+// 文件类型 = 路径最后一段的扩展名（不区分大小写）；没有扩展名的（含点开头的隐藏文件）算同一类
+export function fileType(path: string): string {
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
 }
 
 export class SyncEngine {
   constructor(private readonly createId: () => string = () => crypto.randomUUID()) {}
 
-  reconcile({ base, local, remote, allowIndependentCreatesAndDeletes = false }: ReconcileInput): SyncPlan {
+  reconcile({
+    base, local, remote, allowIndependentCreatesAndDeletes = false, rejectedStaleCopyEntryIds,
+  }: ReconcileInput): SyncPlan {
     // Resume only identity-proven remote moves whose verified target already exists.
     // Equal hashes alone never establish identity for unrelated local files.
     if (base && !local.bootstrapPending) {
@@ -380,6 +404,11 @@ export class SyncEngine {
     const unmaterializedEntryIds = new Set(
       local.unmaterializedEntryIds ?? [],
     );
+    const staleCopies: StaleCopy[] = [];
+    const isStaleCopy = (entry: LiveEntry, file: ObservedFile): boolean =>
+      !rejectedStaleCopyEntryIds?.has(entry.entryId) &&
+      !deferredEntryIds.has(entry.entryId) &&
+      matchesRecordedRevision(entry, file);
 
     for (const file of local.files) {
       const remoteEntry = file.entryId
@@ -395,6 +424,17 @@ export class SyncEngine {
           (unmaterializedEntryIds.has(remoteEntry.entryId) && !file.entryId)) &&
         file.contentHash !== remoteEntry.revision.contentHash
       ) {
+        // 没有可信 base，但本地是远端记录过的旧版本：直接取远端当前版本，不必审查
+        if (file.path === remoteEntry.path && isStaleCopy(remoteEntry, file)) {
+          staleCopies.push({ contentHash: file.contentHash, entryId: remoteEntry.entryId });
+          localActions.push({
+            entryId: remoteEntry.entryId,
+            kind: "download-remote",
+            path: remoteEntry.path,
+            revision: remoteEntry.revision,
+          });
+          continue;
+        }
         conflicts.push({
           kind: "bootstrap-mismatch",
           localFile: file,
@@ -427,6 +467,14 @@ export class SyncEngine {
           path: remoteEntry.path,
         });
       } else if (remoteEntry?.kind === "live") {
+        // 本地和 base、远端当前都不同，却等于远端历史里的某个版本：当作本地没改过，走「远端改了」的下载路径
+        const staleCopy =
+          baseEntry?.kind === "live" &&
+          file.path === baseEntry.path &&
+          file.contentHash !== baseEntry.revision.contentHash &&
+          remoteEntry.revision.contentHash !== baseEntry.revision.contentHash &&
+          file.contentHash !== remoteEntry.revision.contentHash &&
+          isStaleCopy(remoteEntry, file);
         if (
           baseEntry?.kind === "live" &&
           file.path !== baseEntry.path &&
@@ -471,6 +519,7 @@ export class SyncEngine {
           });
         } else if (
           baseEntry?.kind === "live" &&
+          !staleCopy &&
           file.contentHash !== baseEntry.revision.contentHash &&
           remoteEntry.revision.contentHash !== baseEntry.revision.contentHash &&
           file.contentHash !== remoteEntry.revision.contentHash
@@ -508,9 +557,12 @@ export class SyncEngine {
           });
         } else if (
           baseEntry?.kind === "live" &&
-          file.contentHash === baseEntry.revision.contentHash &&
+          (file.contentHash === baseEntry.revision.contentHash || staleCopy) &&
           remoteEntry.revision.contentHash !== baseEntry.revision.contentHash
         ) {
+          if (staleCopy) {
+            staleCopies.push({ contentHash: file.contentHash, entryId: remoteEntry.entryId });
+          }
           if (file.path !== remoteEntry.path) {
             if (
               file.path !== baseEntry.path &&
@@ -719,32 +771,39 @@ export class SyncEngine {
       }
     }
 
-    const possibleRenameDeletions = remoteChanges.filter(
-      (change) => change.kind === "delete-remote",
-    );
-    const possibleRenameCreations = remoteChanges.filter(
-      (change) => change.kind === "upload-new",
-    );
-    if (
-      !allowIndependentCreatesAndDeletes &&
-      possibleRenameDeletions.length > 0 &&
-      possibleRenameCreations.length > 0
-    ) {
-      conflicts.push({
-        deletedEntries: possibleRenameDeletions.map((change) => ({
-          entryId: change.entryId,
-          path: change.path,
-        })),
-        kind: "possible-rename",
-        newFiles: possibleRenameCreations.map((change) => change.file),
-      });
-      for (let index = remoteChanges.length - 1; index >= 0; index -= 1) {
-        const change = remoteChanges[index];
-        if (
-          change?.kind === "delete-remote" ||
-          change?.kind === "upload-new"
-        ) {
-          remoteChanges.splice(index, 1);
+    // 只扣住「有同类型新文件的消失 Entry」和与它们同类型的新文件，其余删除与上传照常进行
+    const heldDeletionEntryIds: string[] = [];
+    if (!allowIndependentCreatesAndDeletes) {
+      const creationTypes = new Set(
+        remoteChanges.flatMap((change) =>
+          change.kind === "upload-new" ? [fileType(change.path)] : [],
+        ),
+      );
+      const heldDeletions = remoteChanges.filter(
+        (change): change is DeleteRemoteChange =>
+          change.kind === "delete-remote" && creationTypes.has(fileType(change.path)),
+      );
+      const heldTypes = new Set(heldDeletions.map((change) => fileType(change.path)));
+      const heldCreations = remoteChanges.filter(
+        (change): change is UploadNewChange =>
+          change.kind === "upload-new" && heldTypes.has(fileType(change.path)),
+      );
+      if (heldDeletions.length > 0) {
+        conflicts.push({
+          deletedEntries: heldDeletions.map((change) => ({
+            entryId: change.entryId,
+            path: change.path,
+          })),
+          kind: "possible-rename",
+          newFiles: heldCreations.map((change) => change.file),
+        });
+        heldDeletionEntryIds.push(...heldDeletions.map((change) => change.entryId));
+        const held = new Set<RemoteChange>([...heldDeletions, ...heldCreations]);
+        for (let index = remoteChanges.length - 1; index >= 0; index -= 1) {
+          const change = remoteChanges[index];
+          if (change && held.has(change)) {
+            remoteChanges.splice(index, 1);
+          }
         }
       }
     }
@@ -793,9 +852,13 @@ export class SyncEngine {
     const totalLiveEntries = Object.values(base?.entries ?? {}).filter(
       (entry) => entry.kind === "live",
     ).length;
-    const deletionEntryIds = remoteChanges.flatMap((change) =>
-      change.kind === "delete-remote" ? [change.entryId] : [],
-    );
+    // 被扣住的消失 Entry 按最坏情况计入删除数，防止拆批绕过 Bulk Deletion 门槛
+    const deletionEntryIds = [
+      ...remoteChanges.flatMap((change) =>
+        change.kind === "delete-remote" ? [change.entryId] : [],
+      ),
+      ...heldDeletionEntryIds,
+    ];
     const deletionCount = deletionEntryIds.length;
     const isBulkDeletion =
       deletionCount > 100 ||
@@ -812,6 +875,7 @@ export class SyncEngine {
       conflicts,
       localActions,
       remoteChanges,
+      ...(staleCopies.length > 0 ? { staleCopies } : {}),
     };
   }
 }

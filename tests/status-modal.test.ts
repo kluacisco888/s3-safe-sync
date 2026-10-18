@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { App } from "obsidian";
 
-const { Element, opened } = vi.hoisted(() => {
+const { Element, opened, dropdowns } = vi.hoisted(() => {
   class Element {
     children: Element[] = [];
     text = "";
@@ -23,7 +23,8 @@ const { Element, opened } = vi.hoisted(() => {
     createDiv(options: {text?: string} = {}) { return this.createEl("div", options); }
     createSpan(options: {text?: string} = {}) { return this.createEl("span", options); }
   }
-  return { Element, opened: [] as Array<{contentEl: Element}> };
+  return { Element, opened: [] as Array<{contentEl: Element}>,
+    dropdowns: [] as Array<{options: Array<[string, string]>; value: string; change?: (value: string) => void}> };
 });
 
 vi.mock("obsidian", () => ({
@@ -40,7 +41,13 @@ vi.mock("obsidian", () => ({
     setName() { return this; }
     setDesc() { return this; }
     addDropdown(callback: (dropdown: unknown) => void) {
-      callback({addOption() { return this; }, setValue() { return this; }, onChange() { return this; }});
+      const record: (typeof dropdowns)[number] = {options: [], value: ""};
+      dropdowns.push(record);
+      callback({
+        addOption(value: string, label: string) { record.options.push([value, label]); return this; },
+        setValue(value: string) { record.value = value; return this; },
+        onChange(change: (value: string) => void) { record.change = change; return this; },
+      });
       return this;
     }
   },
@@ -74,7 +81,7 @@ describe("StatusModal", () => {
       modal.onOpen();
       type FakeElement = InstanceType<typeof Element>;
       const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
-      all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Copy diagnostics")!.events.get("click")!();
+      all(modal.contentEl as unknown as FakeElement).find(node => node.text === "复制诊断数据")!.events.get("click")!();
       if (available) await vi.waitFor(() => expect(writeText).toHaveBeenCalledWith(payload));
       else await vi.waitFor(() => expect(all(opened.at(-1)!.contentEl).some(node => node.tag === "textarea" && node.value === payload)).toBe(true));
     } finally {vi.unstubAllGlobals();}
@@ -95,12 +102,12 @@ describe("StatusModal", () => {
     type FakeElement = InstanceType<typeof Element>;
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
     const texts = all(modal.contentEl as unknown as FakeElement).map(node => node.text);
-    expect(texts).toContain("Local accepted Commit: accepted-version");
-    expect(texts).toContain("Last acknowledged publication from this device: published-version");
-    expect(texts.some(text => text.includes("Last checked S3 Head: remote-version"))).toBe(true);
-    expect(texts.some(text => text.includes("Pending uploads: 1") && text.includes("Pending downloads: 4"))).toBe(true);
+    expect(texts).toContain("本地已接受的提交：accepted-version");
+    expect(texts).toContain("本设备上次确认发布的提交：published-version");
+    expect(texts.some(text => text.includes("上次检查的 S3 Head 指针：remote-version"))).toBe(true);
+    expect(texts.some(text => text.includes("待上传：1") && text.includes("待下载：4"))).toBe(true);
     expect(texts.some(text => text.includes("service") && text.includes("503"))).toBe(true);
-    expect(texts).toContain("Copy diagnostics");
+    expect(texts).toContain("复制诊断数据");
   });
 
   it("offers a real review action for a collision that lists only one path", () => {
@@ -109,7 +116,7 @@ describe("StatusModal", () => {
     type FakeElement = InstanceType<typeof Element>;
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
     expect(all(modal.contentEl as unknown as FakeElement).some(node =>
-      node.tag === "button" && node.text === "Review path collision")).toBe(true);
+      node.tag === "button" && node.text === "审查路径撞名")).toBe(true);
   });
 
   it.each(["local", "remote"] as const)("reviews identities and dispatches only the selected %s rename", async side => {
@@ -123,16 +130,16 @@ describe("StatusModal", () => {
     modal.onOpen();
     type FakeElement = InstanceType<typeof Element>;
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
-    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Review path collision")!.events.get("click")!();
+    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "审查路径撞名")!.events.get("click")!();
     const review = opened.at(-1)!;
-    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Rename S3 record and sync")).toBe(true));
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "给 S3 记录改名并同步")).toBe(true));
     const nodes = all(review.contentEl);
     expect(nodes.some(node => node.text === "local")).toBe(true);
     expect(nodes.some(node => node.text === "remote")).toBe(true);
-    expect(nodes.some(node => node.text === "Previously accepted path: old.md")).toBe(true);
+    expect(nodes.some(node => node.text === "之前认可的路径：old.md")).toBe(true);
     expect(rename).not.toHaveBeenCalled();
     nodes.filter(node => node.tag === "input")[side === "local" ? 0 : 1]!.value = "chosen.md";
-    nodes.find(node => node.text === (side === "local" ? "Rename local file and sync" : "Rename S3 record and sync"))!.events.get("click")!();
+    nodes.find(node => node.text === (side === "local" ? "给本地文件改名并同步" : "给 S3 记录改名并同步"))!.events.get("click")!();
     expect(rename).toHaveBeenCalledWith({paths: ["note.md"], reviewToken: "collision", side, path: "note.md",
       entryId: `${side}-id`, newName: "chosen.md"});
     await vi.waitFor(() => expect(rename).toHaveResolved());
@@ -149,13 +156,13 @@ describe("StatusModal", () => {
     modal.onOpen();
     type FakeElement = InstanceType<typeof Element>;
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
-    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Review path collision")!.events.get("click")!();
+    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "审查路径撞名")!.events.get("click")!();
     const review = opened.at(-1)!;
-    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Confirm target is the renamed original")).toBe(true));
-    expect(all(review.contentEl).some(node => node.text === "Rename local file and sync")).toBe(false);
-    expect(all(review.contentEl).some(node => node.text === "Reload collision review")).toBe(true);
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "确认目标路径就是改名后的原文件")).toBe(true));
+    expect(all(review.contentEl).some(node => node.text === "给本地文件改名并同步")).toBe(false);
+    expect(all(review.contentEl).some(node => node.text === "重新加载撞名审查")).toBe(true);
     expect(recover).not.toHaveBeenCalled();
-    all(review.contentEl).find(node => node.text === "Confirm target is the renamed original")!.events.get("click")!();
+    all(review.contentEl).find(node => node.text === "确认目标路径就是改名后的原文件")!.events.get("click")!();
     expect(recover).toHaveBeenCalledWith(["source.md", "target.md"], "recovery", "target");
     await vi.waitFor(() => expect(recover).toHaveResolved());
   });
@@ -171,20 +178,20 @@ describe("StatusModal", () => {
     type FakeElement = InstanceType<typeof Element>;
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
     const nodes = all(modal.contentEl as unknown as FakeElement);
-    expect(nodes.some(node => node.text.includes("recoverable until 2026-10-18T10:00:00Z"))).toBe(true);
-    nodes.find(node => node.text === "Preview")!.events.get("click")!();
+    expect(nodes.some(node => node.text.includes("可恢复至 2026-10-18T10:00:00Z"))).toBe(true);
+    nodes.find(node => node.text === "预览")!.events.get("click")!();
     const preview = opened.at(-1)!;
     await vi.waitFor(() => expect(all(preview.contentEl).some(node => node.text === "unsynced draft")).toBe(true));
     expect(read).toHaveBeenCalledWith("entry", "backup");
     expect(restore).not.toHaveBeenCalled();
-    nodes.find(node => node.text === "Restore")!.events.get("click")!();
+    nodes.find(node => node.text === "恢复")!.events.get("click")!();
     expect(restore).toHaveBeenCalledWith("entry", "backup");
     await vi.waitFor(() => expect(restore).toHaveResolved());
   });
 
   it("adds bulk-deletion and repair actions when the already-open status changes", () => {
     const controller = issueController([]);
-    let status = "Idle: ready";
+    let status = "空闲：ready";
     let bulk: ReturnType<StatusModalController["getPendingBulkDeletion"]>;
     let listener: (status: {text: string}) => void = () => {};
     controller.getStatusText = () => status;
@@ -195,12 +202,12 @@ describe("StatusModal", () => {
     type FakeElement = InstanceType<typeof Element>;
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
     bulk = {count: 101, totalLiveEntries: 200, entryIds: ["test-entry"]};
-    status = "Action required: review bulk deletion";
+    status = "需要处理：review bulk deletion";
     listener({text: status});
-    expect(all(modal.contentEl as unknown as FakeElement).some(node => node.text === "Confirm bulk deletion")).toBe(true);
-    status = "Action required: Repair Mode: Head missing";
+    expect(all(modal.contentEl as unknown as FakeElement).some(node => node.text === "确认批量删除")).toBe(true);
+    status = "需要处理：修复模式：Head missing";
     listener({text: status});
-    expect(all(modal.contentEl as unknown as FakeElement).some(node => node.text === "Recovery guidance")).toBe(true);
+    expect(all(modal.contentEl as unknown as FakeElement).some(node => node.text === "恢复指引")).toBe(true);
   });
 
   it("keeps a failed mobile-transfer confirmation open and allows retry", async () => {
@@ -212,9 +219,9 @@ describe("StatusModal", () => {
     modal.onOpen();
     type FakeElement = InstanceType<typeof Element>;
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
-    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Try anyway")!.events.get("click")!();
+    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "仍然尝试")!.events.get("click")!();
     const confirmation = opened.at(-1)! as typeof opened[number] & {closed: boolean};
-    const button = all(confirmation.contentEl).find(node => node.text === "Try anyway")!;
+    const button = all(confirmation.contentEl).find(node => node.text === "仍然尝试")!;
     button.events.get("click")!();
     await vi.waitFor(() => expect(all(confirmation.contentEl).some(node => node.text.includes("Network disconnected"))).toBe(true));
     expect(confirmation.closed).toBe(false);
@@ -233,19 +240,19 @@ describe("StatusModal", () => {
     modal.onOpen();
     type FakeElement = InstanceType<typeof Element>;
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
-    expect(all(modal.contentEl as unknown as FakeElement).some(node => node.text === "Use this version")).toBe(true);
-    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Preview version")!.events.get("click")!();
+    expect(all(modal.contentEl as unknown as FakeElement).some(node => node.text === "使用这个版本")).toBe(true);
+    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "预览版本")!.events.get("click")!();
     const preview = opened.at(-1)!;
-    await vi.waitFor(() => expect(all(preview.contentEl).some(node => node.text === "Retry preview")).toBe(true));
-    all(preview.contentEl).find(node => node.text === "Retry preview")!.events.get("click")!();
+    await vi.waitFor(() => expect(all(preview.contentEl).some(node => node.text === "重试预览")).toBe(true));
+    all(preview.contentEl).find(node => node.text === "重试预览")!.events.get("click")!();
     await vi.waitFor(() => expect(all(preview.contentEl).some(node => node.text === "text")).toBe(true));
   });
 
-  it.each(["Not configured: unlock first", "Error: status 403", "Error: connection closed", "Paused: sync paused"])(
+  it.each(["未配置：unlock first", "出错：status 403", "出错：connection closed", "已暂停：sync paused"])(
     "offers settings and troubleshooting for %s", status => {
       const controller = issueController([]);
       controller.getStatusText = () => status;
-      controller.isPaused = () => status.startsWith("Paused");
+      controller.isPaused = () => status.startsWith("已暂停");
       const openSettings = vi.fn();
       controller.openSettings = openSettings;
       const modal = new StatusModal({} as App, controller);
@@ -253,19 +260,19 @@ describe("StatusModal", () => {
       type FakeElement = InstanceType<typeof Element>;
       const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
       const nodes = all(modal.contentEl as unknown as FakeElement);
-      nodes.find(node => node.text === "Open settings")!.events.get("click")!();
+      nodes.find(node => node.text === "打开设置")!.events.get("click")!();
       expect(openSettings).toHaveBeenCalledOnce();
-      expect(nodes.some(node => node.text === "Troubleshooting")).toBe(true);
-      expect(nodes.some(node => node.text === "Copy status")).toBe(true);
-      if (status.startsWith("Paused")) {
-        expect(nodes.find(node => node.text === "Sync now")?.disabled).toBe(true);
-        expect(nodes.some(node => node.text === "Resume")).toBe(true);
+      expect(nodes.some(node => node.text === "故障排查")).toBe(true);
+      expect(nodes.some(node => node.text === "复制状态")).toBe(true);
+      if (status.startsWith("已暂停")) {
+        expect(nodes.find(node => node.text === "立即同步")?.disabled).toBe(true);
+        expect(nodes.some(node => node.text === "继续")).toBe(true);
       }
     },
   );
   const issueController = (issues: LocalSyncIssue[]): StatusModalController => ({
     ...reviewActions,
-    getStatusText: () => "Action required", isPaused: () => false,
+    getStatusText: () => "需要处理", isPaused: () => false,
     getConflicts: () => [], getDeferredDownloads: () => [], getDeletedRecoveries: () => [],
     getLocalIssues: () => issues, getPendingBulkDeletion: () => undefined,
     confirmBulkDeletion: async () => {}, downloadDeferred: async () => {}, importCandidate: async () => {},
@@ -293,11 +300,11 @@ describe("StatusModal", () => {
     const buttons = all(modal.contentEl as unknown as FakeElement).filter(node => node.tag === "button");
     expect(buttons.filter(button => button.text === "How to resolve")).toHaveLength(0);
     const help = all(modal.contentEl as unknown as FakeElement).filter(node =>
-      node.tag === "details" && node.children.some(child => child.text === "Why this needs attention"));
+      node.tag === "details" && node.children.some(child => child.text === "为什么需要处理"));
     expect(help).toHaveLength(8);
     expect(help.every(node => !node.open)).toBe(true);
-    expect(buttons.filter(button => button.text === "Copy path")).toHaveLength(8);
-    expect(buttons.filter(button => button.text === "Compare and resolve")).toHaveLength(3);
+    expect(buttons.filter(button => button.text === "复制路径")).toHaveLength(8);
+    expect(buttons.filter(button => button.text === "对比并处理")).toHaveLength(3);
   });
 
   it("shows both previews before dispatching an explicitly confirmed preservation", async () => {
@@ -308,15 +315,15 @@ describe("StatusModal", () => {
     modal.onOpen();
     type FakeElement = InstanceType<typeof Element>;
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
-    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Compare and resolve")!.events.get("click")!();
+    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "对比并处理")!.events.get("click")!();
     const review = opened.at(-1)!;
     await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "remote")).toBe(true));
     expect(all(review.contentEl).some(node => node.text === "local")).toBe(true);
     expect(preserve).not.toHaveBeenCalled();
     const nodes = all(review.contentEl);
-    expect(nodes.findIndex(node => node.text === "Keep both (local copy)"))
+    expect(nodes.findIndex(node => node.text === "两份都保留（本地副本）"))
       .toBeLessThan(nodes.findIndex(node => node.tag === "pre"));
-    all(review.contentEl).find(node => node.text === "Keep both (local copy)")!.events.get("click")!();
+    all(review.contentEl).find(node => node.text === "两份都保留（本地副本）")!.events.get("click")!();
     expect(preserve).toHaveBeenCalledWith("article.md", "review", "both");
     await vi.waitFor(() => expect(preserve).toHaveResolved());
   });
@@ -332,18 +339,18 @@ describe("StatusModal", () => {
     modal.onOpen();
     type FakeElement = InstanceType<typeof Element>;
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
-    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Compare and resolve")!.events.get("click")!();
+    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "对比并处理")!.events.get("click")!();
     const review = opened.at(-1)!;
     await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "− remote edit")).toBe(true));
     expect(all(review.contentEl).some(node => node.text === "+ local edit")).toBe(true);
-    expect(all(review.contentEl).some(node => node.text === "1 remote-only line · 1 local-only line")).toBe(true);
+    expect(all(review.contentEl).some(node => node.text === "仅远端有 1 行 · 仅本地有 1 行")).toBe(true);
     const fullVersions = all(review.contentEl).filter(node => node.tag === "details");
     expect(fullVersions).toHaveLength(2);
     expect(fullVersions.every(node => !node.open)).toBe(true);
     expect(preserve).not.toHaveBeenCalled();
   });
 
-  it.each([["Use local version", "local"], ["Use S3 version", "remote"], ["Keep both (local copy)", "both"]] as const)(
+  it.each([["使用本地版本", "local"], ["使用 S3 版本", "remote"], ["两份都保留（本地副本）", "both"]] as const)(
     "offers %s with clear consequences, timestamps and access to recovery", async (label, choice) => {
       const controller = issueController([{kind: "bootstrap-mismatch", path: "article.md"}]);
       const resolve = vi.fn().mockResolvedValue(choice === "both" ? "article (local copy).md" : undefined);
@@ -354,22 +361,22 @@ describe("StatusModal", () => {
       modal.onOpen();
       type FakeElement = InstanceType<typeof Element>;
       const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
-      all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Compare and resolve")!.events.get("click")!();
+      all(modal.contentEl as unknown as FakeElement).find(node => node.text === "对比并处理")!.events.get("click")!();
       const review = opened.at(-1)!;
       await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === label)).toBe(true));
       const nodes = all(review.contentEl);
-      expect(nodes.some(node => node.text.startsWith("Local last modified:"))).toBe(true);
-      expect(nodes.some(node => node.text.startsWith("S3 version recorded:"))).toBe(true);
-      expect(nodes.some(node => node.text.includes("30 days"))).toBe(true);
-      expect(nodes.some(node => node.text === "Decide later")).toBe(true);
+      expect(nodes.some(node => node.text.startsWith("本地最后修改："))).toBe(true);
+      expect(nodes.some(node => node.text.startsWith("S3 版本记录时间："))).toBe(true);
+      expect(nodes.some(node => node.text.includes("30 天"))).toBe(true);
+      expect(nodes.some(node => node.text === "稍后再决定")).toBe(true);
       expect(resolve).not.toHaveBeenCalled();
       nodes.find(node => node.text === label)!.events.get("click")!();
       expect(resolve).toHaveBeenCalledWith("article.md", "review", choice);
-      expect(nodes.filter(node => ["Use local version", "Use S3 version", "Keep both (local copy)"].includes(node.text))
+      expect(nodes.filter(node => ["使用本地版本", "使用 S3 版本", "两份都保留（本地副本）"].includes(node.text))
         .every(node => node.disabled)).toBe(true);
-      await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Resolution complete")).toBe(true));
+      await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "处理完成")).toBe(true));
       if (choice !== "both") {
-        all(review.contentEl).find(node => node.text === "Open version history")!.events.get("click")!();
+        all(review.contentEl).find(node => node.text === "打开历史版本")!.events.get("click")!();
         expect(history).toHaveBeenCalledWith("article.md");
       } else expect(all(review.contentEl).some(node => node.text.includes("article (local copy).md"))).toBe(true);
     },
@@ -383,10 +390,10 @@ describe("StatusModal", () => {
     modal.onOpen();
     type FakeElement = InstanceType<typeof Element>;
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
-    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Compare and resolve")!.events.get("click")!();
+    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "对比并处理")!.events.get("click")!();
     const review = opened.at(-1)! as typeof opened[number] & {closed: boolean};
-    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Use local version")).toBe(true));
-    all(review.contentEl).find(node => node.text === "Decide later")!.events.get("click")!();
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "使用本地版本")).toBe(true));
+    all(review.contentEl).find(node => node.text === "稍后再决定")!.events.get("click")!();
     expect(review.closed).toBe(true);
     expect(resolve).not.toHaveBeenCalled();
   });
@@ -402,10 +409,10 @@ describe("StatusModal", () => {
     modal.onOpen();
     type FakeElement = InstanceType<typeof Element>;
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
-    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Compare and resolve")!.events.get("click")!();
+    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "对比并处理")!.events.get("click")!();
     const review = opened.at(-1)!;
-    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text.startsWith("Line comparison unavailable:"))).toBe(true));
-    expect(all(review.contentEl).some(node => node.text === "Keep both (local copy)")).toBe(!blocked);
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text.startsWith("无法逐行对比："))).toBe(true));
+    expect(all(review.contentEl).some(node => node.text === "两份都保留（本地副本）")).toBe(!blocked);
     expect(preserve).not.toHaveBeenCalled();
   });
 
@@ -421,22 +428,22 @@ describe("StatusModal", () => {
     modal.onOpen();
     type FakeElement = InstanceType<typeof Element>;
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
-    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "Compare and resolve")!.events.get("click")!();
+    all(modal.contentEl as unknown as FakeElement).find(node => node.text === "对比并处理")!.events.get("click")!();
     const review = opened.at(-1)!;
-    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Retry review")).toBe(true));
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "重试审查")).toBe(true));
     expect(preserve).not.toHaveBeenCalled();
-    all(review.contentEl).find(node => node.text === "Retry review")!.events.get("click")!();
-    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Keep both (local copy)")).toBe(true));
-    const confirm = all(review.contentEl).find(node => node.text === "Keep both (local copy)")!;
+    all(review.contentEl).find(node => node.text === "重试审查")!.events.get("click")!();
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "两份都保留（本地副本）")).toBe(true));
+    const confirm = all(review.contentEl).find(node => node.text === "两份都保留（本地副本）")!;
     confirm.events.get("click")!();
-    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "Reload review")).toBe(true));
+    await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "重新加载审查")).toBe(true));
     expect(confirm.disabled).toBe(true);
     confirm.events.get("click")!();
     expect(preserve).toHaveBeenCalledTimes(1);
-    all(review.contentEl).find(node => node.text === "Reload review")!.events.get("click")!();
+    all(review.contentEl).find(node => node.text === "重新加载审查")!.events.get("click")!();
     await vi.waitFor(() => expect(all(review.contentEl).some(node => node.text === "+ fresh local")).toBe(true));
     expect(preserve).toHaveBeenCalledTimes(1);
-    all(review.contentEl).find(node => node.text === "Keep both (local copy)")!.events.get("click")!();
+    all(review.contentEl).find(node => node.text === "两份都保留（本地副本）")!.events.get("click")!();
     expect(preserve).toHaveBeenLastCalledWith("article.md", "fresh", "both");
     await vi.waitFor(() => expect(preserve).toHaveResolved());
   });
@@ -444,7 +451,7 @@ describe("StatusModal", () => {
     "provides a review action for %s instead of a dead-end warning", kind => {
       const controller: StatusModalController = {
         ...reviewActions,
-        getStatusText: () => "Action required", isPaused: () => false,
+        getStatusText: () => "需要处理", isPaused: () => false,
         getConflicts: () => [], getDeferredDownloads: () => [], getDeletedRecoveries: () => [],
         getLocalIssues: () => [{kind, path: "article.md"}], getPendingBulkDeletion: () => undefined,
         confirmBulkDeletion: async () => {}, downloadDeferred: async () => {}, importCandidate: async () => {},
@@ -458,12 +465,12 @@ describe("StatusModal", () => {
       type FakeElement = InstanceType<typeof Element>;
       const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
       expect(all(modal.contentEl as unknown as FakeElement).some(node =>
-        node.tag === "button" && node.text === "Compare and resolve",
+        node.tag === "button" && node.text === "对比并处理",
       )).toBe(true);
     },
   );
   it("updates visible status and pause controls without reopening, then unsubscribes", () => {
-    let text = "Error: old failure";
+    let text = "出错：old failure";
     let paused = false;
     const listeners = new Set<(status: { text: string }) => void>();
     const controller: StatusModalController = {
@@ -482,15 +489,15 @@ describe("StatusModal", () => {
     const root = modal.contentEl as unknown as InstanceType<typeof Element>;
     const statusNode = root.children.find(e => e.tag === "p");
     expect(statusNode?.text).toBe(text);
-    text = "Idle: all changes synchronized";
+    text = "空闲：all changes synchronized";
     for (const listener of listeners) listener({ text });
     expect(statusNode?.text).toBe(text);
     paused = true;
-    text = "Paused: automatic sync is paused";
+    text = "已暂停：automatic sync is paused";
     for (const listener of listeners) listener({ text });
     expect(statusNode?.text).toBe(text);
     const all = (node: InstanceType<typeof Element>): InstanceType<typeof Element>[] => [node, ...node.children.flatMap(all)];
-    expect(all(root).some(e => e.text === "Resume")).toBe(true);
+    expect(all(root).some(e => e.text === "继续")).toBe(true);
     modal.onOpen();
     expect(listeners.size).toBe(1);
     modal.onClose();
@@ -505,7 +512,7 @@ describe("StatusModal", () => {
     const resolvePossibleRename = vi.fn(async () => {});
     const controller: StatusModalController = {
       ...reviewActions,
-      getStatusText: () => "Action required: review files", isPaused: () => false,
+      getStatusText: () => "需要处理：review files", isPaused: () => false,
       getConflicts: () => [], getDeferredDownloads: () => [], getDeletedRecoveries: () => [],
       getLocalIssues: () => [issue], getPendingBulkDeletion: () => undefined,
       confirmBulkDeletion: async () => {}, downloadDeferred: async () => {}, importCandidate: async () => {},
@@ -518,13 +525,69 @@ describe("StatusModal", () => {
     const root = modal.contentEl as unknown as FakeElement;
     expect(all(root).find(node => node.text === "before/ → after/")).toBeDefined();
     expect(all(root).find(node => node.tag === "details")?.open).toBe(false);
-    all(root).find(node => node.text === "Review and resolve")!.events.get("click")!();
+    all(root).find(node => node.text === "审查并处理")!.events.get("click")!();
     const review = opened.at(-1)!;
-    const confirm = all(review.contentEl).find(node => node.text === "Confirm moves")!;
+    const confirm = all(review.contentEl).find(node => node.text === "确认挪动")!;
     expect(confirm.disabled).toBe(false);
     confirm.events.get("click")!();
     expect(resolvePossibleRename).toHaveBeenCalledWith({kind: "moves", reviewToken: "review-1",
       pairs: [{fromPath: "before/a.md", toPath: "after/a.md"}, {fromPath: "before/b.md", toPath: "after/b.md"}]});
     await vi.waitFor(() => expect(resolvePossibleRename).toHaveResolved());
+  });
+
+  describe("partial move review", () => {
+    type FakeElement = InstanceType<typeof Element>;
+    const all = (root: FakeElement): FakeElement[] => [root, ...root.children.flatMap(all)];
+    const openReview = (oldPaths: string[], newPaths: string[]) => {
+      const issue = {kind: "possible-rename" as const, oldPaths, newPaths, reviewToken: "review-2"};
+      const resolvePossibleRename = vi.fn(async () => {});
+      const controller: StatusModalController = {...issueController([issue]), resolvePossibleRename};
+      const modal = new StatusModal({} as App, controller);
+      modal.onOpen();
+      dropdowns.length = 0;
+      all(modal.contentEl as unknown as FakeElement).find(node => node.text === "审查并处理")!.events.get("click")!();
+      const review = opened.at(-1)!;
+      const confirm = all(review.contentEl).find(node => node.text === "确认挪动")!;
+      return {review, confirm, resolvePossibleRename};
+    };
+
+    it("lists only same-type candidates and preselects the unique same-name or only candidate", async () => {
+      const {confirm, resolvePossibleRename} = openReview(
+        ["old/report.pdf", "old/plan.pdf", "old/memo.md"],
+        ["new/report.pdf", "new/a.pdf", "new/b.pdf", "new/memo v2.md"],
+      );
+      const [report, plan, memo] = dropdowns;
+      expect(plan!.options).toEqual([["", "按删除处理"], ["new/report.pdf", "report.pdf"],
+        ["new/a.pdf", "a.pdf"], ["new/b.pdf", "b.pdf"]]);
+      expect(memo!.options).toEqual([["", "按删除处理"], ["new/memo v2.md", "memo v2.md"]]);
+      expect(report!.value).toBe("new/report.pdf");
+      expect(plan!.value).toBe("");
+      expect(memo!.value).toBe("new/memo v2.md");
+      expect(confirm.disabled).toBe(false);
+      confirm.events.get("click")!();
+      expect(resolvePossibleRename).toHaveBeenCalledWith({kind: "moves", reviewToken: "review-2",
+        pairs: [{fromPath: "old/report.pdf", toPath: "new/report.pdf"}, {fromPath: "old/memo.md", toPath: "new/memo v2.md"}]});
+      await vi.waitFor(() => expect(resolvePossibleRename).toHaveResolved());
+    });
+
+    it("keeps confirm available for one missing file with three candidates", () => {
+      const {confirm} = openReview(["old/report.pdf"], ["new/a.pdf", "new/b.pdf", "new/c.pdf"]);
+      expect(dropdowns[0]!.value).toBe("");
+      expect(confirm.disabled).toBe(false);
+    });
+
+    it("blocks confirmation while two missing files choose the same new file", () => {
+      const {review, confirm, resolvePossibleRename} = openReview(["old/a.pdf", "old/b.pdf"], ["new/x.pdf", "new/y.pdf"]);
+      dropdowns[0]!.change!("new/x.pdf");
+      dropdowns[1]!.change!("new/x.pdf");
+      expect(confirm.disabled).toBe(true);
+      expect(all(review.contentEl).some(node => node.text === "两个消失的文件不能挪到同一个新文件。")).toBe(true);
+      dropdowns[1]!.change!("new/y.pdf");
+      expect(confirm.disabled).toBe(false);
+      expect(all(review.contentEl).some(node => node.text === "两个消失的文件不能挪到同一个新文件。")).toBe(false);
+      confirm.events.get("click")!();
+      expect(resolvePossibleRename).toHaveBeenCalledWith({kind: "moves", reviewToken: "review-2",
+        pairs: [{fromPath: "old/a.pdf", toPath: "new/x.pdf"}, {fromPath: "old/b.pdf", toPath: "new/y.pdf"}]});
+    });
   });
 });

@@ -31,5 +31,5 @@ export const retryHeadChanges = async <Result>(
       await sleep(baseDelay + Math.floor(baseDelay * jitter));
     }
   }
-  throw new Error("Head retry loop ended unexpectedly");
+  throw new Error("Head 指针重试意外结束");
 };

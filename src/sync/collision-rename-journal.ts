@@ -19,7 +19,7 @@ export class CollisionRenameJournal {
   constructor(private readonly local: LocalVaultPort, private readonly store: CollisionRenameJournalStore) {}
 
   async prepare(from: string, to: string, expectedHash: string, entryId?: string): Promise<void> {
-    if (this.store.read()) throw new Error("An interrupted path rename needs review first.");
+    if (this.store.read()) throw new Error("有一次中断的路径改名需要先审查。");
     await this.store.prepare({from, to, expectedHash, entryId});
   }
 
@@ -36,7 +36,7 @@ export class CollisionRenameJournal {
     let moved: boolean;
     if (confirmation) {
       if ((confirmation.side === "source" ? source : target) !== confirmation.hash) {
-        throw new Error("Recovery content changed again. Reload the collision review.");
+        throw new Error("恢复内容又变了。请重新加载撞名审查。");
       }
       moved = confirmation.side === "target";
     } else if (source === intent.expectedHash && target === undefined) {

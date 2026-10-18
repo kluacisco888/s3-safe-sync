@@ -111,7 +111,7 @@ export class SyncDiagnostics {
       });
       this.prune();
     } catch {
-      this.persistenceWarning = "Local diagnostics could not be loaded. Sync data was not changed.";
+      this.persistenceWarning = "无法读取本地诊断记录。同步数据没有受影响。";
     }
   }
 
@@ -155,6 +155,6 @@ export class SyncDiagnostics {
 
   private async save(): Promise<void> {
     try { await this.writer.save(); this.persistenceWarning = undefined; }
-    catch { this.persistenceWarning = "Local diagnostics could not be saved. Sync data was not changed."; }
+    catch { this.persistenceWarning = "无法保存本地诊断记录。同步数据没有受影响。"; }
   }
 }

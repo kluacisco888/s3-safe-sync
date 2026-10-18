@@ -15,8 +15,8 @@ describe("formatSyncProgress", () => {
       }),
     ).toEqual({
       detail:
-        "Uploading 954/1,559 (61%) · 620 MB / 1.01 GB · notes/current.md",
-      label: "Uploading 954/1,559 (61%)",
+        "正在上传 954/1,559 (61%) · 620 MB / 1.01 GB · notes/current.md",
+      label: "正在上传 954/1,559 (61%)",
     });
   });
 
@@ -30,8 +30,8 @@ describe("formatSyncProgress", () => {
         transferredBytes: 1_084_013_283,
       }),
     ).toEqual({
-      detail: "Publishing encrypted snapshot · 1.01 GB / 1.01 GB",
-      label: "Publishing encrypted snapshot",
+      detail: "正在发布加密快照 · 1.01 GB / 1.01 GB",
+      label: "正在发布加密快照",
     });
   });
 
@@ -45,8 +45,8 @@ describe("formatSyncProgress", () => {
         transferredBytes: 0,
       }),
     ).toEqual({
-      detail: "Checking metadata 1,517/1,517 (100%)",
-      label: "Checking metadata 1,517/1,517 (100%)",
+      detail: "正在检查元数据 1,517/1,517 (100%)",
+      label: "正在检查元数据 1,517/1,517 (100%)",
     });
     expect(
       formatSyncProgress({
@@ -59,8 +59,8 @@ describe("formatSyncProgress", () => {
       }),
     ).toEqual({
       detail:
-        "Hashing content 0/1 (0%) · 0 B / 2.00 KB · attachments/large.bin",
-      label: "Hashing content 0/1 (0%)",
+        "正在计算内容哈希 0/1 (0%) · 0 B / 2.00 KB · attachments/large.bin",
+      label: "正在计算内容哈希 0/1 (0%)",
     });
   });
 });

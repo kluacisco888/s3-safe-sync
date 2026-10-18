@@ -1,12 +1,15 @@
 import { diff3Merge } from "node-diff3";
 
 import {
+  fileType,
   SyncEngine,
   type BulkDeletionPlan,
   type DeletedEntry,
   type LiveEntry,
+  type ReconcileInput,
   type ReplicaObservation,
   type RevisionRef,
+  type SyncPlan,
   type VaultEntry,
   type VaultSnapshot,
 } from "./sync-engine";
@@ -23,6 +26,9 @@ import { sha256Content as sha256 } from "./content-hash";
 import { canonicalVaultPath } from "./canonical-path";
 import { PathCollisionReviewer, type PathCollisionReview, type PathCollisionResolution } from "./path-collision-review";
 import type { CollisionRenameJournal } from "./collision-rename-journal";
+
+// 下载阶段最多每隔这么久把已落地的文件写进 Sync Cache 一次；打断前和开始上传前另外各写一次
+const DOWNLOAD_PROGRESS_SAVE_INTERVAL_MS = 2_000;
 
 const retainedRevisions = (entry: VaultEntry): RevisionRef[] => [
   ...(entry.kind === "live" ? [entry.revision] : []),
@@ -216,7 +222,7 @@ const applicableRenames = (
       continue;
     }
     if (usedIds.has(rename.entryId) || usedTargets.has(rename.toPath) || result.has(source)) {
-      throw new Error("Ambiguous saved rename identities; review the affected paths.");
+      throw new Error("保存的改名记录对应不唯一，请检查受影响的路径。");
     }
     usedIds.add(rename.entryId);
     usedTargets.add(rename.toPath);
@@ -301,7 +307,7 @@ export class SyncService {
 
   async initializeNew(vaultId: string, beforeHeadPublication?: () => Promise<void>): Promise<void> {
     if (await this.options.remote.readHead()) {
-      throw new Error("Remote Store is already initialized");
+      throw new Error("远端存储已经初始化过了");
     }
     const scan = await this.scanFiles(undefined, true);
     const files = scan.files;
@@ -317,11 +323,11 @@ export class SyncService {
     );
     if (collision) {
       throw new Error(
-        `Migration Baseline contains a cross-platform path collision: ${collision.join(", ")}`,
+        `迁移基线里有跨平台路径撞名：${collision.join("、")}`,
       );
     }
     if (scan.unsyncedLocalEntries > 0) {
-      throw new Error("The Migration Baseline contains files above the device limit");
+      throw new Error("迁移基线里有超过本设备限制的文件");
     }
     const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
     let completed = 0;
@@ -353,7 +359,7 @@ export class SyncService {
         plaintext.byteLength !== file.size ||
         (await sha256(plaintext)) !== file.contentHash
       ) {
-        throw new Error(`Local file changed while reading ${file.path}`);
+        throw new Error(`读取期间本地文件被改动：${file.path}`);
       }
       await this.options.remote.writeBlob(blobId, plaintext);
       const revision: RevisionRef = {
@@ -441,15 +447,15 @@ export class SyncService {
   async downloadDeferred(entryId: string): Promise<void> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
-      throw new Error("Remote Store is not initialized");
+      throw new Error("远端存储尚未初始化");
     }
     const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
     const entry = snapshot.entries[entryId];
     if (entry?.kind !== "live") {
-      throw new Error(`Deferred Entry ${entryId} is not live`);
+      throw new Error(`暂缓下载的文件 ${entryId} 已不是当前版本`);
     }
     if (this.options.local.supportsPath?.(entry.path) === false) {
-      throw new Error(`Path is not supported on this device: ${entry.path}`);
+      throw new Error(`本设备不支持这个路径：${entry.path}`);
     }
     const cached = await this.options.cache.load();
     const expectedContentHash = cached?.files[entry.path]?.contentHash ?? null;
@@ -465,7 +471,7 @@ export class SyncService {
       plaintext.byteLength !== entry.revision.size ||
       (await sha256(plaintext)) !== entry.revision.contentHash
     ) {
-      throw new Error(`Deferred Revision ${entry.revision.revisionId} is damaged`);
+      throw new Error(`暂缓下载的版本 ${entry.revision.revisionId} 已损坏`);
     }
     await this.reportVerifiedContent(entry, entry.revision);
     await this.assertLocalContent(entry.path, expectedContentHash);
@@ -480,7 +486,7 @@ export class SyncService {
   async importCandidate(path: string): Promise<void> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
-      throw new Error("Remote Store is not initialized");
+      throw new Error("远端存储尚未初始化");
     }
     const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
     const canonicalPath = canonicalVaultPath(path);
@@ -489,18 +495,18 @@ export class SyncService {
         canonicalVaultPath(entry.path) === canonicalPath,
     );
     if (pathIsKnown) {
-      throw new Error(`Remote Store already knows path ${path}`);
+      throw new Error(`远端存储里已有路径 ${path}`);
     }
     const file = (await this.options.local.list()).find(
       (candidate) => candidate.path === path,
     );
     if (!file) {
-      throw new Error(`Import Candidate no longer exists: ${path}`);
+      throw new Error(`待导入文件已不存在：${path}`);
     }
     if (
       this.exceedsAutomaticFileLimit(file.path, file.size)
     ) {
-      throw new Error(`Import Candidate exceeds the mobile limit: ${path}`);
+      throw new Error(`待导入文件超过移动端限制：${path}`);
     }
     const plaintext = await this.options.local.read(path);
     if (plaintext.byteLength !== file.size) {
@@ -563,12 +569,12 @@ export class SyncService {
 
   private async loadLocalContentReview(path: string) {
     const head = await this.options.remote.readHead();
-    if (!head) throw new Error("Remote Store is not initialized");
+    if (!head) throw new Error("远端存储尚未初始化");
     const snapshot = await this.options.remote.readSnapshot(head.value);
     const atPath = Object.values(snapshot.entries).filter(entry => entry.path === path);
     const currentOwners = atPath.filter(entry => entry.kind !== "deleted");
     const matches = currentOwners.length ? currentOwners : atPath;
-    if (matches.length !== 1) throw new Error("Remote path changed or is ambiguous. Sync and review its current path.");
+    if (matches.length !== 1) throw new Error("远端路径已变化或对应不唯一。请同步后检查它当前的路径。");
     const entry = matches[0]!;
     const file = await this.options.local.stat(path);
     const revisions = entry.kind === "live" ? [entry.revision]
@@ -577,14 +583,14 @@ export class SyncService {
       : entry.kind === "conflicted" ? entry.candidates.find(r => r.contentHash === entry.materializedContentHash)
       : undefined;
     if (entry.kind === "conflicted" && entry.materializedContentHash && !materialized) {
-      throw new RemoteStateError("Conflict has no authenticated materialized candidate", undefined,
+      throw new RemoteStateError("冲突没有可核实的候选版本", undefined,
         {kind: "recovery", entryId: entry.entryId, contentHash: entry.materializedContentHash});
     }
     const blockedReason = (file && this.exceedsAutomaticFileLimit(path, file.size)) ||
       revisions.some(revision => this.exceedsAutomaticFileLimit(path, revision.size))
-      ? "This review exceeds this device's transfer limit. Resolve it on a desktop, or connect to Wi-Fi for attachments below the mobile limit."
+      ? "这次审查超过了本设备的传输限制。请在桌面端处理；若是低于移动端限制的附件，可连接 Wi-Fi 后处理。"
       : this.options.local.supportsPath?.(path) === false
-        ? "This path is unsupported on this device. Rename it on a compatible desktop first."
+        ? "本设备不支持这个路径。请先在兼容的桌面设备上改名。"
         : undefined;
     const previewLimit = 256 * 1024;
     const textPreview = (body: Uint8Array): string | undefined => {
@@ -618,7 +624,7 @@ export class SyncService {
       if (!blockedReason && index < 3 && revision.size <= previewLimit) {
         const body = await this.options.remote.readBlob(revision.blobId);
         if (!body || body.byteLength !== revision.size || await sha256(body) !== revision.contentHash) {
-          throw new RemoteStateError("Remote review content failed verification", undefined, {kind: "blob", blobId: revision.blobId});
+          throw new RemoteStateError("远端审查内容未通过校验", undefined, {kind: "blob", blobId: revision.blobId});
         }
         await this.reportVerifiedContent(entry, revision);
         preview = textPreview(body);
@@ -640,15 +646,15 @@ export class SyncService {
     if (choice === "both") return this.preserveLocalCopyAndAcceptRemote(path, reviewToken);
     const {head, snapshot, entry, file, localHash, review} = await this.loadLocalContentReview(path);
     if (review.blockedReason) throw new Error(review.blockedReason);
-    if (review.reviewToken !== reviewToken) throw new Error("Local or remote content changed. Review the versions again.");
+    if (review.reviewToken !== reviewToken) throw new Error("本地或远端内容有变化。请重新审查两个版本。");
     if (entry.kind !== "live" || !file || !localHash) {
-      throw new Error("This choice requires both a local file and a live S3 version. Review the current state again.");
+      throw new Error("这个选项需要同时有本地文件和 S3 当前版本。请重新审查当前状态。");
     }
     await this.assertLocalContent(path, localHash);
     await this.assertRemoteEntriesBeforePublication(snapshot, new Set([entry.entryId]), []);
     const remoteBody = await this.options.remote.readBlob(entry.revision.blobId);
     if (!remoteBody || remoteBody.byteLength !== entry.revision.size || await sha256(remoteBody) !== entry.revision.contentHash) {
-      throw new RemoteStateError("Remote content failed verification", undefined, {kind: "blob", blobId: entry.revision.blobId});
+      throw new RemoteStateError("远端内容未通过校验", undefined, {kind: "blob", blobId: entry.revision.blobId});
     }
     const localBody = await this.options.local.read(path);
     if (localBody.byteLength !== file.size || await sha256(localBody) !== localHash) throw new LocalStateChangedError(path);
@@ -678,14 +684,14 @@ export class SyncService {
   async preserveLocalCopyAndAcceptRemote(path: string, reviewToken: string): Promise<string | undefined> {
     const {head, snapshot, entry, file, localHash, materialized, review} = await this.loadLocalContentReview(path);
     if (review.blockedReason) throw new Error(review.blockedReason);
-    if (review.reviewToken !== reviewToken) throw new Error("Local or remote content changed. Review the versions again.");
+    if (review.reviewToken !== reviewToken) throw new Error("本地或远端内容有变化。请重新审查两个版本。");
     await this.assertLocalContent(path, localHash);
     await this.assertRemoteEntriesBeforePublication(snapshot, new Set([entry.entryId]), []);
     let remoteBody: Uint8Array | undefined;
     if (materialized) {
       remoteBody = await this.options.remote.readBlob(materialized.blobId);
       if (!remoteBody || remoteBody.byteLength !== materialized.size || await sha256(remoteBody) !== materialized.contentHash) {
-        throw new RemoteStateError("Remote content failed verification", undefined, {kind: "blob", blobId: materialized.blobId});
+        throw new RemoteStateError("远端内容未通过校验", undefined, {kind: "blob", blobId: materialized.blobId});
       }
     }
     let copy: LiveEntry | undefined;
@@ -767,16 +773,16 @@ export class SyncService {
 
   async readConflictCandidate(entryId: string, revisionId: string): Promise<Uint8Array> {
     const head = await this.options.remote.readHead();
-    if (!head) throw new Error("Remote Store is not initialized");
+    if (!head) throw new Error("远端存储尚未初始化");
     const snapshot = await this.options.remote.readSnapshot(head.value);
     const entry = snapshot.entries[entryId];
-    if (entry?.kind !== "conflicted") throw new Error("This conflict has changed. Refresh sync status.");
+    if (entry?.kind !== "conflicted") throw new Error("这个冲突已有变化。请刷新同步状态。");
     const revision = entry.candidates.find(candidate => candidate.revisionId === revisionId);
-    if (!revision) throw new Error("This version is no longer a conflict candidate. Refresh sync status.");
-    if (revision.size > 1024 * 1024) throw new Error("This version exceeds the text preview limit.");
+    if (!revision) throw new Error("这个版本已不是冲突候选版本。请刷新同步状态。");
+    if (revision.size > 1024 * 1024) throw new Error("这个版本超过了文字预览限制。");
     const body = await this.options.remote.readBlob(revision.blobId);
     if (!body || body.byteLength !== revision.size || await sha256(body) !== revision.contentHash) {
-      throw new RemoteStateError("Conflict preview failed content verification", undefined, {kind: "blob", blobId: revision.blobId});
+      throw new RemoteStateError("冲突预览未通过内容校验", undefined, {kind: "blob", blobId: revision.blobId});
     }
     await this.reportVerifiedContent(entry, revision);
     return body;
@@ -788,15 +794,15 @@ export class SyncService {
   ): Promise<void> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
-      throw new Error("Remote Store is not initialized");
+      throw new Error("远端存储尚未初始化");
     }
     const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
     const conflicted = snapshot.entries[entryId];
     if (conflicted?.kind !== "conflicted") {
-      throw new Error(`Entry ${entryId} is not conflicted`);
+      throw new Error(`文件 ${entryId} 没有冲突`);
     }
     if (this.options.local.supportsPath?.(conflicted.path) === false) {
-      throw new Error(`Path is not supported on this device: ${conflicted.path}`);
+      throw new Error(`本设备不支持这个路径：${conflicted.path}`);
     }
     await this.assertRemoteEntriesBeforePublication(
       snapshot,
@@ -823,7 +829,7 @@ export class SyncService {
       );
       if (!candidate) {
         throw new Error(
-          `Conflict candidate ${resolution.revisionId} does not exist`,
+          `冲突候选版本 ${resolution.revisionId} 不存在`,
         );
       }
       materializedContent = await this.options.remote.readBlob(candidate.blobId);
@@ -832,7 +838,7 @@ export class SyncService {
         materializedContent.byteLength !== candidate.size ||
         (await sha256(materializedContent)) !== candidate.contentHash
       ) {
-        throw new Error(`Conflict candidate ${resolution.revisionId} is damaged`);
+        throw new Error(`冲突候选版本 ${resolution.revisionId} 已损坏`);
       }
       resolvedEntry = {
         entryId,
@@ -856,7 +862,7 @@ export class SyncService {
         !conflicted.lastContentHash ||
         !conflicted.lastRevisionId
       ) {
-        throw new Error("This Conflict does not contain a deletion decision");
+        throw new Error("这个冲突里没有删除决定");
       }
       resolvedEntry = {
         deletedAt: conflicted.deletedAt,
@@ -915,33 +921,33 @@ export class SyncService {
 
   async readHistoricalRevision(entryId: string, revisionId: string): Promise<Uint8Array> {
     const head = await this.options.remote.readHead();
-    if (!head) throw new Error("Remote Store is not initialized");
+    if (!head) throw new Error("远端存储尚未初始化");
     const snapshot = await this.options.remote.readSnapshot(head.value);
     const entry = snapshot.entries[entryId];
     const revision = entry?.kind === "live" ? entry.history?.find(value => value.revisionId === revisionId) : undefined;
-    if (entry?.kind !== "live" || !revision) throw new Error("This historical version is no longer available. Refresh version history.");
-    if (this.exceedsAutomaticFileLimit(entry.path, revision.size)) throw new Error("This preview exceeds this device's transfer limit.");
+    if (entry?.kind !== "live" || !revision) throw new Error("这个历史版本已不可用。请刷新历史版本。");
+    if (this.exceedsAutomaticFileLimit(entry.path, revision.size)) throw new Error("这次预览超过了本设备的传输限制。");
     return this.readDeletedRevisionCopy(entry, revision, head.serverDate);
   }
 
   async restoreRevision(entryId: string, revisionId: string): Promise<void> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
-      throw new Error("Remote Store is not initialized");
+      throw new Error("远端存储尚未初始化");
     }
     const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
     const entry = snapshot.entries[entryId];
     if (entry?.kind !== "live") {
-      throw new Error(`Entry ${entryId} is not live`);
+      throw new Error(`文件 ${entryId} 已不是当前版本`);
     }
     if (this.options.local.supportsPath?.(entry.path) === false) {
-      throw new Error(`Path is not supported on this device: ${entry.path}`);
+      throw new Error(`本设备不支持这个路径：${entry.path}`);
     }
     const historical = entry.history?.find(
       (revision) => revision.revisionId === revisionId,
     );
     if (!historical) {
-      throw new Error(`Historical Revision ${revisionId} does not exist`);
+      throw new Error(`历史版本 ${revisionId} 不存在`);
     }
     await this.assertLocalContent(entry.path, entry.revision.contentHash);
     await this.assertRemoteRecoveryForLocalContent(
@@ -955,14 +961,14 @@ export class SyncService {
       plaintext.byteLength !== historical.size ||
       (await sha256(plaintext)) !== historical.contentHash
     ) {
-      throw new Error(`Historical Revision ${revisionId} is damaged`);
+      throw new Error(`历史版本 ${revisionId} 已损坏`);
     }
     await this.reportVerifiedContent(entry, historical);
     if (
       historical.expiresAt !== undefined &&
       Date.parse(historical.expiresAt) <= Date.parse(versionedHead.serverDate)
     ) {
-      throw new Error(`Historical Revision ${revisionId} has expired`);
+      throw new Error(`历史版本 ${revisionId} 已过期`);
     }
     const createdAt = versionedHead.serverDate;
     const restoredEntry: VaultEntry = {
@@ -1012,12 +1018,12 @@ export class SyncService {
   ): Promise<Uint8Array> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
-      throw new Error("Remote Store is not initialized");
+      throw new Error("远端存储尚未初始化");
     }
     const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
     const deleted = snapshot.entries[entryId];
     if (deleted?.kind !== "deleted") {
-      throw new Error(`Entry ${entryId} is not deleted`);
+      throw new Error(`文件 ${entryId} 没有被删除`);
     }
     const revision = revisionId
       ? [deleted.recovery, ...(deleted.history ?? [])].find(
@@ -1025,7 +1031,7 @@ export class SyncService {
         )
       : deleted.recovery;
     if (!revision) {
-      throw new Error(`Deleted Revision ${revisionId ?? entryId} does not exist`);
+      throw new Error(`已删除的版本 ${revisionId ?? entryId} 不存在`);
     }
     return this.readDeletedRevisionCopy(
       deleted,
@@ -1037,12 +1043,12 @@ export class SyncService {
   async restoreDeleted(entryId: string, revisionId?: string): Promise<void> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
-      throw new Error("Remote Store is not initialized");
+      throw new Error("远端存储尚未初始化");
     }
     const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
     const deleted = snapshot.entries[entryId];
     if (deleted?.kind !== "deleted") {
-      throw new Error(`Entry ${entryId} is not deleted`);
+      throw new Error(`文件 ${entryId} 没有被删除`);
     }
     const selected = revisionId
       ? [deleted.recovery, ...(deleted.history ?? [])].find(
@@ -1050,10 +1056,10 @@ export class SyncService {
         )
       : deleted.recovery;
     if (!selected) {
-      throw new Error(`Deleted Revision ${revisionId ?? entryId} does not exist`);
+      throw new Error(`已删除的版本 ${revisionId ?? entryId} 不存在`);
     }
     if (this.options.local.supportsPath?.(deleted.path) === false) {
-      throw new Error(`Path is not supported on this device: ${deleted.path}`);
+      throw new Error(`本设备不支持这个路径：${deleted.path}`);
     }
     this.assertRemotePathAvailable(snapshot, deleted.entryId, deleted.path);
     await this.assertRemoteEntriesBeforePublication(
@@ -1117,7 +1123,7 @@ export class SyncService {
   ): Promise<Uint8Array> {
     const recovery = deleted.recovery;
     if (!recovery) {
-      throw new Error(`Entry ${deleted.entryId} has no Recovery Copy`);
+      throw new Error(`文件 ${deleted.entryId} 没有恢复副本`);
     }
     return this.readDeletedRevisionCopy(
       deleted,
@@ -1137,14 +1143,14 @@ export class SyncService {
       plaintext.byteLength !== revision.size ||
       (await sha256(plaintext)) !== revision.contentHash
     ) {
-      throw new Error(`Recovery Copy for ${entry.entryId} is damaged`);
+      throw new Error(`文件 ${entry.entryId} 的恢复副本已损坏`);
     }
     await this.reportVerifiedContent(entry, revision);
     if (
       revision.expiresAt !== undefined &&
       Date.parse(revision.expiresAt) <= Date.parse(serverDate)
     ) {
-      throw new Error(`Recovery Copy for ${entry.entryId} has expired`);
+      throw new Error(`文件 ${entry.entryId} 的恢复副本已过期`);
     }
     return plaintext;
   }
@@ -1155,7 +1161,7 @@ export class SyncService {
   ): Promise<SyncResult> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead) {
-      throw new Error("Remote Store is not initialized");
+      throw new Error("远端存储尚未初始化");
     }
     this.options.onRemoteHead?.(versionedHead.value.commitId);
     let remote = await this.options.remote.readSnapshot(versionedHead.value);
@@ -1208,6 +1214,33 @@ export class SyncService {
       claimants.push(file);
       newFilesByFingerprint.set(fingerprint, claimants);
     }
+    // 同一内容分组里消失的 Entry 或新文件多于一个时，按文件名（含扩展名，NFC 规范化后完全相同）一一配对：
+    // 只有某个消失 Entry 恰好有一个同名新文件、且该新文件也只对应它一个时才认定为挪动。
+    // 已由 Pending Path Rename 认领的源和目标不参与，避免同一 Entry ID 落到两个路径。
+    const sameNameEntryIdByPath = new Map<string, string>();
+    const fileName = (path: string) => (path.split("/").pop() ?? path).normalize("NFC");
+    for (const [fingerprint, missingEntries] of missingCachedByFingerprint) {
+      const claimants = newFilesByFingerprint.get(fingerprint) ?? [];
+      if (missingEntries.length === 1 && claimants.length === 1) continue;
+      const missingByName = new Map<string, CachedFileState[]>();
+      for (const missing of missingEntries) {
+        if (renamedSourcePaths.has(missing.path)) continue;
+        const name = fileName(missing.path);
+        missingByName.set(name, [...(missingByName.get(name) ?? []), missing]);
+      }
+      const claimantsByName = new Map<string, LocalFileInfo[]>();
+      for (const claimant of claimants) {
+        if (renamedSourcePaths.has(claimant.path) || renameSourcesByTarget.has(claimant.path)) continue;
+        const name = fileName(claimant.path);
+        claimantsByName.set(name, [...(claimantsByName.get(name) ?? []), claimant]);
+      }
+      for (const [name, sameNameMissing] of missingByName) {
+        const sameNameClaimants = claimantsByName.get(name);
+        if (sameNameMissing.length === 1 && sameNameMissing[0] && sameNameClaimants?.length === 1 && sameNameClaimants[0]) {
+          sameNameEntryIdByPath.set(sameNameClaimants[0].path, sameNameMissing[0].entryId);
+        }
+      }
+    }
     for (const file of scanned) {
       const renameSources = renameSourcesByTarget.get(file.path);
       const renamedFile =
@@ -1232,14 +1265,18 @@ export class SyncService {
       const newClaimants = newFilesByFingerprint.get(
         `${file.size}:${file.contentHash}`,
       );
+      const inferredEntryId =
+        renameCandidates?.length === 1 && renameCandidates[0] && newClaimants?.length === 1 &&
+        // 与同名配对一致：已由 Pending Path Rename 认领的源和目标不参与一对一推断，避免同一 Entry ID 落到两个路径
+        !renamedSourcePaths.has(renameCandidates[0].path) && !renameSourcesByTarget.has(file.path)
+          ? renameCandidates[0].entryId
+          : sameNameEntryIdByPath.get(file.path);
       if (
-        renameCandidates?.length === 1 &&
-        renameCandidates[0] &&
-        newClaimants?.length === 1 &&
+        inferredEntryId !== undefined &&
         // Equal bytes are not evidence that an already-owned path changed identity.
-        !(liveOwnersByCanonicalPath.get(canonicalVaultPath(file.path)) ?? []).some(id => id !== renameCandidates[0]!.entryId)
+        !(liveOwnersByCanonicalPath.get(canonicalVaultPath(file.path)) ?? []).some(id => id !== inferredEntryId)
       ) {
-        entryIdByPath.set(file.path, renameCandidates[0].entryId);
+        entryIdByPath.set(file.path, inferredEntryId);
       }
     }
     const deferredDownloadEntries = Object.values(remote.entries).flatMap(
@@ -1349,7 +1386,7 @@ export class SyncService {
     const locallyMutatedPaths = new Set<string>();
     const retiredLocalPaths = new Set<string>();
     const reconciliationBase = this.buildReconciliationBase(cached);
-    let plan = this.engine.reconcile({
+    let plan = await this.reconcileWithRecoverableStaleCopies({
       base: reconciliationBase,
       local: observation,
       remote,
@@ -1359,37 +1396,43 @@ export class SyncService {
       kind: "possible-rename",
       newPaths: possibleRename.newFiles.map(file => file.path),
       oldPaths: possibleRename.deletedEntries.map(entry => entry.path),
+      // 令牌只绑定被扣住的部分：其他文件同步发布新 Commit 后仍然有效，被扣住的文件一变就失效
       reviewToken: await sha256(new TextEncoder().encode(JSON.stringify({
         vaultId: remote.vaultId,
-        head: remote.commitId,
-        base: reconciliationBase?.commitId,
-        old: possibleRename.deletedEntries.map(entry => [entry.entryId, entry.path]).sort(),
-        files: observation.files.map(file => [file.path, file.contentHash, file.size, file.entryId ?? null])
+        old: possibleRename.deletedEntries.map(entry => {
+          const accepted = reconciliationBase?.entries[entry.entryId];
+          return [entry.entryId, entry.path, accepted?.kind === "live" ? accepted.revision.contentHash : null];
+        }).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+        files: possibleRename.newFiles.map(file => [file.path, file.contentHash, file.size])
           .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
       }))),
     } : undefined;
     const resolution = syncOptions.renameResolution;
     if (resolution) {
       if (!renameIssue || resolution.reviewToken !== renameIssue.reviewToken || !possibleRename) {
-        throw new Error("Files or remote state changed since the rename review. Sync again and review the new plan.");
+        throw new Error("审查挪动之后文件或远端状态有变化。请再同步一次并审查新的方案。");
       }
       if (resolution.kind === "moves") {
+        // 部分配对：每个消失路径、每个新路径至多出现一次；没列出的消失 Entry 按删除处理，没被选中的新文件按新文件上传
         const sources = new Map(possibleRename.deletedEntries.map(entry => [entry.path, entry.entryId]));
         const targets = new Set(renameIssue.newPaths);
         const assignments = new Map<string, string>();
         for (const pair of resolution.pairs) {
           const entryId = sources.get(pair.fromPath);
-          if (!entryId || !targets.delete(pair.toPath)) throw new Error("Rename mapping is not one-to-one.");
+          if (!entryId || !targets.delete(pair.toPath)) throw new Error("挪动对应关系不是一对一的。");
+          if (fileType(pair.fromPath) !== fileType(pair.toPath)) {
+            throw new Error("消失的文件只能挪到同类型的新文件。");
+          }
           sources.delete(pair.fromPath);
           assignments.set(pair.toPath, entryId);
         }
-        if (sources.size || targets.size) throw new Error("Review every missing and new file before confirming a move.");
         observation.files = observation.files.map(file => assignments.has(file.path)
           ? { ...file, entryId: assignments.get(file.path)! } : file);
       }
-      plan = this.engine.reconcile({
+      // 配对之外剩下的消失与新增都已由用户审查过，按独立的删除和新增执行
+      plan = await this.reconcileWithRecoverableStaleCopies({
         base: reconciliationBase, local: observation, remote,
-        allowIndependentCreatesAndDeletes: resolution.kind === "separate",
+        allowIndependentCreatesAndDeletes: true,
       });
     }
     const localIssues: LocalSyncIssue[] = [
@@ -1429,7 +1472,6 @@ export class SyncService {
         conflict.kind === "bootstrap-mismatch" ||
         conflict.kind === "import-candidate" ||
         conflict.kind === "path-collision" ||
-        conflict.kind === "possible-rename" ||
         conflict.kind === "resolution-mismatch",
     );
     if (hasBlockingConflict) {
@@ -1503,98 +1545,161 @@ export class SyncService {
     let deleted = 0;
     let downloaded = 0;
     let downloadedBytes = 0;
-    for (const action of plan.localActions) {
-      if (action.kind === "delete-local") {
-        const remoteEntry = remote.entries[action.entryId];
-        if (remoteEntry?.kind === "deleted") {
-          await this.assertRecoveryBeforeDelete(
-            remoteEntry,
-            versionedHead.serverDate,
-          );
+    // 下载落地后就把「这个 Entry 的本地 base = 刚落地的 Revision」记进 Sync Cache，
+    // 同步在之后被打断时，下一次同步把这些文件当成没改过，而不是本机修改或首次连接不一致。
+    // 与手动审查一样只接受这些 Entry：其余 Entry、Deletion Record 和 Conflict 仍保留上一次接受的状态。
+    let downloadProgress: CachedSyncState | undefined;
+    let unsavedDownloads = 0;
+    let lastDownloadSave = Date.now();
+    const pendingRenames = [...(syncOptions.pathRenames ?? new Map<string, PersistedPathRename>()).entries()];
+    const pendingRenamePaths = new Set(pendingRenames.flatMap(([fromPath, rename]) => [fromPath, rename.toPath]));
+    const pendingRenameEntryIds = new Set(pendingRenames.map(([, rename]) => rename.entryId));
+    const saveDownloadProgress = async (): Promise<void> => {
+      if (!downloadProgress || unsavedDownloads === 0) return;
+      unsavedDownloads = 0;
+      lastDownloadSave = Date.now();
+      await this.options.cache.save(structuredClone(downloadProgress));
+    };
+    // 上一次接受的状态里每个路径的拥有者和每个 Entry 的本地记录；每个 Entry 在一次计划里至多下载一次
+    let acceptedOwnersByCanonicalPath: Map<string, string[]> | undefined;
+    let acceptedPathsByEntryId: Map<string, string[]> | undefined;
+    const recordMaterializedDownload = async (entryId: string, path: string, revision: RevisionRef): Promise<void> => {
+      const entry = remote.entries[entryId];
+      // 只记落在远端当前路径、且不牵涉改名记录的下载；挪动和改名仍由最后的重建与既有恢复规则处理
+      if (entry?.kind !== "live" || entry.path !== path || entry.revision.revisionId !== revision.revisionId ||
+        pendingRenameEntryIds.has(entryId) || pendingRenamePaths.has(path)) return;
+      if (!acceptedOwnersByCanonicalPath || !acceptedPathsByEntryId) {
+        acceptedOwnersByCanonicalPath = new Map();
+        acceptedPathsByEntryId = new Map();
+        for (const accepted of Object.values(cached?.snapshot.entries ?? {})) {
+          if (accepted.kind === "deleted") continue;
+          const key = canonicalVaultPath(accepted.path);
+          acceptedOwnersByCanonicalPath.set(key, [...(acceptedOwnersByCanonicalPath.get(key) ?? []), accepted.entryId]);
         }
-        await this.assertLocalContent(
-          action.path,
-          expectedLocalContentByPath.get(action.path) ?? null,
-        );
-        const expectedContentHash =
-          expectedLocalContentByPath.get(action.path) ?? null;
-        await this.options.local.delete(action.path, expectedContentHash);
-        locallyMutatedPaths.add(action.path);
-        retiredLocalPaths.add(action.path);
-        expectedLocalContentByPath.delete(action.path);
-        deleted += 1;
-      } else if (action.kind === "move-local") {
-        const expectedContentHash =
-          expectedLocalContentByPath.get(action.fromPath) ?? null;
-        const expectedTargetHash = expectedLocalContentByPath.get(action.toPath) ?? null;
-        if (expectedTargetHash !== null) {
-          await this.assertRemoteRecoveryForLocalContent(remote, action.entryId, expectedContentHash);
-          await this.assertLocalContent(action.toPath, expectedTargetHash);
+        for (const file of Object.values(cached?.files ?? {})) {
+          acceptedPathsByEntryId.set(file.entryId, [...(acceptedPathsByEntryId.get(file.entryId) ?? []), file.path]);
         }
-        await this.assertLocalContent(action.fromPath, expectedContentHash);
-        await this.options.local.move(
-          action.fromPath,
-          action.toPath,
-          expectedContentHash ?? undefined,
-          expectedTargetHash,
-        );
-        locallyMutatedPaths.add(action.fromPath);
-        retiredLocalPaths.add(action.fromPath);
-        locallyMutatedPaths.add(action.toPath);
-        expectedLocalContentByPath.delete(action.fromPath);
-        if (expectedContentHash) {
-          expectedLocalContentByPath.set(action.toPath, expectedContentHash);
-        }
-      } else {
-        this.reportProgress({
-          completed: downloaded,
-          currentPath: action.path,
-          phase: "downloading",
-          total: downloadingActions.length,
-          totalBytes: downloadTotalBytes,
-          transferredBytes: downloadedBytes,
-        });
-        const plaintext = await this.options.remote.readBlob(
-          action.revision.blobId,
-        );
-        if (!plaintext) {
-          throw new Error(`Missing remote blob ${action.revision.blobId}`);
-        }
-        if (
-          plaintext.byteLength !== action.revision.size ||
-          (await sha256(plaintext)) !== action.revision.contentHash
-        ) {
-          throw new Error(`Remote blob ${action.revision.blobId} failed hash verification`);
-        }
-        const expectedContentHash =
-          expectedLocalContentByPath.get(action.path) ?? null;
-        await this.assertRemoteRecoveryForLocalContent(
-          remote,
-          action.entryId,
-          expectedContentHash,
-        );
-        await this.assertLocalContent(action.path, expectedContentHash);
-        await this.options.local.write(
-          action.path,
-          plaintext,
-          expectedContentHash,
-        );
-        locallyMutatedPaths.add(action.path);
-        expectedLocalContentByPath.set(
-          action.path,
-          action.revision.contentHash,
-        );
-        downloaded += 1;
-        downloadedBytes += action.revision.size;
-        this.reportProgress({
-          completed: downloaded,
-          currentPath: action.path,
-          phase: "downloading",
-          total: downloadingActions.length,
-          totalBytes: downloadTotalBytes,
-          transferredBytes: downloadedBytes,
-        });
       }
+      if ((acceptedOwnersByCanonicalPath.get(canonicalVaultPath(path)) ?? []).some(id => id !== entryId)) return;
+      const progress = downloadProgress ??= cached ? structuredClone(cached) : {
+        bootstrapPending: true,
+        files: {},
+        snapshot: {commitId: remote.commitId, entries: {}, protocolVersion: 1, vaultId: remote.vaultId},
+        unmaterializedEntryIds: [],
+      };
+      const owner = progress.files[path];
+      if (owner && owner.entryId !== entryId) return;
+      // 同一 Entry 在别的路径还有记录时，只有那个路径本次已经挪走或删掉才能改记到新路径
+      const elsewhere = (acceptedPathsByEntryId.get(entryId) ?? []).filter(other => other !== path);
+      if (elsewhere.some(other => !retiredLocalPaths.has(other))) return;
+      const file = await this.verifiedMaterializedFile(path, revision);
+      if (!file) return;
+      for (const stale of elsewhere) delete progress.files[stale];
+      progress.files[path] = {...file, contentHash: revision.contentHash, entryId};
+      progress.snapshot.entries[entryId] = entry;
+      progress.unmaterializedEntryIds = progress.unmaterializedEntryIds?.filter(id => id !== entryId);
+      unsavedDownloads += 1;
+      if (Date.now() - lastDownloadSave >= DOWNLOAD_PROGRESS_SAVE_INTERVAL_MS) await saveDownloadProgress();
+    };
+    try {
+      for (const action of plan.localActions) {
+        if (action.kind === "delete-local") {
+          const remoteEntry = remote.entries[action.entryId];
+          if (remoteEntry?.kind === "deleted") {
+            await this.assertRecoveryBeforeDelete(
+              remoteEntry,
+              versionedHead.serverDate,
+            );
+          }
+          await this.assertLocalContent(
+            action.path,
+            expectedLocalContentByPath.get(action.path) ?? null,
+          );
+          const expectedContentHash =
+            expectedLocalContentByPath.get(action.path) ?? null;
+          await this.options.local.delete(action.path, expectedContentHash);
+          locallyMutatedPaths.add(action.path);
+          retiredLocalPaths.add(action.path);
+          expectedLocalContentByPath.delete(action.path);
+          deleted += 1;
+        } else if (action.kind === "move-local") {
+          const expectedContentHash =
+            expectedLocalContentByPath.get(action.fromPath) ?? null;
+          const expectedTargetHash = expectedLocalContentByPath.get(action.toPath) ?? null;
+          if (expectedTargetHash !== null) {
+            await this.assertRemoteRecoveryForLocalContent(remote, action.entryId, expectedContentHash);
+            await this.assertLocalContent(action.toPath, expectedTargetHash);
+          }
+          await this.assertLocalContent(action.fromPath, expectedContentHash);
+          await this.options.local.move(
+            action.fromPath,
+            action.toPath,
+            expectedContentHash ?? undefined,
+            expectedTargetHash,
+          );
+          locallyMutatedPaths.add(action.fromPath);
+          retiredLocalPaths.add(action.fromPath);
+          locallyMutatedPaths.add(action.toPath);
+          expectedLocalContentByPath.delete(action.fromPath);
+          if (expectedContentHash) {
+            expectedLocalContentByPath.set(action.toPath, expectedContentHash);
+          }
+        } else {
+          this.reportProgress({
+            completed: downloaded,
+            currentPath: action.path,
+            phase: "downloading",
+            total: downloadingActions.length,
+            totalBytes: downloadTotalBytes,
+            transferredBytes: downloadedBytes,
+          });
+          const plaintext = await this.options.remote.readBlob(
+            action.revision.blobId,
+          );
+          if (!plaintext) {
+            throw new Error(`远端缺少数据块 ${action.revision.blobId}`);
+          }
+          if (
+            plaintext.byteLength !== action.revision.size ||
+            (await sha256(plaintext)) !== action.revision.contentHash
+          ) {
+            throw new Error(`远端数据块 ${action.revision.blobId} 未通过哈希校验`);
+          }
+          const expectedContentHash =
+            expectedLocalContentByPath.get(action.path) ?? null;
+          await this.assertRemoteRecoveryForLocalContent(
+            remote,
+            action.entryId,
+            expectedContentHash,
+          );
+          await this.assertLocalContent(action.path, expectedContentHash);
+          await this.options.local.write(
+            action.path,
+            plaintext,
+            expectedContentHash,
+          );
+          locallyMutatedPaths.add(action.path);
+          expectedLocalContentByPath.set(
+            action.path,
+            action.revision.contentHash,
+          );
+          await recordMaterializedDownload(action.entryId, action.path, action.revision);
+          downloaded += 1;
+          downloadedBytes += action.revision.size;
+          this.reportProgress({
+            completed: downloaded,
+            currentPath: action.path,
+            phase: "downloading",
+            total: downloadingActions.length,
+            totalBytes: downloadTotalBytes,
+            transferredBytes: downloadedBytes,
+          });
+        }
+      }
+    } catch (error) {
+      // 被打断前先记下已经落地的文件；这次保存失败时仍报告原来的错误
+      await saveDownloadProgress().catch(() => undefined);
+      throw error;
     }
 
     const uploadingChanges = plan.remoteChanges.filter(
@@ -1631,6 +1736,8 @@ export class SyncService {
         .length;
     let publishedChanges = plan.remoteChanges.length;
     if (plan.remoteChanges.length > 0 || sharedConflicts.length > 0) {
+      // 上传和发布 Head 也可能被打断，先把已落地的下载记下来
+      await saveDownloadProgress();
       const createdAt = versionedHead.serverDate;
       const changedEntries: VaultEntry[] = [];
       const nextEntries = { ...remote.entries };
@@ -1662,7 +1769,7 @@ export class SyncService {
         } else if (change.kind === "move-remote") {
           const current = remote.entries[change.entryId];
           if (current?.kind !== "live") {
-            throw new Error(`Cannot move non-live Entry ${change.entryId}`);
+            throw new Error(`无法挪动不是当前版本的文件 ${change.entryId}`);
           }
           changedEntry = { ...current, path: change.toPath };
         } else {
@@ -1709,7 +1816,7 @@ export class SyncService {
         let changedEntry: VaultEntry;
         if (conflict.kind === "delete-edit") {
           if (remoteEntry?.kind !== "live") {
-            throw new Error(`Expected live Entry ${conflict.entryId}`);
+            throw new Error(`文件 ${conflict.entryId} 应为当前版本`);
           }
           changedEntry = {
             candidates: [remoteEntry.revision],
@@ -1749,7 +1856,7 @@ export class SyncService {
         await this.assertRemoteRevision(localRevision);
         if (conflict.kind === "edit-delete") {
           if (remoteEntry?.kind !== "deleted") {
-            throw new Error(`Expected deleted Entry ${conflict.entryId}`);
+            throw new Error(`文件 ${conflict.entryId} 应为已删除`);
           }
           changedEntry = {
             candidates: [localRevision],
@@ -1774,7 +1881,7 @@ export class SyncService {
             remoteEntry?.kind !== "live" ||
             (baseEntry?.kind !== "live" && baseEntry?.kind !== "deleted")
           ) {
-            throw new Error(`Expected live or restored Entry ${conflict.entryId}`);
+            throw new Error(`文件 ${conflict.entryId} 应为当前版本或已恢复`);
           }
           const baseContent =
             baseEntry.kind === "live"
@@ -1784,7 +1891,7 @@ export class SyncService {
             remoteEntry.revision.blobId,
           );
           if ((baseEntry.kind === "live" && !baseContent) || !remoteContent) {
-            throw new Error(`Conflict history is incomplete for ${conflict.path}`);
+            throw new Error(`${conflict.path} 的冲突历史不完整`);
           }
           if (
             (baseEntry.kind === "live" &&
@@ -1795,7 +1902,7 @@ export class SyncService {
             remoteContent.byteLength !== remoteEntry.revision.size ||
             (await sha256(remoteContent)) !== remoteEntry.revision.contentHash
           ) {
-            throw new Error(`Conflict history is damaged for ${conflict.path}`);
+            throw new Error(`${conflict.path} 的冲突历史已损坏`);
           }
           let merged: Uint8Array | undefined;
           if (
@@ -1972,18 +2079,30 @@ export class SyncService {
         locallyMutatedPaths.add(pendingWrite.path);
       }
     }
-    await this.options.cache.save(
-      await this.buildCache(
-        remote,
-        deferredDownloadEntries.map((entry) => entry.entryId),
-        {
-          forceHashPaths: locallyMutatedPaths,
-          fullHashVerification: false,
-          hashHints: new Map(scan.files.map((file) => [file.path, file])),
-          pathRenames: syncOptions.pathRenames,
-        },
-      ),
+    const nextCache = await this.buildCache(
+      remote,
+      deferredDownloadEntries.map((entry) => entry.entryId),
+      {
+        forceHashPaths: locallyMutatedPaths,
+        fullHashVerification: false,
+        hashHints: new Map(scan.files.map((file) => [file.path, file])),
+        pathRenames: syncOptions.pathRenames,
+      },
     );
+    // 被扣住的消失 Entry 保留上一次接受的本地记录，下一次同步仍是「已知、本地缺失」，
+    // 既不会被当成删除发布，也不会被当成远端新文件下载回旧路径
+    for (const conflict of plan.conflicts) {
+      if (conflict.kind !== "possible-rename") continue;
+      for (const held of conflict.deletedEntries) {
+        const prior = cachedFilesByEntryId.get(held.entryId);
+        const entry = remote.entries[held.entryId];
+        if (prior && entry?.kind === "live" && entry.path === prior.path &&
+          entry.revision.contentHash === prior.contentHash && !nextCache.files[prior.path]) {
+          nextCache.files[prior.path] = prior;
+        }
+      }
+    }
+    await this.options.cache.save(nextCache);
     const status: SyncResult["status"] =
       unresolvedConflicts > 0 || scan.unsyncedLocalEntries > 0 || deferredLocalEditPaths.length > 0 ||
       deferredDownloadEntries.some(entry => entry.reason === "unsupported-path")
@@ -2124,6 +2243,20 @@ export class SyncService {
     return { ...cached.snapshot, entries };
   }
 
+  // 读回刚落地的文件：前后两次元数据一致、内容哈希等于该 Revision 才算已落地。
+  // 落地后马上被编辑的文件不记，交给最后的重建或下一次同步按本机修改处理。
+  private async verifiedMaterializedFile(path: string, revision: RevisionRef): Promise<LocalFileInfo | undefined> {
+    const before = await this.options.local.stat(path);
+    if (!before || before.size !== revision.size) return undefined;
+    const contentHash = this.options.local.hashContent
+      ? (await this.options.local.hashContent(path, {yieldToHost: this.options.yieldDuringHashing})).contentHash
+      : await sha256(await this.options.local.read(path));
+    const after = await this.options.local.stat(path);
+    if (!after || after.modifiedAt !== before.modifiedAt || after.size !== before.size ||
+      contentHash !== revision.contentHash) return undefined;
+    return {modifiedAt: before.modifiedAt, path, size: before.size};
+  }
+
   private async assertLocalContent(
     path: string,
     expectedContentHash: string | null,
@@ -2192,7 +2325,7 @@ export class SyncService {
     );
     if (occupyingEntry) {
       throw new Error(
-        `Cannot restore ${path}; it is owned by Entry ${occupyingEntry.entryId}`,
+        `无法恢复 ${path}：这个路径已被文件 ${occupyingEntry.entryId} 占用`,
       );
     }
   }
@@ -2201,7 +2334,7 @@ export class SyncService {
   async verifyRemoteIntegrity(checks: readonly RemoteIntegrityCheck[], vaultId: string): Promise<void> {
     const head = await this.options.remote.readHead();
     if (!head || head.value.vaultId !== vaultId) {
-      throw new RemoteStateError("Remote Head is missing or belongs to a different Vault");
+      throw new RemoteStateError("远端 Head 指针缺失，或属于另一个仓库");
     }
     const snapshot = await this.options.remote.readSnapshot(head.value);
     for (const check of checks) {
@@ -2209,18 +2342,18 @@ export class SyncService {
         const entry = snapshot.entries[check.entryId];
         if (entry?.kind === "conflicted" && entry.materializedContentHash &&
           !entry.candidates.some(candidate => candidate.contentHash === entry.materializedContentHash)) {
-          throw new RemoteStateError("Conflict has no authenticated materialized candidate", undefined, check);
+          throw new RemoteStateError("冲突没有可核实的候选版本", undefined, check);
         }
         if (entry && retainedRevisions(entry).some(revision => revision.contentHash === check.contentHash &&
           this.exceedsAutomaticFileLimit(entry.path, revision.size))) {
-          throw new Error(`Integrity recheck exceeds this device's transfer limit: ${entry.path}. Retry on Wi-Fi or a desktop.`);
+          throw new Error(`完整校验超过了本设备的传输限制：${entry.path}。请连接 Wi-Fi 或在桌面端重试。`);
         }
         await this.assertRemoteRecoveryForLocalContent(snapshot, check.entryId, check.contentHash);
       } else if (check.kind === "blob") {
         for (const entry of Object.values(snapshot.entries)) {
           for (const revision of retainedRevisions(entry).filter(revision => revision.blobId === check.blobId)) {
             if (this.exceedsAutomaticFileLimit(entry.path, revision.size)) {
-              throw new Error(`Integrity recheck exceeds this device's transfer limit: ${entry.path}. Retry on Wi-Fi or a desktop.`);
+              throw new Error(`完整校验超过了本设备的传输限制：${entry.path}。请连接 Wi-Fi 或在桌面端重试。`);
             }
             await this.assertRemoteRevision(revision);
           }
@@ -2238,6 +2371,24 @@ export class SyncService {
     await this.options.onIntegrityVerified?.({kind: "recovery", entryId: entry.entryId, contentHash: revision.contentHash});
   }
 
+  // 旧副本只有在被替换的本地内容于远端有可认证的恢复副本时才直接取远端；
+  // 核实不了（数据块损坏或校验不过）就退回原有的冲突或审查，网络错误照常抛出
+  private async reconcileWithRecoverableStaleCopies(input: ReconcileInput): Promise<SyncPlan> {
+    const plan = this.engine.reconcile(input);
+    const rejected = new Set<string>();
+    for (const staleCopy of plan.staleCopies ?? []) {
+      try {
+        await this.assertRemoteRecoveryForLocalContent(input.remote, staleCopy.entryId, staleCopy.contentHash);
+      } catch (error) {
+        if (!(error instanceof RemoteStateError)) throw error;
+        rejected.add(staleCopy.entryId);
+      }
+    }
+    return rejected.size > 0
+      ? this.engine.reconcile({...input, rejectedStaleCopyEntryIds: rejected})
+      : plan;
+  }
+
   private async assertRemoteRecoveryForLocalContent(
     snapshot: VaultSnapshot,
     entryId: string,
@@ -2248,7 +2399,7 @@ export class SyncService {
     }
     const entry = snapshot.entries[entryId];
     if (!entry) {
-      throw new Error(`Entry ${entryId} has no remote recovery for local content`);
+      throw new Error(`文件 ${entryId} 的本地内容在远端没有可用的恢复副本`);
     }
     const revisions = retainedRevisions(entry).filter((revision) => revision.contentHash === expectedContentHash);
     for (const revision of revisions) {
@@ -2264,7 +2415,7 @@ export class SyncService {
       }
     }
     throw new RemoteStateError(
-      `No authenticated remote recovery exists for local content at ${entry.path} (Entry ${entryId})`,
+      `${entry.path} 的本地内容在远端没有可核实的恢复副本（文件 ${entryId}）`,
       undefined,
       {kind: "recovery", entryId, contentHash: expectedContentHash},
     );
@@ -2279,7 +2430,7 @@ export class SyncService {
         throw error;
       }
       throw new RemoteStateError(
-        `Remote Revision ${revision.revisionId} cannot be authenticated`,
+        `无法核实远端版本 ${revision.revisionId}`,
         error,
         {kind: "blob", blobId: revision.blobId},
       );
@@ -2290,7 +2441,7 @@ export class SyncService {
       (await sha256(plaintext)) !== revision.contentHash
     ) {
       throw new RemoteStateError(
-        `Remote Revision ${revision.revisionId} failed content verification`,
+        `远端版本 ${revision.revisionId} 未通过内容校验`,
         undefined,
         {kind: "blob", blobId: revision.blobId},
       );
@@ -2309,7 +2460,7 @@ export class SyncService {
     if (serverTime < recoveryRequiredUntil) {
       if (!deleted.recovery) {
         throw new Error(
-          `Deleted Entry ${deleted.entryId} is missing its Recovery Copy`,
+          `已删除的文件 ${deleted.entryId} 缺少恢复副本`,
         );
       }
       await this.readRecoveryCopy(deleted, serverDate);

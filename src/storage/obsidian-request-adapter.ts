@@ -23,8 +23,8 @@ export type ObsidianRequestExecutor = (
 
 export class S3TransportError extends Error {
   constructor(readonly kind: "network" | "timeout", readonly writeMayHaveSucceeded: boolean) {
-    super(kind === "timeout" ? "S3 request timed out after 120 seconds. Check the connection and retry sync."
-      : "S3 network request failed. Check the connection and retry sync.");
+    super(kind === "timeout" ? "S3 请求 120 秒后超时。请检查网络连接后重新同步。"
+      : "S3 网络请求失败。请检查网络连接后重新同步。");
     this.name = "S3TransportError";
   }
 }
@@ -56,7 +56,7 @@ export const createObsidianHttpExecutor = (
     const writeMayHaveSucceeded = method !== "GET" && method !== "HEAD";
     const abortError = (): Error => signal?.reason instanceof Error
       ? signal.reason
-      : new Error("S3 request was cancelled");
+      : new Error("S3 请求已取消");
     if (signal?.aborted) throw abortError();
     let timer: ReturnType<typeof setTimeout> | undefined;
     let onAbort: (() => void) | undefined;

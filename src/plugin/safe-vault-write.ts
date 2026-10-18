@@ -78,7 +78,7 @@ const readHash = async (
   }
   const stat = await adapter.stat(path);
   if (stat?.type !== "file") {
-    throw new Error(`Refusing to replace a non-file path: ${path}`);
+    throw new Error(`拒绝替换不是文件的路径：${path}`);
   }
   return sha256(new Uint8Array(await adapter.readBinary(path)));
 };
@@ -91,7 +91,7 @@ const removeFileIfPresent = async (
     return;
   }
   if ((await adapter.stat(path))?.type !== "file") {
-    throw new Error(`Refusing to remove a non-file staging path: ${path}`);
+    throw new Error(`拒绝移除不是文件的暂存路径：${path}`);
   }
   await adapter.remove(path);
 };
@@ -104,11 +104,11 @@ const trashFileIfPresent = async (
     return;
   }
   if ((await adapter.stat(path))?.type !== "file") {
-    throw new Error(`Refusing to trash a non-file staging path: ${path}`);
+    throw new Error(`拒绝把不是文件的暂存路径移到回收站：${path}`);
   }
   await adapter.trashLocal(path);
   if (await adapter.exists(path)) {
-    throw new Error(`Local trash failed; preserving staged backup: ${path}`);
+    throw new Error(`移到本地回收站失败，已保留暂存的备份：${path}`);
   }
 };
 
@@ -123,7 +123,7 @@ const restoreBackupWithoutOverwrite = async (
     (await readHash(adapter, journal.targetPath)) !== backupHash ||
     (await readHash(adapter, journal.backupPath)) !== backupHash
   ) {
-    throw new Error(`Restored backup needs review for ${journal.targetPath}; preserving ${journal.journalPath} and staged content`);
+    throw new Error(`${journal.targetPath} 恢复的备份需要人工检查；已保留 ${journal.journalPath} 和暂存内容`);
   }
 };
 
@@ -143,7 +143,7 @@ const recoverJournal = async (
         backupHash !== journal.originalHash
       ) {
         throw new Error(
-          `Staged backup needs review for ${journal.targetPath}; preserving ${journal.journalPath} and staged content`,
+          `${journal.targetPath} 暂存的备份需要人工检查；已保留 ${journal.journalPath} 和暂存内容`,
         );
       }
       await trashFileIfPresent(adapter, journal.backupPath);
@@ -157,14 +157,14 @@ const recoverJournal = async (
           await restoreBackupWithoutOverwrite(adapter, journal, backupHash);
         }
         throw new Error(
-          `Staged backup needs review for ${journal.targetPath}; preserving ${journal.journalPath} and staged content`,
+          `${journal.targetPath} 暂存的备份需要人工检查；已保留 ${journal.journalPath} 和暂存内容`,
         );
       }
       await restoreBackupWithoutOverwrite(adapter, journal, backupHash);
       await trashFileIfPresent(adapter, journal.backupPath);
     } else {
       throw new Error(
-        `Staged write needs review for ${journal.targetPath}; preserving ${journal.journalPath} and ${journal.backupPath}`,
+        `${journal.targetPath} 的暂存写入需要人工检查；已保留 ${journal.journalPath} 和 ${journal.backupPath}`,
       );
     }
   } else if (
@@ -174,7 +174,7 @@ const recoverJournal = async (
     !allowUnknownTarget
   ) {
     throw new Error(
-      `Staged write needs review for ${journal.targetPath}; preserving ${journal.journalPath}`,
+      `${journal.targetPath} 的暂存写入需要人工检查；已保留 ${journal.journalPath}`,
     );
   }
   await removeFileIfPresent(adapter, journal.temporaryPath);
@@ -210,7 +210,7 @@ const parseJournal = (body: string, journalPath: string): WriteJournal => {
     !isSafeStagingPath(parsed.temporaryPath) ||
     !isSafeTargetPath(parsed.targetPath)
   ) {
-    throw new Error(`Invalid staged-write journal: ${journalPath}`);
+    throw new Error(`暂存写入日志无效：${journalPath}`);
   }
   return { ...parsed, journalPath } as WriteJournal;
 };
@@ -231,7 +231,7 @@ export const safeReplaceVaultFile = async (
   assertActive: () => void = () => undefined,
 ): Promise<void> => {
   if (!isSafeTargetPath(targetPath)) {
-    throw new Error(`Refusing to write an unsafe Vault path: ${targetPath}`);
+    throw new Error(`拒绝写入不安全的仓库路径：${targetPath}`);
   }
   return withVaultMutationLock(adapter, async () => {
     assertActive();
@@ -264,12 +264,12 @@ export const safeReplaceVaultFile = async (
       if (
         (await readHash(adapter, journal.temporaryPath)) !== journal.expectedHash
       ) {
-        throw new Error(`Staged file failed verification: ${targetPath}`);
+        throw new Error(`暂存文件未通过校验：${targetPath}`);
       }
       // Some mobile filesystems expose readable bytes before a correct file size.
       // Native copy may trust that size and silently produce an empty/truncated file.
       if ((await adapter.stat(journal.temporaryPath))?.size !== body.byteLength) {
-        throw new Error(`Staged file size is inconsistent; retry synchronization: ${targetPath}`);
+        throw new Error(`暂存文件大小不一致，请重新同步：${targetPath}`);
       }
       if ((await readHash(adapter, targetPath)) !== currentHash) {
         throw new LocalStateChangedError(targetPath);
@@ -285,7 +285,7 @@ export const safeReplaceVaultFile = async (
       }
       await adapter.copy(journal.temporaryPath, targetPath);
       if ((await readHash(adapter, targetPath)) !== journal.expectedHash) {
-        throw new Error(`Promoted file failed verification: ${targetPath}`);
+        throw new Error(`写入到位的文件未通过校验：${targetPath}`);
       }
       await recoverJournal(adapter, journal);
     } catch (error) {

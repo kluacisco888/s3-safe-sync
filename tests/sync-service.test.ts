@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   SyncService,
@@ -123,11 +123,11 @@ class MemoryVault implements LocalVaultPort {
       expectedSourceHash !== undefined &&
       sourceHash !== expectedSourceHash
     ) {
-      throw new Error(`Local file changed during synchronization: ${fromPath}`);
+      throw new Error(`同步过程中本地文件被改动：${fromPath}`);
     }
     const target = this.files.get(toPath);
     if (expectedTargetHash === null && target) {
-      throw new Error(`Local file changed during synchronization: ${toPath}`);
+      throw new Error(`同步过程中本地文件被改动：${toPath}`);
     }
     this.files.delete(fromPath);
     this.files.set(toPath, { bytes: file.bytes, modifiedAt: ++this.clock });
@@ -267,7 +267,7 @@ describe("SyncService", () => {
     if (entry.kind !== "live") throw new Error("Expected live fixture");
     const recovery = {kind: "recovery" as const, entryId: entry.entryId, contentHash: entry.revision.contentHash};
     await objects.put(`integrity/v1/blobs/${entry.revision.blobId}`, new TextEncoder().encode("damaged"));
-    await expect(service.verifyRemoteIntegrity([recovery], "vault")).rejects.toThrow("No authenticated remote recovery");
+    await expect(service.verifyRemoteIntegrity([recovery], "vault")).rejects.toThrow("在远端没有可核实的恢复副本");
     await expect(service.verifyRemoteIntegrity([{kind: "blob", blobId: entry.revision.blobId}], "vault"))
       .rejects.toMatchObject({integrityCheck: {kind: "blob", blobId: entry.revision.blobId}});
     // Repair can supply another authenticated copy without deleting the old evidence.
@@ -278,12 +278,12 @@ describe("SyncService", () => {
           history: [{...entry.revision, blobId: "alternate", revisionId: "alternate"}]}}]}});
     await expect(service.verifyRemoteIntegrity([recovery], "vault")).resolves.toBeUndefined();
     await expect(service.verifyRemoteIntegrity([{kind: "recovery", entryId: entry.entryId, contentHash: "sha256:unavailable"}], "vault"))
-      .rejects.toThrow("No authenticated remote recovery");
+      .rejects.toThrow("在远端没有可核实的恢复副本");
     const limited = new SyncService({cache, local, remote, replicaId: "phone", maxAutomaticFileBytes: 1});
     const reads: string[] = [];
     objects.onGet = key => {reads.push(key);};
     for (const check of [recovery, {kind: "blob" as const, blobId: entry.revision.blobId}]) {
-      await expect(limited.verifyRemoteIntegrity([check], "vault")).rejects.toThrow("transfer limit");
+      await expect(limited.verifyRemoteIntegrity([check], "vault")).rejects.toThrow("传输限制");
     }
     expect(reads.some(key => key.includes("/blobs/"))).toBe(false);
     // A rejected upload not referenced by accepted history must not leave an eternal blocker.
@@ -309,7 +309,7 @@ describe("SyncService", () => {
           path: entry.path, reason: "edit-edit", candidates: [], materializedContentHash: entry.revision.contentHash,
           history: [entry.revision]}}]}});
     await expect(service.verifyRemoteIntegrity([{kind: "recovery", entryId: entry.entryId, contentHash: entry.revision.contentHash}], "vault"))
-      .rejects.toThrow("no authenticated materialized candidate");
+      .rejects.toThrow("冲突没有可核实的候选版本");
   });
 
   it("rejects a cross-platform path collision before initializing Head", async () => {
@@ -330,7 +330,7 @@ describe("SyncService", () => {
     });
 
     await expect(service.initializeNew("vault-1")).rejects.toThrow(
-      "cross-platform path collision",
+      "跨平台路径撞名",
     );
 
     await expect(remote.readHead()).resolves.toBeUndefined();
@@ -493,7 +493,7 @@ describe("SyncService", () => {
     });
 
     await expect(service.initializeNew("vault-1")).rejects.toThrow(
-      "Local file changed while reading notes/example.md",
+      "读取期间本地文件被改动：notes/example.md",
     );
     expect(await remote.readHead()).toBeUndefined();
   });
@@ -689,6 +689,316 @@ describe("SyncService", () => {
     expect((await remote.readHead())?.value.generation).toBe(1);
   });
 
+  describe("a stale local copy that matches Version History", () => {
+    const path = "notes/stale.md";
+    const encode = (text: string) => new TextEncoder().encode(text);
+    // 电脑依次发布 R1、R2、R3；手机的 base 停在 R1（或没有 base），本地内容另行写入
+    const setup = async (options: {phoneHasBase: boolean; phoneContent: string}) => {
+      const objects = new MemoryObjectStore();
+      const remote = await RemoteStore.open({objects, prefix: "stale", vaultKey: new Uint8Array(32)});
+      const desktopVault = new MemoryVault();
+      const desktop = new SyncService({cache: new MemorySyncCache(), local: desktopVault, remote, replicaId: "desktop"});
+      await desktopVault.write(path, encode("R1 first draft"));
+      await desktop.initializeNew("vault");
+      const phoneVault = new MemoryVault();
+      const phone = new SyncService({cache: new MemorySyncCache(), local: phoneVault, remote, replicaId: "phone"});
+      if (options.phoneHasBase) await phone.synchronize();
+      await desktopVault.write(path, encode("R2 second draft"));
+      await desktop.synchronize();
+      await desktopVault.write(path, encode("R3 current"));
+      await desktop.synchronize();
+      await phoneVault.write(path, encode(options.phoneContent));
+      const entryOf = async () => {
+        const head = (await remote.readHead())!;
+        return Object.values((await remote.readSnapshot(head.value)).entries).find(entry => entry.path === path)!;
+      };
+      const damageRevision = async (content: string) => {
+        const entry = await entryOf();
+        const hash = await sha256Content(encode(content));
+        const revision = (entry.history ?? []).find(value => value.contentHash === hash)!;
+        await objects.put(`stale/v1/blobs/${revision.blobId}`, encode("damaged"));
+      };
+      return {remote, phone, phoneVault, entryOf, damageRevision};
+    };
+
+    it("replaces a stale copy with the current Revision instead of conflicting", async () => {
+      const {remote, phone, phoneVault, entryOf} = await setup({phoneHasBase: true, phoneContent: "R2 second draft"});
+      const generation = (await remote.readHead())!.value.generation;
+
+      await expect(phone.synchronize()).resolves.toMatchObject({
+        status: "complete", downloaded: 1, uploaded: 0, localIssues: [],
+      });
+
+      expect(phoneVault.readText(path)).toBe("R3 current");
+      const entry = await entryOf();
+      expect(entry.kind).toBe("live");
+      expect(entry.kind === "live" && entry.revision.contentHash).toBe(await sha256Content(encode("R3 current")));
+      expect((await remote.readHead())!.value.generation).toBe(generation);
+      await expect(phone.synchronize()).resolves.toMatchObject({
+        status: "complete", downloaded: 0, uploaded: 0,
+      });
+    });
+
+    it("replaces a stale copy without a base instead of asking for review", async () => {
+      const {phone, phoneVault} = await setup({phoneHasBase: false, phoneContent: "R1 first draft"});
+
+      await expect(phone.synchronize()).resolves.toMatchObject({
+        status: "complete", downloaded: 1, uploaded: 0, localIssues: [],
+      });
+
+      expect(phoneVault.readText(path)).toBe("R3 current");
+      await expect(phone.synchronize()).resolves.toMatchObject({
+        status: "complete", downloaded: 0, uploaded: 0,
+      });
+    });
+
+    it("keeps conflicting when local content is not a recorded Revision", async () => {
+      const {phone, entryOf} = await setup({phoneHasBase: true, phoneContent: "phone edit"});
+
+      await phone.synchronize();
+
+      expect(await entryOf()).toMatchObject({kind: "conflicted", reason: "edit-edit"});
+    });
+
+    it("keeps bootstrap review when local content is not a recorded Revision", async () => {
+      const {phone, phoneVault} = await setup({phoneHasBase: false, phoneContent: "phone edit"});
+
+      await expect(phone.synchronize()).resolves.toMatchObject({
+        status: "action-required", localIssues: [{kind: "bootstrap-mismatch", path}],
+      });
+      expect(phoneVault.readText(path)).toBe("phone edit");
+    });
+
+    it("conflicts when the matching Revision can no longer be authenticated", async () => {
+      const {phone, entryOf, damageRevision} = await setup({phoneHasBase: true, phoneContent: "R2 second draft"});
+      await damageRevision("R2 second draft");
+
+      await phone.synchronize();
+
+      expect(await entryOf()).toMatchObject({kind: "conflicted", reason: "edit-edit"});
+    });
+
+    it("asks for bootstrap review when the matching Revision can no longer be authenticated", async () => {
+      const {phone, phoneVault, damageRevision} = await setup({phoneHasBase: false, phoneContent: "R1 first draft"});
+      await damageRevision("R1 first draft");
+
+      await expect(phone.synchronize()).resolves.toMatchObject({
+        status: "action-required", localIssues: [{kind: "bootstrap-mismatch", path}],
+      });
+      expect(phoneVault.readText(path)).toBe("R1 first draft");
+    });
+  });
+
+  describe("downloads materialized before an interrupted synchronization", () => {
+    const x = "notes/x.txt";
+    const encode = (text: string) => new TextEncoder().encode(text);
+    // 电脑发布 R1 后手机建立（或不建立）base；电脑再发布 R2 和新文件，手机下载到一半被打断；电脑随后发布 R3
+    const setup = async (options: {phoneHasBase: boolean}) => {
+      const objects = new MemoryObjectStore();
+      const remote = await RemoteStore.open({objects, prefix: "resume", vaultKey: new Uint8Array(32)});
+      const desktopVault = new MemoryVault();
+      const desktop = new SyncService({cache: new MemorySyncCache(), local: desktopVault, remote, replicaId: "desktop"});
+      await desktopVault.write(x, encode("R1 x"));
+      await desktopVault.write("notes/gone.txt", encode("gone"));
+      await desktopVault.write("notes/y.txt", encode("R1 y"));
+      await desktop.initializeNew("vault");
+      const phoneVault = new MemoryVault();
+      const phoneCache = new MemorySyncCache();
+      const hooks: {onProgress?: (progress: SyncProgress) => void} = {};
+      const phone = new SyncService({
+        cache: phoneCache, local: phoneVault, remote, replicaId: "phone",
+        onProgress: progress => hooks.onProgress?.(progress),
+      });
+      if (options.phoneHasBase) await phone.synchronize();
+      await desktopVault.write(x, encode("R2 x"));
+      await desktopVault.delete("notes/gone.txt");
+      await desktopVault.write("notes/z.md", encode("new z"));
+      // 删除 1 个文件超过 20% 的阈值，按确认后的集合发布
+      const pending = await desktop.synchronize();
+      await desktop.synchronize(pending.bulkDeletion?.entryIds ?? []);
+      const entryAt = async (path: string) => {
+        const head = (await remote.readHead())!;
+        return Object.values((await remote.readSnapshot(head.value)).entries).find(entry => entry.path === path)!;
+      };
+      // 第 n 个文件下载完成后，下一次读取数据块时网络中断
+      const interruptAfterDownloads = (count: number) => {
+        let armed = false;
+        hooks.onProgress = progress => {
+          if (progress.phase === "downloading" && progress.completed >= count) armed = true;
+        };
+        objects.onGet = key => {
+          if (!armed || !key.includes("/blobs/")) return;
+          armed = false;
+          hooks.onProgress = undefined;
+          objects.onGet = undefined;
+          throw new Error("network lost");
+        };
+      };
+      // 规划阶段读不出这个历史版本（票 07 的旧副本规则因此不生效），进入下载阶段后恢复可读
+      const hideRevisionWhilePlanning = async (path: string, content: string) => {
+        const entry = await entryAt(path);
+        const hash = await sha256Content(encode(content));
+        const revision = (entry.history ?? []).find(value => value.contentHash === hash)!;
+        const key = `resume/v1/blobs/${revision.blobId}`;
+        const original = (await objects.get(key))!;
+        await objects.put(key, encode("damaged"));
+        hooks.onProgress = progress => {
+          if (progress.phase !== "downloading") return;
+          hooks.onProgress = undefined;
+          void objects.put(key, original.body);
+        };
+      };
+      const publishR3 = async () => {
+        await desktopVault.write(x, encode("R3 x"));
+        await desktop.synchronize();
+      };
+      return {objects, remote, phone, phoneVault, phoneCache, desktopVault, desktop, hooks,
+        entryAt, interruptAfterDownloads, hideRevisionWhilePlanning, publishR3};
+    };
+
+    it("treats a file downloaded before the interruption as unmodified", async () => {
+      const {phone, phoneVault, phoneCache, entryAt, interruptAfterDownloads, hideRevisionWhilePlanning, publishR3} =
+        await setup({phoneHasBase: true});
+      interruptAfterDownloads(1);
+      await expect(phone.synchronize()).rejects.toThrow("network lost");
+      expect(phoneVault.readText(x)).toBe("R2 x");
+      expect(phoneVault.readText("notes/z.md")).toBeUndefined();
+      // 只记下已落地的 x：还没下载的 z 不进 base，远端的删除也不提前写成 Deletion Record
+      const accepted = phoneCache.state!;
+      const xEntry = Object.values(accepted.snapshot.entries).find(entry => entry.path === x);
+      expect(xEntry?.kind === "live" && xEntry.revision.contentHash).toBe(await sha256Content(encode("R2 x")));
+      expect(accepted.files[x]?.contentHash).toBe(await sha256Content(encode("R2 x")));
+      expect(Object.values(accepted.snapshot.entries).some(entry => entry.path === "notes/z.md")).toBe(false);
+      expect(accepted.files["notes/z.md"]).toBeUndefined();
+      expect(Object.values(accepted.snapshot.entries).find(entry => entry.path === "notes/gone.txt")?.kind).toBe("live");
+
+      await publishR3();
+      await hideRevisionWhilePlanning(x, "R2 x");
+      await expect(phone.synchronize()).resolves.toMatchObject({
+        status: "complete", downloaded: 2, uploaded: 0, localIssues: [],
+      });
+
+      expect(phoneVault.readText(x)).toBe("R3 x");
+      expect(phoneVault.readText("notes/z.md")).toBe("new z");
+      expect(await entryAt(x)).toMatchObject({kind: "live"});
+      await expect(phone.synchronize()).resolves.toMatchObject({status: "complete", downloaded: 0, uploaded: 0});
+    });
+
+    it("stops without a Conflict when the downloaded Revision has no recovery copy left", async () => {
+      const {objects, phone, phoneVault, entryAt, interruptAfterDownloads, publishR3} = await setup({phoneHasBase: true});
+      interruptAfterDownloads(1);
+      await expect(phone.synchronize()).rejects.toThrow("network lost");
+      await publishR3();
+      const entry = await entryAt(x);
+      const hash = await sha256Content(encode("R2 x"));
+      const r2 = (entry.history ?? []).find(value => value.contentHash === hash)!;
+      await objects.put(`resume/v1/blobs/${r2.blobId}`, encode("damaged"));
+
+      // 不变量 9：替换本地 R2 之前必须有可核实的恢复副本，没有就停下，不把它当成本机修改发布 Conflict
+      await expect(phone.synchronize()).rejects.toBeInstanceOf(RemoteStateError);
+      expect(phoneVault.readText(x)).toBe("R2 x");
+      expect(await entryAt(x)).toMatchObject({kind: "live"});
+    });
+
+    it("does not ask for bootstrap review of a file downloaded before the interruption", async () => {
+      const {phone, phoneVault, phoneCache, interruptAfterDownloads, hideRevisionWhilePlanning, publishR3} =
+        await setup({phoneHasBase: false});
+      interruptAfterDownloads(1);
+      await expect(phone.synchronize()).rejects.toThrow("network lost");
+      expect(phoneVault.readText(x)).toBe("R2 x");
+      expect(phoneCache.state).toMatchObject({bootstrapPending: true});
+      expect(Object.keys(phoneCache.state!.files)).toEqual([x]);
+
+      await publishR3();
+      await hideRevisionWhilePlanning(x, "R2 x");
+      await expect(phone.synchronize()).resolves.toMatchObject({
+        status: "complete", uploaded: 0, localIssues: [],
+      });
+
+      expect(phoneVault.readText(x)).toBe("R3 x");
+      expect(phoneVault.readText("notes/z.md")).toBe("new z");
+      expect(phoneCache.state?.bootstrapPending).toBeUndefined();
+    });
+
+    it("keeps a download materialized before an interrupted upload while real local edits still conflict", async () => {
+      const {objects, phone, phoneVault, desktopVault, desktop, entryAt, hooks, hideRevisionWhilePlanning, publishR3} =
+        await setup({phoneHasBase: true});
+      // 下载前就存在的本机修改：y 不等于任何远端版本，另有一个本机新文件
+      await phoneVault.write("notes/y.txt", encode("phone y edit"));
+      await phoneVault.write("notes/new.txt", encode("phone new"));
+      await desktopVault.write("notes/y.txt", encode("desktop y edit"));
+      await desktop.synchronize();
+      let uploadsStarted = false;
+      hooks.onProgress = progress => {
+        if (progress.phase === "uploading") uploadsStarted = true;
+      };
+      objects.onPut = key => {
+        if (!uploadsStarted || !key.includes("/blobs/")) return;
+        objects.onPut = undefined;
+        throw new Error("network lost");
+      };
+      await expect(phone.synchronize()).rejects.toThrow("network lost");
+      hooks.onProgress = undefined;
+      expect(phoneVault.readText(x)).toBe("R2 x");
+
+      await publishR3();
+      await hideRevisionWhilePlanning(x, "R2 x");
+      await expect(phone.synchronize()).resolves.toMatchObject({status: "action-required", uploaded: 2});
+
+      expect(phoneVault.readText(x)).toBe("R3 x");
+      expect(await entryAt(x)).toMatchObject({kind: "live"});
+      expect(await entryAt("notes/y.txt")).toMatchObject({kind: "conflicted", reason: "edit-edit"});
+      expect(await entryAt("notes/new.txt")).toMatchObject({kind: "live"});
+    });
+
+    it("does not record a file edited right after it was downloaded", async () => {
+      const {phone, phoneVault, phoneCache, entryAt, interruptAfterDownloads, publishR3} =
+        await setup({phoneHasBase: true});
+      const write = phoneVault.write.bind(phoneVault);
+      phoneVault.write = async (path: string, body: Uint8Array) => {
+        await write(path, body);
+        if (path === x) {
+          phoneVault.write = write;
+          await write(x, encode("phone edit after download"));
+        }
+      };
+      interruptAfterDownloads(1);
+      await expect(phone.synchronize()).rejects.toThrow("network lost");
+      expect(phoneCache.state!.files[x]?.contentHash).toBe(await sha256Content(encode("R1 x")));
+
+      await publishR3();
+      await phone.synchronize();
+
+      expect(await entryAt(x)).toMatchObject({kind: "conflicted", reason: "edit-edit"});
+    });
+
+    it("saves downloaded files periodically so a killed run keeps them", async () => {
+      const {objects, phone, phoneCache, hooks} = await setup({phoneHasBase: true});
+      vi.useFakeTimers({toFake: ["Date"]});
+      try {
+        // 第一个下载开始时时钟走过保存间隔；进程在下一个下载中途被杀，来不及走错误处理
+        let savedBeforeKill: CachedSyncState | undefined;
+        hooks.onProgress = progress => {
+          if (progress.phase !== "downloading") return;
+          if (progress.completed === 0) vi.setSystemTime(Date.now() + 5_000);
+          if (progress.completed === 1) {
+            hooks.onProgress = undefined;
+            objects.onGet = key => {
+              if (!key.includes("/blobs/")) return;
+              objects.onGet = undefined;
+              savedBeforeKill = structuredClone(phoneCache.state);
+              throw new Error("process killed");
+            };
+          }
+        };
+        await expect(phone.synchronize()).rejects.toThrow("process killed");
+        expect(savedBeforeKill?.files[x]?.contentHash).toBe(await sha256Content(encode("R2 x")));
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   describe("reviewing local content without a trusted base", () => {
     const setup = async (reverseOrder = false) => {
       const objects = new MemoryObjectStore();
@@ -780,7 +1090,7 @@ describe("SyncService", () => {
         else { await source.write("article.md", new TextEncoder().encode("new S3 version")); await sourceService.synchronize(); }
         const head = await remote.readHead();
         const before = await local.list();
-        await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("changed. Review");
+        await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("有变化。请重新审查");
         expect(await remote.readHead()).toEqual(head);
         expect(await local.list()).toEqual(before);
         expect(local.readText("article.md")).toBe(changed === "local" ? "new draft" : "local article");
@@ -809,7 +1119,7 @@ describe("SyncService", () => {
         objects.onPut = undefined;
         await local.write("article.md", new TextEncoder().encode("typing while saving"));
       };
-      await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("changed");
+      await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("被改动");
       expect(local.readText("article.md")).toBe("typing while saving");
       expect(await remote.readHead()).toEqual(head);
     });
@@ -823,7 +1133,7 @@ describe("SyncService", () => {
         await source.write("article.md", new TextEncoder().encode("concurrent remote update"));
         await sourceService.synchronize();
       };
-      await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("Head changed");
+      await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("Head 指针被改了");
       expect(local.readText("article.md")).toBe("local article");
       const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
       const entry = Object.values(snapshot.entries).find(value => value.path === "article.md");
@@ -839,7 +1149,7 @@ describe("SyncService", () => {
         objects.onPut = undefined;
         await local.write("article.md", new TextEncoder().encode("typing during publication"));
       };
-      await expect(service.resolveLocalContent("article.md", review.reviewToken, "remote")).rejects.toThrow("changed");
+      await expect(service.resolveLocalContent("article.md", review.reviewToken, "remote")).rejects.toThrow("被改动");
       expect(local.readText("article.md")).toBe("typing during publication");
       const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
       const entry = Object.values(snapshot.entries).find(value => value.path === "article.md");
@@ -853,7 +1163,7 @@ describe("SyncService", () => {
       const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
       const entry = Object.values(snapshot.entries).find(value => value.path === "article.md")!;
       await expect(service.readHistoricalRevision(missing === "missing-entry" ? "missing" : entry.entryId, "missing"))
-        .rejects.toThrow("This historical version is no longer available");
+        .rejects.toThrow("这个历史版本已不可用");
     });
 
     it("refuses expired or corrupted backup previews and restores", async () => {
@@ -880,8 +1190,8 @@ describe("SyncService", () => {
       await remote.advance({expectedHeadEtag: head.etag, head: {...head.value, commitId},
         commit: {commitId, vaultId: snapshot.vaultId, protocolVersion: 1, createdAt: head.serverDate,
           parentIds: [head.value.commitId], replicaId: "test", changes: [{kind: "set-entry", entry: expired}]}});
-      await expect(service.readHistoricalRevision(entry.entryId, backup.revisionId)).rejects.toThrow("expired");
-      await expect(service.restoreRevision(entry.entryId, backup.revisionId)).rejects.toThrow("expired");
+      await expect(service.readHistoricalRevision(entry.entryId, backup.revisionId)).rejects.toThrow("已过期");
+      await expect(service.restoreRevision(entry.entryId, backup.revisionId)).rejects.toThrow("已过期");
       expect(local.readText("article.md")).toBe("remote article");
     });
 
@@ -1060,7 +1370,7 @@ describe("SyncService", () => {
       }
       const before = (await remote.readHead())!.value.commitId;
       await expect(service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken))
-        .rejects.toThrow("changed. Review");
+        .rejects.toThrow("有变化。请重新审查");
       expect((await remote.readHead())!.value.commitId).toBe(before);
       expect((await local.list()).length).toBe(2);
       expect(local.readText("article.md")).toBe(side === "local" ? "new draft" : "local article");
@@ -1085,7 +1395,7 @@ describe("SyncService", () => {
         objects.onPut = undefined;
         await local.write("article.md", new TextEncoder().encode("typing during upload"));
       };
-      await expect(service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken)).rejects.toThrow("changed");
+      await expect(service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken)).rejects.toThrow("被改动");
       expect(local.readText("article.md")).toBe("typing during upload");
     });
 
@@ -1109,10 +1419,10 @@ describe("SyncService", () => {
       const service = new SyncService({remote, local, cache: new MemorySyncCache(), replicaId: "phone", maxAutomaticFileBytes: 5});
       const reads = local.readCount;
       const review = await service.reviewLocalContent("article.md");
-      expect(review.blockedReason).toContain("device's transfer limit");
+      expect(review.blockedReason).toContain("本设备的传输限制");
       expect(local.readCount).toBe(reads);
       for (const choice of ["local", "remote", "both"] as const) {
-        await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("device's transfer limit");
+        await expect(service.resolveLocalContent("article.md", review.reviewToken, choice)).rejects.toThrow("本设备的传输限制");
       }
     });
 
@@ -1125,7 +1435,7 @@ describe("SyncService", () => {
         await source.write("article.md", new TextEncoder().encode("another device edited during backup"));
         await sourceService.synchronize();
       };
-      await expect(service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken)).rejects.toThrow("Head changed");
+      await expect(service.preserveLocalCopyAndAcceptRemote("article.md", review.reviewToken)).rejects.toThrow("Head 指针被改了");
       expect(local.readText("article.md")).toBe("local article");
       const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
       const original = Object.values(snapshot.entries).find(entry => entry.path === "article.md");
@@ -1164,7 +1474,7 @@ describe("SyncService", () => {
       expect(previews).toContain("local article");
       expect(previews).toContain("concurrent remote edit");
       expect((await remote.readHead())!.value.commitId).toBe(previewHead);
-      await expect(service.readConflictCandidate(before.entryId, "missing-candidate")).rejects.toThrow("no longer");
+      await expect(service.readConflictCandidate(before.entryId, "missing-candidate")).rejects.toThrow("已不是冲突候选版本");
       await local.write("article.md", new TextEncoder().encode("extra local edits during conflict"));
       expect((await service.synchronize()).localIssues).toContainEqual({kind: "resolution-mismatch", path: "article.md"});
       const review = await service.reviewLocalContent("article.md");
@@ -1706,7 +2016,7 @@ describe("SyncService", () => {
     };
 
     await expect(phone.synchronize()).rejects.toThrow(
-      "Local file changed during synchronization: notes/example.md",
+      "同步过程中本地文件被改动：notes/example.md",
     );
 
     expect(phoneVault.readText("notes/example.md")).toBe(
@@ -1873,7 +2183,7 @@ describe("SyncService", () => {
     };
 
     await expect(service.synchronize(entryIds)).rejects.toThrow(
-      "Local file changed during synchronization",
+      "同步过程中本地文件被改动",
     );
 
     expect(local.readText("notes/example.md")).toBe("recreated draft");
@@ -1926,7 +2236,7 @@ describe("SyncService", () => {
     };
 
     await expect(phone.synchronize()).rejects.toThrow(
-      "Local file changed during synchronization: notes/example.md",
+      "同步过程中本地文件被改动：notes/example.md",
     );
 
     expect(phoneVault.readText("notes/example.md")).toBe(
@@ -1984,7 +2294,7 @@ describe("SyncService", () => {
 
     const synchronization = phone.synchronize();
     await expect(synchronization).rejects.toThrow(
-      "Vault Snapshot references missing blobs",
+      "仓库快照引用的数据块缺失",
     );
     await expect(synchronization).rejects.toThrow("notes/example.md");
 
@@ -2027,7 +2337,7 @@ describe("SyncService", () => {
     await local.write("notes/example.md", new TextEncoder().encode("after"));
 
     await expect(service.synchronize()).rejects.toThrow(
-      "cannot be authenticated",
+      "无法核实远端版本",
     );
 
     await expect(remote.readHead()).resolves.toMatchObject({
@@ -2086,7 +2396,7 @@ describe("SyncService", () => {
 
     const synchronization = phone.synchronize();
     await expect(synchronization).rejects.toThrow(
-      "No authenticated remote recovery exists",
+      "在远端没有可核实的恢复副本",
     );
     await expect(synchronization).rejects.toThrow("notes/example.md");
     await expect(synchronization).rejects.toBeInstanceOf(RemoteStateError);
@@ -2687,7 +2997,7 @@ describe("SyncService", () => {
         fullHashVerification: true,
         retryHashMemo,
       }),
-    ).rejects.toThrow("Head changed");
+    ).rejects.toThrow("Head 指针被改了");
     local.readCount = 0;
     local.readPaths.length = 0;
 
@@ -2975,7 +3285,7 @@ describe("SyncService", () => {
     local.listedSizeOverrides.set("notes/example.md", 100);
 
     await expect(service.synchronize()).rejects.toMatchObject({
-      message: "Local file changed during synchronization: notes/example.md",
+      message: "同步过程中本地文件被改动：notes/example.md",
       path: "notes/example.md",
     });
     expect((await remote.readHead())?.value.generation).toBe(1);
@@ -3321,7 +3631,7 @@ describe("SyncService", () => {
       throw new Error("Expected unsupported remote path");
     }
     await expect(phone.downloadDeferred(unsupported.entryId)).rejects.toThrow(
-      "not supported on this device",
+      "本设备不支持这个路径",
     );
   });
 
@@ -3829,7 +4139,7 @@ describe("SyncService", () => {
 
     await expect(
       service.restoreRevision(entry.entryId, entry.history[0].revisionId),
-    ).rejects.toThrow("No authenticated remote recovery exists");
+    ).rejects.toThrow("在远端没有可核实的恢复副本");
 
     expect(local.readText("notes/example.md")).toBe("version two");
     await expect(remote.readHead()).resolves.toMatchObject({
@@ -4080,7 +4390,7 @@ describe("SyncService", () => {
     objects.corruptNextBlobPut = true;
 
     await expect(phone.synchronize()).rejects.toThrow(
-      "cannot be authenticated",
+      "无法核实远端版本",
     );
 
     expect(phoneVault.readText("notes/example.md")).toBe("phone edit");
@@ -4192,7 +4502,7 @@ describe("SyncService", () => {
     };
 
     await expect(service.restoreDeleted(entryId)).rejects.toThrow(
-      "Local file changed during synchronization",
+      "同步过程中本地文件被改动",
     );
 
     expect(local.readText("notes/example.md")).toBe("new local draft");
@@ -4236,7 +4546,7 @@ describe("SyncService", () => {
     };
 
     await expect(service.restoreDeleted(entryId)).rejects.toThrow(
-      "Head changed",
+      "Head 指针被改了",
     );
 
     expect(local.readText("notes/example.md")).toBeUndefined();
@@ -4306,7 +4616,7 @@ describe("SyncService", () => {
     });
 
     await expect(restoringReplica.restoreDeleted(foo.entryId)).rejects.toThrow(
-      "it is owned by Entry",
+      "这个路径已被文件",
     );
 
     expect(emptyLocal.readText("notes/foo.md")).toBeUndefined();
@@ -4824,7 +5134,7 @@ describe("SyncService", () => {
     if (entry.kind !== "live") throw new Error("Expected live fixture");
     await objects.put(`damaged-move/v1/blobs/${entry.revision.blobId}`, new TextEncoder().encode("damaged ciphertext"));
     await local.write("new.md", new TextEncoder().encode("original"));
-    await expect(phone.synchronize()).rejects.toThrow("No authenticated remote recovery");
+    await expect(phone.synchronize()).rejects.toThrow("在远端没有可核实的恢复副本");
     expect(local.readText("old.md")).toBe("original");
     expect(local.readText("new.md")).toBe("original");
   });
@@ -4987,7 +5297,7 @@ describe("SyncService", () => {
     await local.write("note.md", new TextEncoder().encode("typing"));
     const head = await remote.readHead();
     await expect(service.resolvePathCollision({paths: review.paths, reviewToken: review.reviewToken, side: "local",
-      path: "note.md", newName: "renamed.md"}, tracker.capture(), collisionJournal(local, cache, tracker))).rejects.toThrow("changed");
+      path: "note.md", newName: "renamed.md"}, tracker.capture(), collisionJournal(local, cache, tracker))).rejects.toThrow("文件或同步记录有变化");
     expect(await remote.readHead()).toEqual(head);
     expect(local.readText("note.md")).toBe("typing");
     expect(local.readText("renamed.md")).toBeUndefined();
@@ -5007,7 +5317,7 @@ describe("SyncService", () => {
     const head = await remote.readHead();
     await expect(service.resolvePathCollision({paths: review.paths, reviewToken: review.reviewToken, side: "remote",
       path: "note.md", entryId: review.remoteFiles[0]!.entryId, newName: "EMPTY.md"}, tracker.capture(), collisionJournal(local, cache, tracker)))
-      .rejects.toThrow("occupied");
+      .rejects.toThrow("已被占用");
     expect(await remote.readHead()).toEqual(head);
   });
 
@@ -5049,7 +5359,7 @@ describe("SyncService", () => {
     };
 
     await expect(phone.synchronize()).rejects.toThrow(
-      "Local file changed during synchronization: notes/b.md",
+      "同步过程中本地文件被改动：notes/b.md",
     );
 
     expect(phoneVault.readText("notes/a.md")).toBe("remote");
@@ -5262,12 +5572,16 @@ describe("SyncService", () => {
   });
 
   describe("possible rename review", () => {
-    const setupReview = async (count = 1) => {
+    // unrelated：无关的存活文件数。被扣住的消失 Entry 计入 Bulk Deletion 门槛，补足它们才能走挪动审查而不是批量删除
+    const setupReview = async (count = 1, unrelated = 20) => {
       const objects = new MemoryObjectStore();
       const remote = await RemoteStore.open({objects, prefix: "test", vaultKey: new Uint8Array(32)});
       const local = new MemoryVault();
       for (let index = 0; index < count; index += 1) {
         await local.write(`old/${index}.md`, new TextEncoder().encode(`original ${index}`));
+      }
+      for (let index = 0; index < unrelated; index += 1) {
+        await local.write(`keep/${index}.md`, new TextEncoder().encode(`keep ${index}`));
       }
       const cache = new MemorySyncCache();
       const service = new SyncService({cache, local, remote, replicaId: "desktop"});
@@ -5277,13 +5591,15 @@ describe("SyncService", () => {
         await local.move(`old/${index}.md`, `new/${index}.md`);
         await local.write(`new/${index}.md`, new TextEncoder().encode(`edited ${index}`));
       }
-      const issue = (await service.synchronize()).localIssues.find(issue => issue.kind === "possible-rename");
+      const review = await service.synchronize();
+      const issue = review.localIssues.find(issue => issue.kind === "possible-rename");
       if (!issue) throw new Error("Expected rename review");
-      return {objects, remote, local, cache, service, original, issue};
+      return {objects, remote, local, cache, service, original, issue, review};
     };
 
     it("accepts a reviewed folder move with edits, retaining every Entry and old content", async () => {
-      const {service, issue, remote, original} = await setupReview(3);
+      const {service, issue, remote, original, review} = await setupReview(3);
+      expect(review.bulkDeletion).toBeUndefined();
       const result = await service.synchronize([], {renameResolution: {
         kind: "moves", reviewToken: issue.reviewToken,
         pairs: issue.oldPaths.map(fromPath => ({fromPath, toPath: fromPath.replace("old/", "new/")})),
@@ -5291,7 +5607,9 @@ describe("SyncService", () => {
       expect(result.status).toBe("complete");
       const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
       expect(Object.keys(snapshot.entries).sort()).toEqual(Object.keys(original.snapshot.entries).sort());
-      for (const entry of Object.values(snapshot.entries)) {
+      const moved = Object.values(snapshot.entries).filter(entry => !entry.path.startsWith("keep/"));
+      expect(moved).toHaveLength(3);
+      for (const entry of moved) {
         expect(entry.kind).toBe("live");
         expect(entry.path.startsWith("new/")).toBe(true);
         expect(entry.history?.[0]?.contentHash).toBe(
@@ -5300,36 +5618,39 @@ describe("SyncService", () => {
       }
     });
 
-    it.each(["local-edit", "new-file", "remote-change", "wrong-token"])(
+    it.each(["local-edit", "new-file", "remote-edit", "wrong-token"])(
       "rejects a stale review after %s without publishing or deleting files", async change => {
-        const {service, issue, local, remote} = await setupReview();
+        const {service, issue, local, remote, review} = await setupReview();
+        expect(review.bulkDeletion).toBeUndefined();
         if (change === "local-edit") await local.write("new/0.md", new TextEncoder().encode("newer draft"));
         if (change === "new-file") await local.write("new/extra.md", new TextEncoder().encode("extra draft"));
-        if (change === "remote-change") {
-          const head = (await remote.readHead())!;
-          const commitId = crypto.randomUUID();
-          await remote.advance({expectedHeadEtag: head.etag, head: {...head.value, commitId, generation: head.value.generation + 1},
-            commit: {commitId, changes: [], parentIds: [head.value.commitId], createdAt: head.serverDate,
-              protocolVersion: 1, replicaId: "other", vaultId: "vault"}});
+        if (change === "remote-edit") {
+          const other = new MemoryVault();
+          const otherService = new SyncService({cache: new MemorySyncCache(), local: other, remote, replicaId: "phone"});
+          await otherService.synchronize();
+          await other.write("old/0.md", new TextEncoder().encode("remote draft"));
+          await otherService.synchronize();
         }
         const before = (await remote.readHead())!.value.commitId;
         await expect(service.synchronize([], {renameResolution: {
           kind: "separate", reviewToken: change === "wrong-token" ? "stale" : issue.reviewToken,
-        }})).rejects.toThrow("changed since the rename review");
+        }})).rejects.toThrow("审查挪动之后文件或远端状态有变化");
         expect((await remote.readHead())!.value.commitId).toBe(before);
         expect(local.readText("new/0.md")).toBe(change === "local-edit" ? "newer draft" : "edited 0");
       },
     );
 
     it("rejects a mapping that assigns two old Entries to the same new file", async () => {
-      const {service, issue} = await setupReview(2);
+      const {service, issue, review} = await setupReview(2);
+      expect(review.bulkDeletion).toBeUndefined();
       await expect(service.synchronize([], {renameResolution: {kind: "moves", reviewToken: issue.reviewToken,
         pairs: issue.oldPaths.map(fromPath => ({fromPath, toPath: "new/0.md"})),
-      }})).rejects.toThrow("not one-to-one");
+      }})).rejects.toThrow("不是一对一的");
     });
 
     it("requires exact bulk-delete confirmation after separate delete/add review", async () => {
-      const {service, issue, remote, local} = await setupReview(2);
+      // 不补无关文件：分开处理后的删除集合与审查时被扣住的集合相同，要让前者成为批量删除，审查阶段也必然超过门槛
+      const {service, issue, remote, local} = await setupReview(2, 0);
       const before = (await remote.readHead())!.value.commitId;
       const resolution = {kind: "separate" as const, reviewToken: issue.reviewToken};
       const blocked = await service.synchronize([], {renameResolution: resolution});
@@ -5345,6 +5666,301 @@ describe("SyncService", () => {
     });
   });
 
+  describe("held unobserved moves", () => {
+    const encode = (text: string) => new TextEncoder().encode(text);
+    const notes = ["a.md", "b.md", "c.md", "d.md", "e.md"];
+    // 2026-10-13 图纸场景：旧 PDF 消失，两个同内容 PDF 新增，另有截图与笔记改动
+    const setupDrawings = async () => {
+      const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "test", vaultKey: new Uint8Array(32)});
+      const local = new MemoryVault();
+      await local.write("TM/8799-D R1.pdf", encode("drawing"));
+      for (const note of notes) await local.write(note, encode(`note ${note}`));
+      const cache = new MemorySyncCache();
+      const service = new SyncService({cache, local, remote, replicaId: "desktop"});
+      await service.initializeNew("vault");
+      const pdfEntryId = cache.state!.files["TM/8799-D R1.pdf"]!.entryId;
+      const other = new MemoryVault();
+      const otherService = new SyncService({cache: new MemorySyncCache(), local: other, remote, replicaId: "phone"});
+      await otherService.synchronize();
+      await other.write("b.md", encode("remote edit"));
+      await otherService.synchronize();
+      await local.delete("TM/8799-D R1.pdf");
+      await local.write("TM/archive/8799-D R1 old.pdf", encode("drawing"));
+      await local.write("TM/8797-D R1.pdf", encode("drawing"));
+      for (let index = 0; index < 5; index += 1) await local.write(`shots/${index}.png`, encode(`png ${index}`));
+      await local.write("a.md", encode("local edit"));
+      return {remote, local, cache, service, other, otherService, pdfEntryId};
+    };
+    const liveByPath = async (remote: RemoteStore) => {
+      const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
+      return new Map(Object.values(snapshot.entries).flatMap(entry => entry.kind === "live" ? [[entry.path, entry] as const] : []));
+    };
+    const heldPdfIssue = {
+      kind: "possible-rename",
+      newPaths: expect.arrayContaining(["TM/archive/8799-D R1 old.pdf", "TM/8797-D R1.pdf"]),
+      oldPaths: ["TM/8799-D R1.pdf"],
+      reviewToken: expect.any(String),
+    };
+
+    it("syncs unrelated changes while holding only the same-type files of an unrecognized move", async () => {
+      const {remote, local, service, pdfEntryId} = await setupDrawings();
+
+      const result = await service.synchronize();
+
+      expect(result.status).toBe("action-required");
+      expect(result.cacheUpdated).toBe(true);
+      expect(result.localIssues).toEqual([heldPdfIssue]);
+      const live = await liveByPath(remote);
+      for (let index = 0; index < 5; index += 1) expect(live.has(`shots/${index}.png`)).toBe(true);
+      const note = live.get("a.md")!;
+      expect(new TextDecoder().decode(await remote.readBlob(note.revision.blobId))).toBe("local edit");
+      expect(local.readText("b.md")).toBe("remote edit");
+      expect(live.get("TM/8799-D R1.pdf")?.entryId).toBe(pdfEntryId);
+      expect(live.has("TM/archive/8799-D R1 old.pdf")).toBe(false);
+      expect(live.has("TM/8797-D R1.pdf")).toBe(false);
+      expect(local.readText("TM/8799-D R1.pdf")).toBeUndefined();
+    });
+
+    it("keeps the held files unchanged on the next sync without a decision", async () => {
+      const {remote, local, service, pdfEntryId} = await setupDrawings();
+      const first = await service.synchronize();
+      const firstIssue = first.localIssues.find(issue => issue.kind === "possible-rename");
+      const head = (await remote.readHead())!.value.commitId;
+
+      const second = await service.synchronize();
+
+      expect(second.status).toBe("action-required");
+      expect(second.localIssues).toEqual([firstIssue]);
+      expect(second.downloaded).toBe(0);
+      expect(second.uploaded).toBe(0);
+      expect((await remote.readHead())!.value.commitId).toBe(head);
+      expect(local.readText("TM/8799-D R1.pdf")).toBeUndefined();
+      const live = await liveByPath(remote);
+      expect(live.get("TM/8799-D R1.pdf")?.entryId).toBe(pdfEntryId);
+      expect(live.has("TM/archive/8799-D R1 old.pdf")).toBe(false);
+      expect(live.has("TM/8797-D R1.pdf")).toBe(false);
+    });
+
+    it("recognizes the held move once only one identical candidate remains", async () => {
+      const {remote, local, service, pdfEntryId} = await setupDrawings();
+      await service.synchronize();
+      await local.delete("TM/8797-D R1.pdf");
+
+      const result = await service.synchronize();
+
+      expect(result.status).toBe("complete");
+      expect(result.localIssues).toEqual([]);
+      const live = await liveByPath(remote);
+      expect(live.get("TM/archive/8799-D R1 old.pdf")?.entryId).toBe(pdfEntryId);
+      expect(live.has("TM/8799-D R1.pdf")).toBe(false);
+    });
+
+    const setupVault = async (files: Record<string, string>) => {
+      const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "test", vaultKey: new Uint8Array(32)});
+      const local = new MemoryVault();
+      for (const [path, text] of Object.entries(files)) await local.write(path, encode(text));
+      const cache = new MemorySyncCache();
+      const service = new SyncService({cache, local, remote, replicaId: "desktop"});
+      await service.initializeNew("vault");
+      return {remote, local, cache, service};
+    };
+    const notesVault = (count: number) =>
+      Object.fromEntries(Array.from({length: count}, (_, index) => [`note-${index}.md`, `note ${index}`]));
+    const entriesById = async (remote: RemoteStore) =>
+      (await remote.readSnapshot((await remote.readHead())!.value)).entries;
+
+    it("syncs a missing file as a deletion when only other file types are new", async () => {
+      const {remote, local, cache, service} = await setupVault({"drawing.pdf": "drawing", ...notesVault(5)});
+      const pdfEntryId = cache.state!.files["drawing.pdf"]!.entryId;
+      await local.delete("drawing.pdf");
+      await local.write("shot.png", encode("png"));
+
+      const result = await service.synchronize();
+
+      expect(result.status).toBe("complete");
+      expect(result.localIssues).toEqual([]);
+      expect((await entriesById(remote))[pdfEntryId]).toMatchObject({kind: "deleted", path: "drawing.pdf"});
+      expect((await liveByPath(remote)).has("shot.png")).toBe(true);
+    });
+
+    it("accepts the earlier review token after unrelated files publish a new Commit", async () => {
+      const {remote, local, service, pdfEntryId} = await setupDrawings();
+      const issue = (await service.synchronize()).localIssues.find(issue => issue.kind === "possible-rename")!;
+      await local.write("c.md", encode("another local edit"));
+      expect((await service.synchronize()).uploaded).toBe(1);
+
+      const result = await service.synchronize([], {renameResolution: {kind: "separate", reviewToken: issue.reviewToken}});
+
+      expect(result.status).toBe("complete");
+      expect((await entriesById(remote))[pdfEntryId]).toMatchObject({
+        kind: "deleted", path: "TM/8799-D R1.pdf", recovery: expect.objectContaining({contentHash: expect.any(String)}),
+      });
+      const live = await liveByPath(remote);
+      expect(live.has("TM/archive/8799-D R1 old.pdf")).toBe(true);
+      expect(live.has("TM/8797-D R1.pdf")).toBe(true);
+    });
+
+    it("rejects the review token after a held file changes", async () => {
+      const {remote, local, service} = await setupDrawings();
+      const issue = (await service.synchronize()).localIssues.find(issue => issue.kind === "possible-rename")!;
+      await local.write("TM/8797-D R1.pdf", encode("corrected drawing"));
+      const before = (await remote.readHead())!.value.commitId;
+
+      await expect(service.synchronize([], {renameResolution: {kind: "separate", reviewToken: issue.reviewToken}}))
+        .rejects.toThrow("审查挪动之后文件或远端状态有变化");
+
+      expect((await remote.readHead())!.value.commitId).toBe(before);
+      expect((await liveByPath(remote)).has("TM/8797-D R1.pdf")).toBe(false);
+    });
+
+    it("confirms a held one-to-one move after unrelated files were synced", async () => {
+      const {remote, local, cache, service} = await setupVault({"plan.pdf": "plan v1", ...notesVault(5)});
+      const pdfEntryId = cache.state!.files["plan.pdf"]!.entryId;
+      const oldHash = cache.state!.files["plan.pdf"]!.contentHash;
+      await local.delete("plan.pdf");
+      await local.write("archive/plan v2.pdf", encode("plan v2"));
+      await local.write("shot.png", encode("png"));
+      const first = await service.synchronize();
+      expect((await liveByPath(remote)).has("shot.png")).toBe(true);
+      const issue = first.localIssues.find(issue => issue.kind === "possible-rename")!;
+      expect(issue).toMatchObject({oldPaths: ["plan.pdf"], newPaths: ["archive/plan v2.pdf"]});
+
+      const result = await service.synchronize([], {renameResolution: {kind: "moves", reviewToken: issue.reviewToken,
+        pairs: [{fromPath: "plan.pdf", toPath: "archive/plan v2.pdf"}]}});
+
+      expect(result.status).toBe("complete");
+      const entry = (await entriesById(remote))[pdfEntryId]!;
+      expect(entry).toMatchObject({kind: "live", path: "archive/plan v2.pdf"});
+      expect(entry.history?.[0]?.contentHash).toBe(oldHash);
+    });
+
+    const setupPartialReview = async () => {
+      const vault = await setupVault({"a.pdf": "a v1", "b.pdf": "b v1", ...notesVault(10)});
+      const aEntry = vault.cache.state!.files["a.pdf"]!;
+      const bEntryId = vault.cache.state!.files["b.pdf"]!.entryId;
+      await vault.local.delete("a.pdf");
+      await vault.local.delete("b.pdf");
+      await vault.local.write("new/x.pdf", encode("x"));
+      await vault.local.write("new/y.pdf", encode("y"));
+      await vault.local.write("new/z.pdf", encode("z"));
+      const issue = (await vault.service.synchronize()).localIssues.find(issue => issue.kind === "possible-rename")!;
+      expect(issue).toMatchObject({oldPaths: ["a.pdf", "b.pdf"], newPaths: ["new/x.pdf", "new/y.pdf", "new/z.pdf"]});
+      return {...vault, aEntry, bEntryId, issue};
+    };
+
+    it("moves only the paired missing Entry, deletes the unpaired one and uploads unchosen new files", async () => {
+      const {remote, service, aEntry, bEntryId, issue} = await setupPartialReview();
+
+      const result = await service.synchronize([], {renameResolution: {kind: "moves", reviewToken: issue.reviewToken,
+        pairs: [{fromPath: "a.pdf", toPath: "new/x.pdf"}]}});
+
+      expect(result.status).toBe("complete");
+      expect(result.localIssues).toEqual([]);
+      const entries = await entriesById(remote);
+      expect(entries[aEntry.entryId]).toMatchObject({kind: "live", path: "new/x.pdf"});
+      expect(entries[aEntry.entryId]!.history?.[0]?.contentHash).toBe(aEntry.contentHash);
+      expect(entries[bEntryId]).toMatchObject({
+        kind: "deleted", path: "b.pdf", recovery: expect.objectContaining({contentHash: expect.any(String)}),
+      });
+      const live = await liveByPath(remote);
+      for (const path of ["new/y.pdf", "new/z.pdf"]) {
+        expect(live.get(path)?.entryId).toBeDefined();
+        expect([aEntry.entryId, bEntryId]).not.toContain(live.get(path)!.entryId);
+      }
+    });
+
+    it("treats a review that maps no missing file like separate deletions and additions", async () => {
+      const {remote, service, aEntry, bEntryId, issue} = await setupPartialReview();
+
+      const result = await service.synchronize([], {renameResolution: {kind: "moves", reviewToken: issue.reviewToken, pairs: []}});
+
+      expect(result.status).toBe("complete");
+      const entries = await entriesById(remote);
+      expect(entries[aEntry.entryId]).toMatchObject({kind: "deleted", path: "a.pdf"});
+      expect(entries[bEntryId]).toMatchObject({kind: "deleted", path: "b.pdf"});
+      const live = await liveByPath(remote);
+      for (const path of ["new/x.pdf", "new/y.pdf", "new/z.pdf"]) expect(live.has(path)).toBe(true);
+    });
+
+    it("rejects a move between a missing Entry and a held new file of another type", async () => {
+      const {remote, local, service} = await setupVault({"plan.pdf": "plan", "memo.md": "memo", ...notesVault(10)});
+      await local.delete("plan.pdf");
+      await local.delete("memo.md");
+      await local.write("archive/plan v2.pdf", encode("plan v2"));
+      await local.write("archive/memo v2.md", encode("memo v2"));
+      const issue = (await service.synchronize()).localIssues.find(issue => issue.kind === "possible-rename")!;
+      const before = (await remote.readHead())!.value.commitId;
+
+      await expect(service.synchronize([], {renameResolution: {kind: "moves", reviewToken: issue.reviewToken,
+        pairs: [{fromPath: "plan.pdf", toPath: "archive/memo v2.md"}]}})).rejects.toThrow("同类型的新文件");
+
+      expect((await remote.readHead())!.value.commitId).toBe(before);
+    });
+
+    it("keeps another Replica's edit of a held Entry and the local moved file without publishing a deletion", async () => {
+      const {remote, local, cache, service} = await setupVault({"plan.pdf": "plan v1", ...notesVault(5)});
+      const pdfEntryId = cache.state!.files["plan.pdf"]!.entryId;
+      await local.delete("plan.pdf");
+      await local.write("archive/plan v2.pdf", encode("plan v2"));
+      const first = await service.synchronize();
+      expect(first.localIssues.some(issue => issue.kind === "possible-rename")).toBe(true);
+      const phoneFiles = new MemoryVault();
+      const phone = new SyncService({cache: new MemorySyncCache(), local: phoneFiles, remote, replicaId: "phone"});
+      await phone.synchronize();
+      await phoneFiles.write("plan.pdf", encode("plan v1 edited on phone"));
+      await phone.synchronize();
+      const phoneHash = await sha256Content(encode("plan v1 edited on phone"));
+
+      // 实际结果：被扣住的 Entry 在远端被改后，本机下一次同步把它当作 delete-edit 冲突发布到冲突中心，
+      // 新位置的文件作为新文件上传；两份内容都在，不发布删除
+      const second = await service.synchronize();
+      expect(second.status).toBe("action-required");
+      expect(second.localIssues).toEqual([]);
+      for (let round = 0; round < 2; round += 1) await service.synchronize();
+      await phone.synchronize();
+
+      const entries = await entriesById(remote);
+      expect(entries[pdfEntryId]).toMatchObject({kind: "conflicted", path: "plan.pdf", reason: "delete-edit"});
+      const conflicted = entries[pdfEntryId];
+      if (conflicted?.kind !== "conflicted") throw new Error("Expected conflicted Entry");
+      expect(conflicted.candidates.map(candidate => candidate.contentHash)).toContain(phoneHash);
+      expect(Object.values(entries).filter(entry => entry.kind === "deleted")).toEqual([]);
+      const moved = (await liveByPath(remote)).get("archive/plan v2.pdf");
+      expect(moved?.entryId).toBeDefined();
+      expect(moved!.entryId).not.toBe(pdfEntryId);
+      expect(local.readText("archive/plan v2.pdf")).toBe("plan v2");
+      expect(phoneFiles.readText("plan.pdf")).toBe("plan v1 edited on phone");
+      expect(phoneFiles.readText("archive/plan v2.pdf")).toBe("plan v2");
+    });
+
+    it("counts held missing Entries toward the bulk deletion threshold", async () => {
+      const {remote, local, cache, service} = await setupVault({"drawing.pdf": "drawing", ...notesVault(10)});
+      const pdfEntryId = cache.state!.files["drawing.pdf"]!.entryId;
+      await local.delete("note-0.md");
+      await local.delete("note-1.md");
+      await local.delete("drawing.pdf");
+      await local.write("archive/drawing a.pdf", encode("drawing"));
+      await local.write("archive/drawing b.pdf", encode("drawing"));
+      const before = (await remote.readHead())!.value.commitId;
+
+      const blocked = await service.synchronize();
+
+      expect(blocked.bulkDeletion?.count).toBe(3);
+      expect(blocked.bulkDeletion?.entryIds).toContain(pdfEntryId);
+      expect(blocked.cacheUpdated).toBe(false);
+      expect((await remote.readHead())!.value.commitId).toBe(before);
+
+      const approved = await service.synchronize(blocked.bulkDeletion!.entryIds);
+
+      expect(approved.status).toBe("action-required");
+      expect(approved.localIssues.some(issue => issue.kind === "possible-rename")).toBe(true);
+      const entries = await entriesById(remote);
+      expect(Object.values(entries).filter(entry => entry.kind === "deleted").map(entry => entry.path).sort())
+        .toEqual(["note-0.md", "note-1.md"]);
+      expect(entries[pdfEntryId]).toMatchObject({kind: "live", path: "drawing.pdf"});
+    });
+  });
+
   it("does not assign one missing Entry identity to two identical new files", async () => {
     const objects = new MemoryObjectStore();
     const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
@@ -5355,6 +5971,10 @@ describe("SyncService", () => {
     });
     const local = new MemoryVault();
     await local.write("notes/old.md", new TextEncoder().encode("same"));
+    // 补足无关的存活文件，让被扣住的消失 Entry 不触发 Bulk Deletion，走挪动审查
+    for (let index = 0; index < 5; index += 1) {
+      await local.write(`keep/${index}.md`, new TextEncoder().encode(`keep ${index}`));
+    }
     const service = new SyncService({
       cache: new MemorySyncCache(),
       local,
@@ -5370,6 +5990,7 @@ describe("SyncService", () => {
     const result = await service.synchronize();
 
     expect(result.status).toBe("action-required");
+    expect(result.bulkDeletion).toBeUndefined();
     expect(result.localIssues).toEqual([
       {
         kind: "possible-rename",
@@ -5379,6 +6000,191 @@ describe("SyncService", () => {
       },
     ]);
     expect((await remote.readHead())?.value.generation).toBe(initialGeneration);
+  });
+
+  describe("same-name move inference among identical candidates", () => {
+    const drawing = new TextEncoder().encode("%PDF identical drawing bytes");
+    const setupVault = async (files: Record<string, Uint8Array>) => {
+      const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "same-name", vaultKey: new Uint8Array(32)});
+      const local = new MemoryVault();
+      for (const [path, bytes] of Object.entries(files)) await local.write(path, bytes);
+      const cache = new MemorySyncCache();
+      const service = new SyncService({cache, local, remote, replicaId: "desktop"});
+      await service.initializeNew("vault");
+      const readSnapshot = async () => remote.readSnapshot((await remote.readHead())!.value);
+      const before = await readSnapshot();
+      const entryAt = (path: string) => Object.values(before.entries).find(entry => entry.path === path)!;
+      return {remote, local, cache, service, readSnapshot, entryAt};
+    };
+
+    it("keeps the Entry of a drawing moved under its own name when an identical new drawing appears", async () => {
+      const {local, service, readSnapshot, entryAt} = await setupVault({
+        "TM图纸/8799-D (Section) R1.pdf": drawing,
+        "notes/project.md": new TextEncoder().encode("v1"),
+      });
+      const moved = entryAt("TM图纸/8799-D (Section) R1.pdf");
+      if (moved.kind !== "live") throw new Error("Expected live fixture");
+      await local.move("TM图纸/8799-D (Section) R1.pdf", "TM图纸/过程文档/8799-D (Section) R1.pdf");
+      await local.write("TM图纸/8797-D (Section) R1.pdf", drawing);
+      for (let index = 1; index <= 5; index += 1) {
+        await local.write(`截图/screenshot-${index}.png`, new TextEncoder().encode(`png ${index}`));
+      }
+      await local.write("notes/project.md", new TextEncoder().encode("v2"));
+
+      const result = await service.synchronize();
+
+      expect(result.status).toBe("complete");
+      expect(result.localIssues).toEqual([]);
+      const snapshot = await readSnapshot();
+      expect(snapshot.entries[moved.entryId]).toMatchObject({
+        kind: "live",
+        path: "TM图纸/过程文档/8799-D (Section) R1.pdf",
+        revision: {blobId: moved.revision.blobId},
+      });
+      expect(Object.values(snapshot.entries).filter(entry => entry.kind === "deleted")).toEqual([]);
+      const livePaths = Object.values(snapshot.entries).filter(entry => entry.kind === "live").map(entry => entry.path).sort();
+      expect(livePaths).toEqual([
+        "TM图纸/8797-D (Section) R1.pdf",
+        "TM图纸/过程文档/8799-D (Section) R1.pdf",
+        "notes/project.md",
+        ...[1, 2, 3, 4, 5].map(index => `截图/screenshot-${index}.png`),
+      ].sort());
+      expect((await service.synchronize()).uploaded).toBe(0);
+    });
+
+    it("pairs every uniquely same-named move within one identical content group", async () => {
+      const {local, service, readSnapshot, entryAt} = await setupVault({
+        "图纸/a.pdf": drawing,
+        "图纸/b.pdf": drawing,
+        "图纸/c.pdf": drawing,
+      });
+      const ids = ["a", "b", "c"].map(name => entryAt(`图纸/${name}.pdf`).entryId);
+      for (const name of ["a", "b", "c"]) await local.move(`图纸/${name}.pdf`, `归档/${name}.pdf`);
+      await local.write("图纸/d.pdf", drawing);
+
+      const result = await service.synchronize();
+
+      expect(result.status).toBe("complete");
+      expect(result.localIssues).toEqual([]);
+      const snapshot = await readSnapshot();
+      ["a", "b", "c"].forEach((name, index) => {
+        expect(snapshot.entries[ids[index]!]).toMatchObject({kind: "live", path: `归档/${name}.pdf`});
+      });
+      expect(Object.values(snapshot.entries).filter(entry => entry.kind === "deleted")).toEqual([]);
+      expect(Object.values(snapshot.entries).filter(entry => entry.kind === "live").map(entry => entry.path))
+        .toContain("图纸/d.pdf");
+    });
+
+    // 无关的存活文件：让被扣住的消失 Entry 不触发 Bulk Deletion，走挪动审查
+    const unrelated = Object.fromEntries([0, 1, 2, 3, 4].map(index =>
+      [`notes/keep-${index}.md`, new TextEncoder().encode(`keep ${index}`)]));
+
+    it("still reviews the move when two identical candidates share the missing name", async () => {
+      const {remote, local, service} = await setupVault({"图纸/x.pdf": drawing, ...unrelated});
+      const before = (await remote.readHead())!.value.commitId;
+      await local.move("图纸/x.pdf", "甲/x.pdf");
+      await local.write("乙/x.pdf", drawing);
+
+      const result = await service.synchronize();
+
+      expect(result.status).toBe("action-required");
+      expect(result.bulkDeletion).toBeUndefined();
+      expect(result.localIssues).toEqual([{
+        kind: "possible-rename",
+        newPaths: ["甲/x.pdf", "乙/x.pdf"],
+        oldPaths: ["图纸/x.pdf"],
+        reviewToken: expect.any(String),
+      }]);
+      expect((await remote.readHead())!.value.commitId).toBe(before);
+    });
+
+    it("does not pair a same-named candidate whose path another live Entry owns", async () => {
+      const {remote, local, service, readSnapshot, entryAt} = await setupVault({"图纸/x.pdf": drawing, ...unrelated});
+      const moved = entryAt("图纸/x.pdf");
+      const phoneFiles = new MemoryVault();
+      const phone = new SyncService({cache: new MemorySyncCache(), local: phoneFiles, remote, replicaId: "phone"});
+      await phone.synchronize();
+      await phoneFiles.write("归档/x.pdf", drawing);
+      await phone.synchronize();
+      const owner = Object.values((await readSnapshot()).entries).find(entry => entry.path === "归档/x.pdf")!;
+      await local.move("图纸/x.pdf", "归档/x.pdf");
+      await local.write("图纸/y.pdf", drawing);
+      const result = await service.synchronize();
+
+      expect(result.bulkDeletion).toBeUndefined();
+      // 被占用的同名路径不配对：它归属另一 Entry，剩下的消失/新增照旧进入挪动审查，而不是路径冲突。
+      expect(result.localIssues).toEqual([{
+        kind: "possible-rename",
+        newPaths: ["图纸/y.pdf"],
+        oldPaths: ["图纸/x.pdf"],
+        reviewToken: expect.any(String),
+      }]);
+
+      const snapshot = await readSnapshot();
+      expect(snapshot.entries[owner.entryId]).toMatchObject({kind: "live", path: "归档/x.pdf"});
+      expect(snapshot.entries[moved.entryId]?.path).not.toBe("归档/x.pdf");
+    });
+
+    it("still infers a single identical move whose name changed", async () => {
+      const {local, service, readSnapshot, entryAt} = await setupVault({"图纸/x.pdf": drawing});
+      const moved = entryAt("图纸/x.pdf");
+      await local.move("图纸/x.pdf", "归档/renamed.pdf");
+
+      const result = await service.synchronize();
+
+      expect(result.status).toBe("complete");
+      expect((await readSnapshot()).entries[moved.entryId]).toMatchObject({kind: "live", path: "归档/renamed.pdf"});
+    });
+  });
+
+  describe("one-to-one move inference beside a Pending Path Rename", () => {
+    const encode = (text: string) => new TextEncoder().encode(text);
+    const setupRenamed = async () => {
+      const remote = await RemoteStore.open({objects: new MemoryObjectStore(), prefix: "one-to-one", vaultKey: new Uint8Array(32)});
+      const local = new MemoryVault();
+      await local.write("notes/a.md", encode("original a"));
+      await local.write("notes/d.md", encode("original d"));
+      for (let index = 0; index < 10; index += 1) await local.write(`keep/${index}.md`, encode(`keep ${index}`));
+      const cache = new MemorySyncCache();
+      const service = new SyncService({cache, local, remote, replicaId: "desktop"});
+      await service.initializeNew("vault");
+      const idA = cache.state!.files["notes/a.md"]!.entryId;
+      const idD = cache.state!.files["notes/d.md"]!.entryId;
+      const readSnapshot = async () => remote.readSnapshot((await remote.readHead())!.value);
+      return {remote, local, cache, service, idA, idD, readSnapshot};
+    };
+
+    it("does not infer a renamed source Entry onto another new file with its old content", async () => {
+      const {local, service, idA, readSnapshot} = await setupRenamed();
+      await local.move("notes/a.md", "notes/b.md");
+      await local.write("notes/b.md", encode("edited after rename"));
+      await local.write("copy/c.md", encode("original a"));
+
+      const result = await service.synchronize([], {pathRenames: new Map([["notes/a.md", {entryId: idA, toPath: "notes/b.md"}]])});
+
+      // 修复前：copy/c.md 也被推断为 idA，同一 Entry ID 落到两个路径，同步停在 Path Collision
+      expect(result.localIssues).toEqual([]);
+      expect(result.status).toBe("complete");
+      const live = Object.values((await readSnapshot()).entries).filter(entry => entry.kind === "live");
+      expect(live.filter(entry => entry.entryId === idA).map(entry => entry.path)).toEqual(["notes/b.md"]);
+      const copy = live.find(entry => entry.path === "copy/c.md");
+      expect(copy?.entryId).toBeDefined();
+      expect(copy?.entryId).not.toBe(idA);
+    });
+
+    it("does not infer a missing Entry onto a rename target with its content", async () => {
+      const {local, service, idA, idD, readSnapshot} = await setupRenamed();
+      await local.move("notes/a.md", "notes/b.md");
+      await local.write("notes/b.md", encode("original d"));
+      await local.delete("notes/d.md");
+
+      await service.synchronize([], {pathRenames: new Map([["notes/a.md", {entryId: idA, toPath: "notes/b.md"}]])});
+
+      const entries = (await readSnapshot()).entries;
+      expect(entries[idA]).toMatchObject({kind: "live", path: "notes/b.md"});
+      expect(Object.values(entries).filter(entry => entry.kind === "live" && entry.path === "notes/b.md")).toHaveLength(1);
+      expect(entries[idD]?.kind).not.toBe("live");
+    });
   });
 
   it("publishes a rename and edit as one updated live Entry", async () => {

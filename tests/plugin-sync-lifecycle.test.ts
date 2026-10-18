@@ -17,6 +17,7 @@ const host = vi.hoisted((): {
   domEvents: Map<string, Array<() => void>>;
   mobile: boolean;
   android: boolean;
+  openedModals: Array<{close(): void}>;
 } => ({
   data: undefined,
   notices: [],
@@ -26,12 +27,17 @@ const host = vi.hoisted((): {
   domEvents: new Map(),
   mobile: false,
   android: false,
+  openedModals: [],
 }));
 
 vi.mock("obsidian", () => ({
   App: class {},
   FileSystemAdapter: class {},
-  Modal: class {},
+  Modal: class {
+    contentEl = {empty() {}};
+    open() { host.openedModals.push(this); }
+    close() { (this as {onClose?: () => void}).onClose?.(); }
+  },
   Notice: class {
     constructor(message: string) { host.notices.push(message); }
     hide() {}
@@ -74,6 +80,7 @@ import type { ObsidianRequestExecutor } from "../src/storage/obsidian-request-ad
 import { RemoteStore } from "../src/storage/remote-store";
 import { ObsidianVaultPort } from "../src/plugin/obsidian-vault-port";
 import { withVaultMutationLock } from "../src/plugin/safe-vault-write";
+import { SyncService, type LocalSyncIssue } from "../src/sync/sync-service";
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -83,6 +90,7 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
   vi.stubGlobal("document", { visibilityState: "visible" });
   host.notices = [];
   host.noticeActions = [];
+  host.openedModals = [];
   host.beforeSave = undefined;
   host.beforeLoad = undefined;
   host.registrationCount = 0;
@@ -236,6 +244,7 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
     head: { commitId: "initial", generation: 1, protocolVersion: 1, vaultId: "vault-1" },
   });
   let text = initialFile.text;
+  let localPresent = true;
   const file = Object.assign(new TFile(), { path: entry.path, stat: { mtime: 1, size: initialBytes.byteLength } });
   const events = new Map<string, Array<(file: TFile, oldPath?: string) => void>>();
   const edit = (value: string) => {
@@ -259,8 +268,8 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
         read: async (path: string) => { if (localRoot) return readFile(join(localRoot, path), "utf8"); const body = diagnosticFiles.get(path); if (body === undefined) throw new Error("Missing file"); return body; },
         write: async (path: string, body: string) => { if (localRoot) {await mkdir(dirname(join(localRoot, path)), {recursive: true}); await writeFile(join(localRoot, path), body);} else diagnosticFiles.set(path, body); },
       },
-      getFiles: () => [file],
-      getAbstractFileByPath: (path: string) => path === file.path ? file : null,
+      getFiles: () => localPresent ? [file] : [],
+      getAbstractFileByPath: (path: string) => localPresent && path === file.path ? file : null,
       readBinary: () => localRoot ? readFile(join(localRoot, initialFile.path)).then(body => Uint8Array.from(body).buffer) : Promise.resolve(new TextEncoder().encode(text).buffer),
       on: (name: string, listener: (file: TFile, oldPath?: string) => void) => {
         const listeners = events.get(name) ?? [];
@@ -290,7 +299,8 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
   const plugin = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
   await plugin.onload();
   if (loopback) cleanups.push(() => {plugin.onunload(); return Promise.resolve();});
-  return { plugin, remote, hooks, edit, rename, localText: () => localRoot ? readFileSync(join(localRoot, initialFile.path), "utf8") : text, app, objects, diagnosticFiles, wire, localRoot };
+  const setLocalPresent = (present: boolean) => {localPresent = present;};
+  return { plugin, remote, hooks, edit, rename, setLocalPresent, localText: () => localRoot ? readFileSync(join(localRoot, initialFile.path), "utf8") : text, app, objects, diagnosticFiles, wire, localRoot };
 };
 
 afterEach(async () => {
@@ -333,7 +343,7 @@ describe("plugin synchronization lifecycle", () => {
     hooks.headFailure = undefined;
     await vi.advanceTimersByTimeAsync(30_000);
     await vi.waitFor(() => {
-      expect(plugin.getStatusText()).toMatch(/^Idle:/);
+      expect(plugin.getStatusText()).toMatch(/^空闲：/);
       expect(plugin.getDiagnostics().queued).toBe(false);
     });
     const head = (await remote.readHead())!;
@@ -358,7 +368,7 @@ describe("plugin synchronization lifecycle", () => {
     await first;
     expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({errorCategory: "timeout", outcome: "retrying"});
     await vi.advanceTimersByTimeAsync(30_000);
-    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/));
     expect(plugin.getDiagnostics().acceptedCommit).toBe("initial");
     expect(plugin.getDiagnostics().nextRetryAt).toBeUndefined();
   }, 20_000);
@@ -374,7 +384,7 @@ describe("plugin synchronization lifecycle", () => {
     expect(wire.faults).toBe(1);
     expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({outcome: "retrying", writeResultUncertain: true});
     await vi.advanceTimersByTimeAsync(30_000);
-    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/));
     expect((await remote.readHead())!.value.commitId).toBe(head.value.commitId);
     expect(wire.headPublications).toBe(publications);
     const snapshot = await remote.readSnapshot(head.value);
@@ -391,7 +401,7 @@ describe("plugin synchronization lifecycle", () => {
     expect(wire.faults).toBe(1);
     expect(plugin.getDiagnostics().records.at(-1)?.errorCategory).toBe("network");
     await vi.advanceTimersByTimeAsync(30_000);
-    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/));
     const head = (await remote.readHead())!;
     const snapshot = await remote.readSnapshot(head.value);
     const entry = snapshot.entries["entry-1"];
@@ -500,7 +510,7 @@ describe("plugin synchronization lifecycle", () => {
     release();
     await syncing;
     expect(host.requestUrl.mock.calls.length).toBe(requestCount);
-    expect(plugin.getStatusText()).toContain("S3 target changed");
+    expect(plugin.getStatusText()).toContain("S3 目标被改了");
     plugin.onunload();
   });
 
@@ -542,7 +552,7 @@ describe("plugin synchronization lifecycle", () => {
     await first;
     expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({outcome: "retrying", errorCategory: "timeout", writeResultUncertain: true});
     await vi.advanceTimersByTimeAsync(30_000);
-    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/));
     const winner = (await remote.readHead())!.value.commitId;
     release();
     await vi.waitFor(() => expect(lateStatus).toBe(412));
@@ -570,9 +580,9 @@ describe("plugin synchronization lifecycle", () => {
     vi.spyOn(app.vault.adapter, "write").mockRejectedValue(new Error("secret local path and credentials"));
     edit("A saved paragraph.");
     await plugin.togglePause();
-    expect(plugin.getStatusText()).toMatch(/^Idle:/);
+    expect(plugin.getStatusText()).toMatch(/^空闲：/);
     expect((await remote.readHead())!.value.commitId).not.toBe("initial");
-    expect(plugin.getDiagnostics().persistenceWarning).toContain("could not be saved");
+    expect(plugin.getDiagnostics().persistenceWarning).toContain("无法保存");
     expect(plugin.exportDiagnostics()).not.toContain("secret local path");
     plugin.onunload();
   });
@@ -639,11 +649,11 @@ describe("plugin synchronization lifecycle", () => {
       await vi.waitFor(() => expect(plugin.getDiagnostics().records.at(count - 1)?.finishedAt).toBeDefined());
     }
     expect(plugin.getDiagnostics().records).toHaveLength(4);
-    expect(plugin.getStatusText()).toMatch(/^Error:/);
+    expect(plugin.getStatusText()).toMatch(/^出错：/);
     expect(host.notices).toHaveLength(1);
     hooks.headFailure = undefined;
     await plugin.syncNow();
-    expect(plugin.getStatusText()).toMatch(/^Idle:/);
+    expect(plugin.getStatusText()).toMatch(/^空闲：/);
     plugin.onunload();
   });
 
@@ -678,9 +688,9 @@ describe("plugin synchronization lifecycle", () => {
     edit("Saved article including its final sentence.");
     await plugin.togglePause();
     const acceptedHead = (await remote.readHead())!.value.commitId;
-    expect(plugin.getStatusText()).toContain("Retrying automatically");
+    expect(plugin.getStatusText()).toContain("秒后自动重试");
     await vi.advanceTimersByTimeAsync(30_000);
-    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/));
     expect((await remote.readHead())!.value.commitId).toBe(acceptedHead);
     expect(publications).toBe(1);
     const snapshot = await remote.readSnapshot((await remote.readHead())!.value);
@@ -696,7 +706,7 @@ describe("plugin synchronization lifecycle", () => {
     await plugin.togglePause();
     hooks.headFailure = undefined;
     for (const listener of host.domEvents.get("online") ?? []) {listener(); listener();}
-    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/));
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/));
     expect(plugin.getDiagnostics().records).toHaveLength(2);
     plugin.onunload();
   });
@@ -705,11 +715,11 @@ describe("plugin synchronization lifecycle", () => {
     const {plugin, hooks, remote} = await setup();
     hooks.headFailure = "network";
     await plugin.togglePause();
-    expect(plugin.getStatusText()).toContain("Retrying automatically");
+    expect(plugin.getStatusText()).toContain("秒后自动重试");
     expect(host.notices).toEqual([]);
     hooks.headFailure = undefined;
     await vi.advanceTimersByTimeAsync(30_000);
-    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/u));
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/u));
     expect((await remote.readHead())?.value.commitId).toBe("initial");
     expect(plugin.getDiagnostics().records.map(record => record.outcome)).toEqual(["retrying", "complete"]);
     plugin.onunload();
@@ -765,7 +775,7 @@ describe("plugin synchronization lifecycle", () => {
     });
     try {
       await plugin.togglePause();
-      expect(plugin.getStatusText()).toMatch(/^Idle:/);
+      expect(plugin.getStatusText()).toMatch(/^空闲：/);
       expect(plugin.getLocalIssues()).toEqual([]);
       expect(plugin.getDeferredDownloads()).toEqual([]);
       await plugin.syncNow();
@@ -881,7 +891,7 @@ describe("plugin synchronization lifecycle", () => {
     const key = "test-prefix/.s3-vault-sync-probe-00000000-0000-4000-8000-000000000000";
     const original = { body: new TextEncoder().encode("user-owned object"), etag: "user-etag" };
     objects.set(key, original);
-    await expect(plugin.initializeOrUnlock("test-password")).rejects.toThrow("prefix is not empty");
+    await expect(plugin.initializeOrUnlock("test-password")).rejects.toThrow("前缀不是空的");
     expect(objects.get(key)).toEqual(original);
   });
 
@@ -891,7 +901,7 @@ describe("plugin synchronization lifecycle", () => {
       hooks.afterProbePut = undefined;
       plugin.onunload();
     };
-    await expect(plugin.initializeOrUnlock("test-password")).rejects.toThrow("stopped");
+    await expect(plugin.initializeOrUnlock("test-password")).rejects.toThrow("插件已停止运行");
     expect([...objects.keys()].some(key => key.includes(".s3-vault-sync-probe-"))).toBe(true);
     const replacement = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
     await replacement.onload();
@@ -906,7 +916,7 @@ describe("plugin synchronization lifecycle", () => {
       hooks.beforeBlobRead = undefined;
       plugin.getSettings()[field] += "-changed";
     };
-    await expect(plugin.initializeOrUnlock("test-password")).rejects.toThrow("S3 target changed");
+    await expect(plugin.initializeOrUnlock("test-password")).rejects.toThrow("S3 目标被改了");
     expect(plugin.getSettings().vaultId).toBeUndefined();
     expect(objects.has("test-prefix/v1/head")).toBe(false);
     expect(host.data).toMatchObject({ pendingInitialization: {
@@ -935,7 +945,7 @@ describe("plugin synchronization lifecycle", () => {
   it("keeps the active sync status when an unrelated setting is saved", async () => {
     const { plugin } = await setup();
     const stop = plugin.onStatusChange(status => {
-      if (status.text.includes("Checking metadata")) {
+      if (status.text.includes("正在检查元数据")) {
         stop();
         plugin.getSettings().deviceName = "Renamed device";
         void plugin.saveSettings();
@@ -962,13 +972,13 @@ describe("plugin synchronization lifecycle", () => {
     expect(objects.has("test-prefix/v1/head")).toBe(true);
     expect(replacement.getSettings().vaultId).toBeTruthy();
     objects.delete("test-prefix/v1/head");
-    await expect(replacement.initializeOrUnlock("test-password")).rejects.toThrow("Head is missing");
+    await expect(replacement.initializeOrUnlock("test-password")).rejects.toThrow("Head 指针缺失");
     expect(objects.has("test-prefix/v1/head")).toBe(false);
     replacement.onunload();
     host.data = interruptedCheckpoint;
     const rolledBackCache = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
     await rolledBackCache.onload();
-    await expect(rolledBackCache.initializeOrUnlock("test-password")).rejects.toThrow("Head is missing");
+    await expect(rolledBackCache.initializeOrUnlock("test-password")).rejects.toThrow("Head 指针缺失");
   });
 
   it("waits for an old in-flight data write before loading a replacement instance", async () => {
@@ -994,7 +1004,7 @@ describe("plugin synchronization lifecycle", () => {
     expect(replacement.getSettings().deviceName).toBe("old setting");
     replacement.getSettings().deviceName = "new setting";
     await replacement.saveSettings();
-    await expect(plugin.saveSettings()).rejects.toThrow("stopped");
+    await expect(plugin.saveSettings()).rejects.toThrow("插件已停止运行");
     expect(host.data).toMatchObject({ settings: { deviceName: "new setting" } });
   });
 
@@ -1019,12 +1029,12 @@ describe("plugin synchronization lifecycle", () => {
       edit("The complete paragraph and its final sentence.");
     };
     await plugin.togglePause();
-    expect(plugin.getStatusText()).toContain("Retrying after edits settle");
+    expect(plugin.getStatusText()).toContain("等编辑停下后会自动重试");
     expect(host.notices).toEqual([]);
     await vi.advanceTimersByTimeAsync(4_999);
     expect((await remote.readHead())?.value.commitId).toBe("initial");
     await vi.advanceTimersByTimeAsync(1);
-    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/u));
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/u));
     const head = await remote.readHead();
     if (!head) throw new Error("Expected accepted Head");
     const snapshot = await remote.readSnapshot(head.value);
@@ -1034,30 +1044,30 @@ describe("plugin synchronization lifecycle", () => {
     expect(localText()).toBe("The complete paragraph and its final sentence.");
     for (let poll = 0; poll < 2; poll += 1) {
       await vi.advanceTimersByTimeAsync(120_000);
-      await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^Idle:/u));
+      await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/u));
     }
     expect(await remote.readHead()).toMatchObject({ etag: head.etag, value: head.value });
-    expect(plugin.getStatusText()).toMatch(/^Idle:/u);
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
     expect(host.notices).toEqual([]);
   });
 
   it("still displays Paused when an active synchronization finishes after pausing", async () => {
     const { plugin } = await setup();
     const stop = plugin.onStatusChange(status => {
-      if (status.text.includes("Checking metadata")) {
+      if (status.text.includes("正在检查元数据")) {
         stop();
         void plugin.togglePause();
       }
     });
     await plugin.togglePause();
     expect(plugin.isPaused()).toBe(true);
-    expect(plugin.getStatusText()).toMatch(/^Paused:/u);
+    expect(plugin.getStatusText()).toMatch(/^已暂停：/u);
   });
 
   it.each(["network", "corrupt"] as const)("does not hide a %s failure after pausing", async failure => {
     const { plugin, hooks } = await setup();
     const stop = plugin.onStatusChange(status => {
-      if (status.text.startsWith("Checking: Reading")) {
+      if (status.text.startsWith("检查中：正在读取")) {
         stop();
         hooks.headFailure = failure;
         void plugin.togglePause();
@@ -1065,10 +1075,10 @@ describe("plugin synchronization lifecycle", () => {
     });
     await plugin.togglePause();
     expect(plugin.isPaused()).toBe(true);
-    expect(plugin.getStatusText()).toMatch(failure === "network" ? /^Error:/u : /^Action required:/u);
+    expect(plugin.getStatusText()).toMatch(failure === "network" ? /^出错：/u : /^需要处理：/u);
     expect(host.notices).toHaveLength(1);
     const openStatus = vi.spyOn(plugin, "openStatus").mockImplementation(() => {});
-    expect(host.noticeActions[0]?.text).toBe("Open sync status");
+    expect(host.noticeActions[0]?.text).toBe("打开同步状态");
     host.noticeActions[0]?.click({stopPropagation() {}});
     expect(openStatus).toHaveBeenCalledOnce();
   });
@@ -1077,6 +1087,204 @@ describe("plugin synchronization lifecycle", () => {
     const {plugin, hooks} = await setup();
     hooks.headFailure = "network";
     await expect(plugin.downloadDeferred("entry-1")).rejects.toThrow("503");
-    expect(plugin.getStatusText()).toMatch(/^Error:/);
+    expect(plugin.getStatusText()).toMatch(/^出错：/);
+  });
+});
+
+describe("opening sync status when synchronization stops", () => {
+  it("opens sync status once when a sync needs a Bulk Deletion decision", async () => {
+    const {plugin, setLocalPresent} = await setup();
+    setLocalPresent(false);
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：请审查并确认这次批量删除/u);
+    expect(host.openedModals).toHaveLength(1);
+    plugin.onunload();
+  });
+
+  it.each(["forbidden", "corrupt"] as const)("opens sync status once at once for a %s failure", async failure => {
+    const {plugin, hooks} = await setup();
+    hooks.headFailure = failure;
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toMatch(failure === "forbidden" ? /^出错：/u : /^需要处理：修复模式/u);
+    expect(host.openedModals).toHaveLength(1);
+    expect(host.notices).toHaveLength(1);
+    expect(host.noticeActions.map(action => action.text)).toEqual(["打开同步状态"]);
+    plugin.onunload();
+  });
+
+  it("opens sync status once per problem until it changes or a sync succeeds", async () => {
+    const {plugin, hooks, setLocalPresent} = await setup();
+    setLocalPresent(false);
+    await plugin.togglePause();
+    expect(host.openedModals).toHaveLength(1);
+    host.openedModals[0]!.close();
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
+    expect(host.openedModals).toHaveLength(1);
+    hooks.headFailure = "forbidden";
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^出错：/u);
+    expect(host.openedModals).toHaveLength(2);
+    host.openedModals[1]!.close();
+    hooks.headFailure = undefined;
+    setLocalPresent(true);
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+    setLocalPresent(false);
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
+    expect(host.openedModals).toHaveLength(3);
+    plugin.onunload();
+  });
+
+  it("does not open another sync status window while one is open", async () => {
+    const {plugin, hooks, setLocalPresent} = await setup();
+    setLocalPresent(false);
+    await plugin.togglePause();
+    expect(host.openedModals).toHaveLength(1);
+    hooks.headFailure = "forbidden";
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^出错：/u);
+    expect(host.openedModals).toHaveLength(1);
+    host.openedModals[0]!.close();
+    await plugin.syncNow();
+    expect(host.openedModals).toHaveLength(1);
+    plugin.onunload();
+  });
+
+  it("does not open sync status for settings validation or unlock errors", async () => {
+    const {plugin} = await setup();
+    await expect(plugin.saveAwsCredentials({accessKeyId: "test-key", secretAccessKey: ""})).rejects.toThrow();
+    await expect(plugin.initializeOrUnlock("")).rejects.toThrow();
+    expect(plugin.getStatusText()).toMatch(/^出错：/u);
+    expect(host.notices).toHaveLength(2);
+    expect(host.openedModals).toHaveLength(0);
+    plugin.onunload();
+  });
+
+  const stubSyncResult = (localIssues: LocalSyncIssue[]) =>
+    vi.spyOn(SyncService.prototype, "synchronize").mockResolvedValue({
+      cacheUpdated: false, deferredDownloadEntries: [], deferredDownloads: 0, deleted: 0, downloaded: 0,
+      localIssues, status: "action-required", unsyncedLocalEntries: 0, uploaded: 0,
+    });
+
+  it("does not open sync status when a sync only reports unsynced local files", async () => {
+    const {plugin} = await setup();
+    const synchronize = stubSyncResult([{kind: "unsynced-local", path: "notes/example.md"}]);
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
+    expect(host.openedModals).toHaveLength(0);
+    synchronize.mockRestore();
+    plugin.onunload();
+  });
+
+  it("opens sync status once for a possible rename review", async () => {
+    const {plugin} = await setup();
+    const synchronize = stubSyncResult([
+      {kind: "possible-rename", oldPaths: ["notes/example.md"], newPaths: ["notes/moved.md"], reviewToken: "token-1"},
+      {kind: "unsynced-local", path: "notes/other.md"},
+    ]);
+    await plugin.togglePause();
+    expect(host.openedModals).toHaveLength(1);
+    host.openedModals[0]!.close();
+    synchronize.mockResolvedValue({
+      cacheUpdated: false, deferredDownloadEntries: [], deferredDownloads: 0, deleted: 0, downloaded: 0,
+      localIssues: [
+        {kind: "possible-rename", oldPaths: ["notes/example.md"], newPaths: ["notes/moved.md"], reviewToken: "token-1"},
+        {kind: "unsynced-local", path: "notes/third.md"},
+      ],
+      status: "action-required", unsyncedLocalEntries: 0, uploaded: 0,
+    });
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
+    expect(host.openedModals).toHaveLength(1);
+    synchronize.mockRestore();
+    plugin.onunload();
+  });
+
+  const settle = async (plugin: S3VaultSyncPlugin, ms: number) => {
+    await vi.advanceTimersByTimeAsync(ms);
+    await vi.waitFor(() => expect(plugin.getDiagnostics().records.at(-1)?.finishedAt).toBeDefined());
+  };
+
+  it("opens sync status only after network failures continue for 30 minutes", async () => {
+    const {plugin, hooks} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    await settle(plugin, 29 * 60_000);
+    expect(plugin.getStatusText()).toMatch(/^出错：/u);
+    expect(host.notices.length).toBeGreaterThan(0);
+    expect(host.openedModals).toHaveLength(0);
+    await settle(plugin, 2 * 60_000);
+    expect(host.openedModals).toHaveLength(1);
+    await settle(plugin, 10 * 60_000);
+    expect(host.openedModals).toHaveLength(1);
+    plugin.onunload();
+  });
+
+  it("opens sync status once for one network outage that fails different operations", async () => {
+    const {plugin, hooks, edit} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    await settle(plugin, 31 * 60_000);
+    expect(host.openedModals).toHaveLength(1);
+    host.openedModals[0]!.close();
+    const headFailure = plugin.getStatusText();
+    const protocol = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;
+    host.requestUrl.mockImplementation((request: Parameters<ObsidianRequestExecutor>[0]) =>
+      request.method === "PUT" && request.url.includes("/blobs/")
+        ? Promise.resolve({status: 503, arrayBuffer: new ArrayBuffer(0), headers: {}})
+        : protocol(request));
+    hooks.headFailure = undefined;
+    edit("An edit made while the network is still failing.");
+    await settle(plugin, 10 * 60_000);
+    expect(plugin.getStatusText()).toMatch(/^出错：/u);
+    expect(plugin.getStatusText()).not.toBe(headFailure);
+    expect(host.openedModals).toHaveLength(1);
+    plugin.onunload();
+  });
+
+  it("restarts the 30 minute network wait after one successful sync", async () => {
+    const {plugin, hooks} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    await settle(plugin, 20 * 60_000);
+    hooks.headFailure = undefined;
+    await settle(plugin, 2 * 60_000);
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+    hooks.headFailure = "network";
+    await settle(plugin, 2 * 60_000);
+    await settle(plugin, 16 * 60_000);
+    expect(plugin.getStatusText()).toMatch(/^出错：/u);
+    expect(host.openedModals).toHaveLength(0);
+    await settle(plugin, 16 * 60_000);
+    expect(host.openedModals).toHaveLength(1);
+    plugin.onunload();
+  });
+
+  it.each([
+    {device: "Android", android: true},
+    {device: "iOS", android: false},
+  ])("applies the same popup rules on $device", async ({android}) => {
+    host.mobile = true;
+    host.android = android;
+    const {plugin, hooks, setLocalPresent} = await setup();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    await settle(plugin, 29 * 60_000);
+    expect(host.openedModals).toHaveLength(0);
+    await settle(plugin, 2 * 60_000);
+    expect(host.openedModals).toHaveLength(1);
+    host.openedModals[0]!.close();
+    hooks.headFailure = undefined;
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+    setLocalPresent(false);
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
+    expect(host.openedModals).toHaveLength(2);
+    await plugin.syncNow();
+    expect(host.openedModals).toHaveLength(2);
+    plugin.onunload();
   });
 });

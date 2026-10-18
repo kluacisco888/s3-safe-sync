@@ -78,7 +78,7 @@ describe("collision rename journal", () => {
     const {journal, files, outcomes, expectedHash} = await fixture();
     files.delete("source.md"); files.set("target.md", "new edits");
     expect(await journal.recover()).toBe("needs-review");
-    await expect(journal.recover({side: "target", hash: expectedHash})).rejects.toThrow("changed again");
+    await expect(journal.recover({side: "target", hash: expectedHash})).rejects.toThrow("恢复内容又变了");
     expect(outcomes).toEqual([]);
     const reviewedHash = await sha256Content(new TextEncoder().encode("new edits"));
     expect(await journal.recover({side: "target", hash: reviewedHash})).toBe("ready");

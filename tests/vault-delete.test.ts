@@ -113,7 +113,7 @@ describe("deleteVaultPath", () => {
 
     await expect(
       deleteVaultPath(vault, "notes/example.md", isFile),
-    ).rejects.toThrow("Refusing to delete a folder");
+    ).rejects.toThrow("拒绝删除文件路径上的文件夹");
 
     expect(vault.trash).not.toHaveBeenCalled();
     expect(vault.delete).not.toHaveBeenCalled();
@@ -130,7 +130,7 @@ describe("deleteVaultPath", () => {
 
     await expect(
       deleteVaultPath(vault, "notes/example.md", isFile),
-    ).rejects.toThrow("Refusing to delete a folder");
+    ).rejects.toThrow("拒绝删除文件路径上的文件夹");
 
     expect(vault.delete).not.toHaveBeenCalled();
     expect(vault.adapter.remove).not.toHaveBeenCalled();
@@ -142,7 +142,7 @@ describe("deleteVaultPath", () => {
 
     await expect(
       deleteVaultPath(vault, "notes/example.md", isFile),
-    ).rejects.toThrow("Refusing to remove a non-file path");
+    ).rejects.toThrow("拒绝移除不是文件的路径");
 
     expect(vault.adapter.remove).not.toHaveBeenCalled();
   });
@@ -153,7 +153,7 @@ describe("deleteVaultPath", () => {
 
     await expect(
       deleteVaultPath(vault, "notes/example.md", isFile),
-    ).rejects.toThrow("still exists after deletion");
+    ).rejects.toThrow("删除后本地仓库路径仍然存在");
   });
 
   it("stops before deletion when the file no longer matches the plan", async () => {
@@ -167,7 +167,7 @@ describe("deleteVaultPath", () => {
         isFile,
         await hash(bytes("before")),
       ),
-    ).rejects.toThrow("Local file changed during synchronization");
+    ).rejects.toThrow("同步过程中本地文件被改动");
 
     expect(vault.trash).not.toHaveBeenCalled();
     expect(vault.adapter.trashLocal).not.toHaveBeenCalled();
@@ -183,7 +183,7 @@ describe("deleteVaultPath", () => {
 
     await expect(
       deleteVaultPath(vault, "notes/example.md", isFile, expectedHash),
-    ).rejects.toThrow("Local file changed during synchronization");
+    ).rejects.toThrow("同步过程中本地文件被改动");
 
     expect(vault.adapter.remove).not.toHaveBeenCalled();
     expect(vault.exists).toBe(true);
@@ -199,7 +199,7 @@ describe("deleteVaultPath", () => {
         isFile,
         await hash(vault.content),
       ),
-    ).rejects.toThrow("refusing permanent deletion");
+    ).rejects.toThrow("同步期间拒绝永久删除");
 
     expect(vault.delete).not.toHaveBeenCalled();
     expect(vault.adapter.remove).not.toHaveBeenCalled();

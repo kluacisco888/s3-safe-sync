@@ -30,7 +30,7 @@ export interface S3VaultSyncSettings {
 export const DEFAULT_SETTINGS: S3VaultSyncSettings = {
   bucket: "",
   confirmedRemotelySaveDisabled: false,
-  deviceName: "My device",
+  deviceName: "我的设备",
   fullHashVerificationIntervalDays:
     DEFAULT_FULL_HASH_VERIFICATION_INTERVAL_DAYS,
   paused: false,
@@ -76,10 +76,10 @@ const addVisibilityButton = (
   component: TextComponent,
 ): void => {
   setting.addButton((button) =>
-    button.setButtonText("Show").onClick(() => {
+    button.setButtonText("显示").onClick(() => {
       const showing = component.inputEl.type === "text";
       component.inputEl.type = showing ? "password" : "text";
-      button.setButtonText(showing ? "Show" : "Hide");
+      button.setButtonText(showing ? "显示" : "隐藏");
     }),
   );
 };
@@ -100,28 +100,28 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
     const settings = this.controller.getSettings();
     containerEl.empty();
     const statusSetting = new Setting(containerEl)
-      .setName("Status")
+      .setName("状态")
       .setDesc(this.controller.getStatusText())
-      .addButton(button => button.setButtonText("Open sync status").onClick(() => this.controller.openStatus()));
+      .addButton(button => button.setButtonText("打开同步状态").onClick(() => this.controller.openStatus()));
 
-    this.textSetting("Device name", settings.deviceName, async (value) => {
-      settings.deviceName = value.trim() || "My device";
+    this.textSetting("设备名称", settings.deviceName, async (value) => {
+      settings.deviceName = value.trim() || "我的设备";
       await this.controller.saveSettings();
     });
-    this.textSetting("AWS region", settings.region, async (value) => {
+    this.textSetting("AWS 区域", settings.region, async (value) => {
       settings.region = value.trim();
       await this.controller.saveSettings();
     });
-    this.textSetting("S3 bucket", settings.bucket, async (value) => {
+    this.textSetting("S3 存储桶", settings.bucket, async (value) => {
       settings.bucket = value.trim();
       await this.controller.saveSettings();
     });
-    this.textSetting("S3 prefix", settings.prefix, async (value) => {
+    this.textSetting("S3 前缀", settings.prefix, async (value) => {
       settings.prefix = value.trim();
       await this.controller.saveSettings();
     });
     this.textSetting(
-      "Remotely Save prefix (migration only)",
+      "Remotely Save 前缀（仅迁移时使用）",
       settings.remotelySavePrefix,
       async (value) => {
         settings.remotelySavePrefix = value.trim();
@@ -129,9 +129,9 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
       },
     );
     new Setting(containerEl)
-      .setName("Remotely Save is disabled")
+      .setName("已停用 Remotely Save")
       .setDesc(
-        "Required before migration so the old plugin cannot write to its prefix during cutover.",
+        "迁移前必须确认，避免切换期间旧插件继续往它的前缀里写入。",
       )
       .addToggle((toggle) =>
         toggle
@@ -149,8 +149,8 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
       saveCredentialsButton?.setDisabled(!accessKeyId || !secretAccessKey);
     };
     const credentialDescription = this.controller.hasAwsCredentials()
-      ? "Credentials are saved in Obsidian SecretStorage on this device. Enter both fields to replace them."
-      : "Stored only in Obsidian SecretStorage on this device.";
+      ? "凭证已保存在本设备的 Obsidian SecretStorage 中。两栏都填写即可替换。"
+      : "只保存在本设备的 Obsidian SecretStorage 中。";
     const accessKeySetting = new Setting(containerEl)
       .setName("Access Key ID")
       .setDesc(credentialDescription);
@@ -179,12 +179,12 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
     });
 
     new Setting(containerEl)
-      .setName("Save AWS credentials")
-      .setDesc("Both values are required when saving or replacing credentials.")
+      .setName("保存 AWS 凭证")
+      .setDesc("保存或替换凭证时两项都必须填写。")
       .addButton((button) => {
         saveCredentialsButton = button;
         button
-          .setButtonText("Save credentials")
+          .setButtonText("保存凭证")
           .setDisabled(true)
           .onClick(async () => {
             button.setDisabled(true);
@@ -194,7 +194,7 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
               secretAccessKey = "";
               this.display();
             } catch (error) {
-              accessKeySetting.setDesc(error instanceof Error ? error.message : "Saving failed. Retry or open sync status.");
+              accessKeySetting.setDesc(error instanceof Error ? error.message : "保存失败。请重试，或打开同步状态查看。");
               updateCredentialButton();
             }
           });
@@ -206,10 +206,10 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
     let renderStatus = (): void => {};
     const vaultUnlocked = this.controller.isVaultUnlocked();
     const passwordDescription = vaultUnlocked
-      ? "Unlocked on this device. The password is not stored; the Vault Key is kept in Obsidian SecretStorage."
-      : "The password is not stored. After a successful unlock, the Vault Key is kept in Obsidian SecretStorage.";
+      ? "本设备已解锁。密码不会被保存；仓库密钥保存在 Obsidian SecretStorage 中。"
+      : "密码不会被保存。解锁成功后，仓库密钥会保存在 Obsidian SecretStorage 中。";
     const passwordSetting = new Setting(containerEl)
-      .setName("Vault password")
+      .setName("仓库密码")
       .setDesc(passwordDescription);
     passwordSetting.settingEl.addClass("s3-vault-sync-secret-setting");
     passwordSetting.addText((text) => {
@@ -217,23 +217,23 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
         password = value;
         initializeButton?.setDisabled(!password || initializationRunning);
         initializeButton?.setButtonText(
-          vaultUnlocked ? "Unlock again" : "Initialize or unlock",
+          vaultUnlocked ? "重新解锁" : "初始化或解锁",
         );
       });
       addVisibilityButton(passwordSetting, text);
     });
 
     const encryptionSetting = new Setting(containerEl)
-      .setName("Vault encryption")
+      .setName("仓库加密")
       .setDesc(
         vaultUnlocked
-          ? "This device remains unlocked across restarts unless its Obsidian SecretStorage is cleared."
-          : "Creates a new encrypted remote Vault or unlocks an existing one.",
+          ? "除非清空本设备的 Obsidian SecretStorage，否则重启后本设备仍保持解锁。"
+          : "新建一个加密的远端仓库，或解锁已有的远端仓库。",
       )
       .addButton((button) => {
         initializeButton = button;
         button
-          .setButtonText(vaultUnlocked ? "Unlock again" : "Initialize or unlock")
+          .setButtonText(vaultUnlocked ? "重新解锁" : "初始化或解锁")
           .setDisabled(true)
           .onClick(async () => {
             initializationRunning = true;
@@ -244,8 +244,8 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
               password = "";
               this.display();
             } catch (error) {
-              encryptionSetting.setDesc(error instanceof Error ? error.message : "Unlock failed. Retry or open sync status.");
-              button.setButtonText(vaultUnlocked ? "Unlock again" : "Initialize or unlock");
+              encryptionSetting.setDesc(error instanceof Error ? error.message : "解锁失败。请重试，或打开同步状态查看。");
+              button.setButtonText(vaultUnlocked ? "重新解锁" : "初始化或解锁");
               button.setDisabled(!password);
             } finally {
               initializationRunning = false;
@@ -254,8 +254,8 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName("Pause automatic sync")
-      .setDesc("Local file changes remain in the Vault until sync resumes.")
+      .setName("暂停自动同步")
+      .setDesc("暂停期间本地改动留在仓库里，恢复同步后再上传。")
       .addToggle((toggle) =>
         toggle.setValue(settings.paused).onChange(async (value) => {
           if (value !== settings.paused) await this.controller.togglePause();
@@ -263,15 +263,15 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Full integrity check interval")
+      .setName("完整校验间隔")
       .setDesc(
-        "Automatic sync remains incremental. This interval controls how often every eligible file is read and hashed.",
+        "自动同步只检查有变化的文件。这个间隔决定多久把所有可同步文件完整读一遍并计算哈希。",
       )
       .addDropdown((dropdown) => {
         for (const days of SUPPORTED_FULL_HASH_VERIFICATION_INTERVAL_DAYS) {
           dropdown.addOption(
             String(days),
-            days === 1 ? "Every day" : `Every ${days} days`,
+            days === 1 ? "每天" : `每 ${days} 天`,
           );
         }
         return dropdown
@@ -290,22 +290,22 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
       });
 
     const syncDescription =
-      "Checks the encrypted remote Head and reconciles this device.";
+      "检查加密的远端 Head 指针，并让本设备与之对齐。";
     let manualSyncRunning = false;
     let fullVerificationRunning = false;
     let syncButton: ButtonComponent | undefined;
     const syncSetting = new Setting(containerEl)
-      .setName("Sync now")
+      .setName("立即同步")
       .setDesc(syncDescription)
       .addButton((button) => {
         syncButton = button;
-        button.setButtonText("Sync now").onClick(async () => {
+        button.setButtonText("立即同步").onClick(async () => {
           manualSyncRunning = true;
           renderStatus();
           try {
             await this.controller.syncNow();
           } catch (error) {
-            statusSetting.setDesc(error instanceof Error ? error.message : "Sync failed. Open sync status.");
+            statusSetting.setDesc(error instanceof Error ? error.message : "同步失败。请打开同步状态查看。");
           } finally {
             manualSyncRunning = false;
             this.display();
@@ -315,19 +315,19 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
 
     let fullVerificationButton: ButtonComponent | undefined;
     const fullVerificationSetting = new Setting(containerEl)
-      .setName("Full integrity check")
+      .setName("完整校验")
       .setDesc(
-        "Reads and hashes every eligible file. This can take a long time for large Vaults.",
+        "把所有可同步文件完整读一遍并计算哈希。仓库很大时可能要很久。",
       )
       .addButton((button) => {
         fullVerificationButton = button;
-        button.setButtonText("Check all files").onClick(async () => {
+        button.setButtonText("校验全部文件").onClick(async () => {
           fullVerificationRunning = true;
           renderStatus();
           try {
             await this.controller.verifyAllFiles();
           } catch (error) {
-            statusSetting.setDesc(error instanceof Error ? error.message : "Check failed. Open sync status.");
+            statusSetting.setDesc(error instanceof Error ? error.message : "校验失败。请打开同步状态查看。");
           } finally {
             fullVerificationRunning = false;
             this.display();
@@ -341,16 +341,16 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
       statusSetting.setDesc(status);
       if (initializationRunning && initializeButton) {
         encryptionSetting.setDesc(status);
-        initializeButton.setButtonText(progressLabel ?? "Initializing…");
+        initializeButton.setButtonText(progressLabel ?? "正在初始化…");
       }
       if (manualSyncRunning && syncButton) {
         syncSetting.setDesc(status);
-        syncButton.setButtonText(progressLabel ?? "Syncing…");
+        syncButton.setButtonText(progressLabel ?? "正在同步…");
       }
       if (fullVerificationRunning && fullVerificationButton) {
         fullVerificationSetting.setDesc(status);
         fullVerificationButton.setButtonText(
-          progressLabel ?? "Checking all files…",
+          progressLabel ?? "正在校验全部文件…",
         );
       }
       syncButton?.setDisabled(

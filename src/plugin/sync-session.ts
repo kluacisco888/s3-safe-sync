@@ -1,6 +1,6 @@
 export class SyncStoppedError extends Error {
   constructor() {
-    super("This plugin instance has stopped");
+    super("插件已停止运行");
     this.name = "SyncStoppedError";
   }
 }

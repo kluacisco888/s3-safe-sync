@@ -267,7 +267,7 @@ describe("RemoteStore", () => {
     await objects.delete("chosen-prefix/v1/blobs/blob-1");
 
     await expect(remote.readSnapshot(currentHead.value)).rejects.toThrow(
-      "Vault Snapshot references missing blobs for paths: notes/example.md",
+      "仓库快照引用的数据块缺失，涉及路径：notes/example.md",
     );
   });
 
@@ -310,7 +310,7 @@ describe("RemoteStore", () => {
         ...head("commit-1", 1),
         snapshotId: "snapshot-1",
       }),
-    ).rejects.toThrow("Snapshot snapshot-1 cannot be authenticated or decoded");
+    ).rejects.toThrow("无法核实或解码快照 snapshot-1");
     expect(objects.putCount).toBe(writesBeforeRead);
   });
 
@@ -341,7 +341,7 @@ describe("RemoteStore", () => {
       RemoteStateError,
     );
     await expect(remote.readSnapshot(head("commit-1", 1))).rejects.toThrow(
-      "Sync Commit commit-1 cannot be authenticated or decoded",
+      "无法核实或解码同步提交 commit-1",
     );
     expect(objects.putCount).toBe(writesBeforeRead);
   });
@@ -375,7 +375,7 @@ describe("RemoteStore", () => {
         snapshotId: "snapshot-1",
       }),
     ).rejects.toMatchObject({
-      message: "Snapshot snapshot-1 payload is invalid",
+      message: "快照 snapshot-1 的内容无效",
       name: "RemoteStateError",
     });
     expect(objects.putCount).toBe(writesBeforeRead);
@@ -400,7 +400,7 @@ describe("RemoteStore", () => {
     const writesBeforeRead = objects.putCount;
 
     await expect(remote.readCommit("commit-1")).rejects.toMatchObject({
-      message: "Sync Commit commit-1 payload is invalid",
+      message: "同步提交 commit-1 的内容无效",
       name: "RemoteStateError",
     });
     await expect(remote.readSnapshot(head("commit-1", 1))).rejects.toBeInstanceOf(
@@ -431,11 +431,11 @@ describe("RemoteStore", () => {
         snapshotId: "snapshot-1",
       }),
     ).rejects.toMatchObject({
-      message: "Snapshot snapshot-1 cannot be authenticated or decoded",
+      message: "无法核实或解码快照 snapshot-1",
       name: "RemoteStateError",
     });
     await expect(remote.readCommit("commit-1")).rejects.toMatchObject({
-      message: "Sync Commit commit-1 cannot be authenticated or decoded",
+      message: "无法核实或解码同步提交 commit-1",
       name: "RemoteStateError",
     });
     expect(objects.putCount).toBe(writesBeforeRead);

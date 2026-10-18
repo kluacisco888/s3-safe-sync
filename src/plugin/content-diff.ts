@@ -18,7 +18,7 @@ export interface ContentDiff {
 const format = (text: string): string => {
   const endings = new Set(text.match(/\r\n|\r|\n/g) ?? []);
   const names = [...endings].map(ending => ending === "\r\n" ? "CRLF" : ending === "\n" ? "LF" : "CR");
-  return `${names.join(" / ") || "No line endings"} · ${/[\r\n]$/.test(text) ? "final newline" : "no final newline"}${text.startsWith("\uFEFF") ? " · BOM" : ""}`;
+  return `${names.join(" / ") || "无换行符"} · ${/[\r\n]$/.test(text) ? "末尾有换行" : "末尾无换行"}${text.startsWith("\uFEFF") ? " · BOM" : ""}`;
 };
 
 // This is a two-way comparison, not a claim about which version is newer.
@@ -28,7 +28,7 @@ export const compareContent = (local: string, remote: string): ContentDiff => {
   const a = remote ? normalize(remote).split("\n") : [];
   const b = local ? normalize(local).split("\n") : [];
   if (local === remote || normalize(local) === normalize(remote)) {
-    result.summary = local === remote ? "Both text versions are identical." : "Only line-ending format differs; the text is identical.";
+    result.summary = local === remote ? "两个版本的文字完全相同。" : "只有换行符格式不同，文字完全相同。";
     return result;
   }
   let start = 0;
@@ -44,8 +44,8 @@ export const compareContent = (local: string, remote: string): ContentDiff => {
   for (const line of changedA) matchingPairs += frequencies.get(line) ?? 0;
   // Bound the synchronous LCS work, including repeated-line worst cases on mobile.
   if (changedA.length * changedB.length > 1_000_000 || matchingPairs > 40_000) {
-    result.summary = "Detailed line comparison is too large to display safely.";
-    result.warning = "Open the full versions below to compare them. Neither version has been changed.";
+    result.summary = "逐行对比内容太多，无法安全显示。";
+    result.warning = "请展开下方的完整版本自行对比。两个版本都没有被改动。";
     return result;
   }
   const changes = diffIndices(changedA, changedB);
@@ -55,17 +55,17 @@ export const compareContent = (local: string, remote: string): ContentDiff => {
   let cursorB = 0;
   const append = (line: DiffLine): void => {
     if (result.lines.length < 400) result.lines.push(line);
-    else result.warning = "Showing the first 400 comparison rows. Open the full versions below for the remaining content.";
+    else result.warning = "只显示前 400 行对比。其余内容请展开下方的完整版本查看。";
   };
   const common = (count: number, first: boolean, last: boolean): void => {
     let omitted = 0;
     for (let index = 0; index < count; index++) {
       if ((!first && index < 2) || (!last && index >= count - 2)) {
-        if (omitted) { append({kind: "omitted", text: `… ${omitted} unchanged lines …`}); omitted = 0; }
+        if (omitted) { append({kind: "omitted", text: `… ${omitted} 行未变 …`}); omitted = 0; }
         append({kind: "context", text: a[cursorA + index]!, remoteLine: cursorA + index + 1, localLine: cursorB + index + 1});
       } else omitted++;
     }
-    if (omitted) append({kind: "omitted", text: `… ${omitted} unchanged lines …`});
+    if (omitted) append({kind: "omitted", text: `… ${omitted} 行未变 …`});
     cursorA += count;
     cursorB += count;
   };
@@ -85,28 +85,28 @@ export const compareContent = (local: string, remote: string): ContentDiff => {
     cursorB += countB;
   }
   common(a.length - cursorA, false, true);
-  result.summary = `${remoteOnly} remote-only line${remoteOnly === 1 ? "" : "s"} · ${localOnly} local-only line${localOnly === 1 ? "" : "s"}`;
+  result.summary = `仅远端有 ${remoteOnly} 行 · 仅本地有 ${localOnly} 行`;
   return result;
 };
 
 export const renderContentDiff = (container: HTMLElement, local: string, remote: string): void => {
   const diff = compareContent(local, remote);
   container.createEl("p", {text: diff.summary});
-  container.createEl("p", {text: `Local: ${diff.localFormat}. Remote: ${diff.remoteFormat}.`});
+  container.createEl("p", {text: `本地：${diff.localFormat}。远端：${diff.remoteFormat}。`});
   if (diff.warning) container.createEl("p", {text: diff.warning});
   if (!diff.lines.length) return;
-  container.createEl("p", {text: "− Remote only · + Local only. These markers do not indicate which version is newer. · marks edge spaces, → tabs, [BOM] a byte-order mark."});
+  container.createEl("p", {text: "− 仅远端有 · + 仅本地有。这些标记不代表哪个版本更新。· 表示行首行尾的空格，→ 表示制表符，[BOM] 表示字节顺序标记。"});
   const rows = container.createDiv({cls: "s3-vault-sync-diff"});
   const heading = rows.createDiv({cls: "s3-vault-sync-diff-row"});
-  heading.createSpan({text: "Remote"});
-  heading.createSpan({text: "Local"});
-  heading.createSpan({text: "Content"});
+  heading.createSpan({text: "远端"});
+  heading.createSpan({text: "本地"});
+  heading.createSpan({text: "内容"});
   for (const line of diff.lines) {
     const row = rows.createDiv({cls: `s3-vault-sync-diff-row s3-vault-sync-diff-${line.kind}`});
     row.createSpan({text: line.remoteLine?.toString() ?? ""});
     row.createSpan({text: line.localLine?.toString() ?? ""});
     const prefix = line.kind === "remote" ? "− " : line.kind === "local" ? "+ " : "  ";
     const visible = line.text.replace(/^ +| +$/g, spaces => "·".repeat(spaces.length)).replace(/\t/g, "→").replace(/\uFEFF/g, "[BOM]");
-    row.createEl("code", {text: `${prefix}${visible || "[empty line]"}`});
+    row.createEl("code", {text: `${prefix}${visible || "[空行]"}`});
   }
 };

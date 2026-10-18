@@ -74,13 +74,13 @@ export class PathCollisionReviewer {
   private blocked(path: string, size: number): string | undefined {
     const configured = this.options.maxAutomaticFileBytes;
     const limit = typeof configured === "function" ? configured(path) : configured;
-    if (limit !== undefined && size > limit) return "This file exceeds the device limit. Resolve its path on a desktop.";
+    if (limit !== undefined && size > limit) return "这个文件超过了本设备的限制。请在桌面端处理它的路径。";
     return undefined;
   }
 
   private async load(paths: string[], renames: ReadonlyMap<string, PersistedPathRename>) {
     const head = await this.options.remote.readHead();
-    if (!head) throw new Error("Remote Store is not initialized");
+    if (!head) throw new Error("远端存储尚未初始化");
     const snapshot = await this.options.remote.readSnapshot(head.value);
     const cache = await this.options.cache.load();
     const local = await this.options.local.list();
@@ -133,7 +133,7 @@ export class PathCollisionReviewer {
       if (!blockedReason && entry.revision.size <= 256 * 1024) {
         const body = await this.options.remote.readBlob(entry.revision.blobId);
         if (!body || body.byteLength !== entry.revision.size || await sha256(body) !== entry.revision.contentHash) {
-          throw new Error("S3 collision content could not be authenticated. No rename was performed.");
+          throw new Error("无法核实 S3 上撞名文件的内容。没有执行任何改名。");
         }
         preview = previewText(body);
       }
@@ -157,28 +157,28 @@ export class PathCollisionReviewer {
   async resolve(request: PathCollisionResolution, renames: ReadonlyMap<string, PersistedPathRename>,
     journal: Pick<CollisionRenameJournal, "prepare" | "recover">): Promise<string> {
     const {review, head, snapshot, local} = await this.load(request.paths, renames);
-    if (review.reviewToken !== request.reviewToken) throw new Error("Files or sync records changed. Reload the collision review.");
+    if (review.reviewToken !== request.reviewToken) throw new Error("文件或同步记录有变化。请重新加载撞名审查。");
     const files = request.side === "local" ? review.localFiles : review.remoteFiles;
     const file = files.find(file => file.path === request.path && (request.side === "local" || file.entryId === request.entryId));
-    if (!file) throw new Error("The selected collision file no longer exists. Reload the review.");
+    if (!file) throw new Error("所选的撞名文件已不存在。请重新加载审查。");
     if (file.blockedReason) throw new Error(file.blockedReason);
-    if (!validName(request.newName)) throw new Error("Choose a portable filename, not a folder path (maximum 255 UTF-8 bytes).");
+    if (!validName(request.newName)) throw new Error("请填一个各平台通用的文件名，不要填文件夹路径（最多 255 个 UTF-8 字节）。");
     const newPath = parentOf(file.path) + request.newName;
     if (newPath.split("/").some(part => !part || part.startsWith(".") || part.startsWith("_") || part === "node_modules") ||
-      this.options.local.supportsPath?.(newPath) === false) throw new Error("The new path is not supported in this Vault.");
+      this.options.local.supportsPath?.(newPath) === false) throw new Error("这个仓库不支持新的路径。");
     const target = canonicalVaultPath(newPath);
     if (target === canonicalVaultPath(file.path) || await this.options.local.pathExists?.(newPath) ||
       local.some(other => canonicalVaultPath(other.path) === target || canonicalVaultPath(other.path).startsWith(`${target}/`) || target.startsWith(`${canonicalVaultPath(other.path)}/`))) {
-      throw new Error("That name is already occupied on this device. Choose a different filename.");
+      throw new Error("本设备上这个名字已被占用。请换一个文件名。");
     }
     const allowedOwner = request.side === "local" ? file.entryId : undefined;
     if (Object.values(snapshot.entries).some(entry =>
       (canonicalVaultPath(entry.path) === target && !(entry.entryId === allowedOwner && entry.kind === "live")) ||
       (entry.kind !== "deleted" && (canonicalVaultPath(entry.path).startsWith(`${target}/`) || target.startsWith(`${canonicalVaultPath(entry.path)}/`))))) {
-      throw new Error("S3 already has a record at that name. Choose a different filename.");
+      throw new Error("S3 上这个名字已有记录。请换一个文件名。");
     }
     if (request.side === "local") {
-      if (!file.contentHash) throw new Error("The local content could not be verified.");
+      if (!file.contentHash) throw new Error("无法核实本地内容。");
       await journal.prepare(file.path, newPath, file.contentHash, file.preserveAsNew ? undefined : file.entryId);
       if (file.preserveAsNew) {
         // Do not revive or move a deleted identity. Explicitly preserve these bytes as a new Entry.
@@ -189,7 +189,7 @@ export class PathCollisionReviewer {
         await this.options.remote.writeBlob(revision.blobId, body);
         const verified = await this.options.remote.readBlob(revision.blobId);
         if (!verified || verified.byteLength !== revision.size || await sha256(verified) !== revision.contentHash) {
-          throw new Error("The preserved copy could not be verified. The local file was not moved.");
+          throw new Error("无法核实保存下来的副本。本地文件没有被挪动。");
         }
         const commitId = crypto.randomUUID();
         await this.options.remote.advance({expectedHeadEtag: head.etag,
@@ -199,13 +199,13 @@ export class PathCollisionReviewer {
             changes: [{kind: "set-entry", entry: {kind: "live", entryId: crypto.randomUUID(), path: newPath, revision}}]}});
       }
       await this.options.local.move(file.path, newPath, file.contentHash, null);
-      if (await journal.recover() !== "ready") throw new Error("The interrupted rename needs review before synchronization can continue.");
+      if (await journal.recover() !== "ready") throw new Error("中断的改名需要先审查，同步才能继续。");
     } else {
       const entry = file.entryId ? snapshot.entries[file.entryId] : undefined;
-      if (entry?.kind !== "live") throw new Error("The selected S3 version is no longer live.");
+      if (entry?.kind !== "live") throw new Error("所选的 S3 版本已不是当前版本。");
       const body = await this.options.remote.readBlob(entry.revision.blobId);
       if (!body || body.byteLength !== entry.revision.size || await sha256(body) !== entry.revision.contentHash) {
-        throw new Error("S3 content verification failed. No rename was performed.");
+        throw new Error("S3 内容校验失败。没有执行任何改名。");
       }
       const commitId = crypto.randomUUID();
       await this.options.remote.advance({expectedHeadEtag: head.etag,

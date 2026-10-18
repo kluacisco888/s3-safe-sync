@@ -98,7 +98,7 @@ export class ObsidianVaultPort implements LocalVaultPort {
   ): Promise<void> {
     this.assertActive();
     if (!isSafeTargetPath(path)) {
-      throw new Error(`Refusing to delete an unsafe Vault path: ${path}`);
+      throw new Error(`拒绝删除不安全的仓库路径：${path}`);
     }
     await this.ensureRecovered();
     this.assertActive();
@@ -179,7 +179,7 @@ export class ObsidianVaultPort implements LocalVaultPort {
   ): Promise<void> {
     this.assertActive();
     if (!isSafeTargetPath(fromPath) || !isSafeTargetPath(toPath)) {
-      throw new Error(`Refusing to move an unsafe Vault path: ${toPath}`);
+      throw new Error(`拒绝挪动到不安全的仓库路径：${toPath}`);
     }
     await this.ensureRecovered();
     await withVaultMutationLock(this.vault.adapter, async () => {
@@ -187,7 +187,7 @@ export class ObsidianVaultPort implements LocalVaultPort {
       const normalizedSource = normalizePath(fromPath);
       const file = this.vault.getAbstractFileByPath(normalizedSource);
       if (!(file instanceof TFile)) {
-        throw new Error(`Local Vault path does not exist: ${fromPath}`);
+        throw new Error(`本地仓库路径不存在：${fromPath}`);
       }
       const normalizedTarget = normalizePath(toPath);
       if (
@@ -195,7 +195,7 @@ export class ObsidianVaultPort implements LocalVaultPort {
         !isSafeTargetPath(normalizedTarget) ||
         canonicalVaultPath(normalizedSource) === canonicalVaultPath(normalizedTarget)
       ) {
-        throw new Error(`Refusing to move an unsafe Vault path: ${toPath}`);
+        throw new Error(`拒绝挪动到不安全的仓库路径：${toPath}`);
       }
       if (
         expectedSourceHash !== undefined &&
@@ -235,7 +235,7 @@ export class ObsidianVaultPort implements LocalVaultPort {
       const copiedHash = await this.readAdapterHash(normalizedTarget);
       const sourceHash = expectedSourceHash ?? (await this.readAdapterHash(normalizedSource));
       if (!sourceHash || copiedHash !== sourceHash) {
-        throw new Error(`Copied local file failed verification: ${toPath}`);
+        throw new Error(`复制出的本地文件未通过校验：${toPath}`);
       }
       await deleteVaultPath(
         this.vault,
@@ -250,7 +250,7 @@ export class ObsidianVaultPort implements LocalVaultPort {
     await this.ensureRecovered();
     const file = this.vault.getAbstractFileByPath(normalizePath(path));
     if (!(file instanceof TFile)) {
-      throw new Error(`Local Vault file does not exist: ${path}`);
+      throw new Error(`本地仓库文件不存在：${path}`);
     }
     return new Uint8Array(await this.vault.readBinary(file));
   }
@@ -295,12 +295,12 @@ export class ObsidianVaultPort implements LocalVaultPort {
   ): Promise<void> {
     this.assertActive();
     if (!isSafeTargetPath(path)) {
-      throw new Error(`Refusing to write an unsafe Vault path: ${path}`);
+      throw new Error(`拒绝写入不安全的仓库路径：${path}`);
     }
     await this.ensureRecovered();
     const normalized = normalizePath(path);
     if (!isSafeTargetPath(normalized)) {
-      throw new Error(`Refusing to write an unsafe Vault path: ${path}`);
+      throw new Error(`拒绝写入不安全的仓库路径：${path}`);
     }
     const parent = normalized.includes("/")
       ? normalized.slice(0, normalized.lastIndexOf("/"))
@@ -329,7 +329,7 @@ export class ObsidianVaultPort implements LocalVaultPort {
       return undefined;
     }
     if ((await this.vault.adapter.stat(path))?.type !== "file") {
-      throw new Error(`Expected local file path: ${path}`);
+      throw new Error(`这里应该是本地文件路径：${path}`);
     }
     return sha256(await this.vault.adapter.readBinary(path));
   }
