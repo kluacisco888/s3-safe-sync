@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { App } from "obsidian";
+import type { DeletedEntry } from "../src/sync/sync-engine";
 
 const { Element, opened, dropdowns } = vi.hoisted(() => {
   class Element {
@@ -12,6 +13,7 @@ const { Element, opened, dropdowns } = vi.hoisted(() => {
     constructor(readonly tag: string) {}
     empty() { this.children = []; }
     addClass() {}
+    setAttr() {}
     addEventListener(name: string, handler: () => void) { this.events.set(name, handler); }
     setText(text: string) { this.text = text; }
     createEl(tag: string, options: { text?: string } = {}) {
@@ -588,6 +590,42 @@ describe("StatusModal", () => {
       confirm.events.get("click")!();
       expect(resolvePossibleRename).toHaveBeenCalledWith({kind: "moves", reviewToken: "review-2",
         pairs: [{fromPath: "old/a.pdf", toPath: "new/x.pdf"}, {fromPath: "old/b.pdf", toPath: "new/y.pdf"}]});
+    });
+  });
+
+  describe("deleted files list", () => {
+    type FakeElement = InstanceType<typeof Element>;
+    const all = (root: FakeElement): FakeElement[] => [root, ...root.children.flatMap(all)];
+    const revision = (id: string, expiresAt: string) => ({revisionId: id, blobId: `${id}-blob`, contentHash: `${id}-hash`,
+      size: 5, createdAt: "2026-09-01T00:00:00Z", expiresAt});
+    // 设备时间 2026-10-18 10:00（上海时区），只影响显示
+    const now = "2026-10-18T02:00:00Z";
+    const expired: DeletedEntry = {kind: "deleted", entryId: "expired", path: "expired.md", deletedAt: "2026-09-01T00:00:00Z",
+      lastContentHash: "h1", lastRevisionId: "r1", recovery: revision("r1", "2026-10-01T00:00:00Z"),
+      history: [revision("old1", "2026-09-30T00:00:00Z")]};
+    const fresh: DeletedEntry = {kind: "deleted", entryId: "fresh", path: "fresh.md", deletedAt: "2026-10-06T01:11:26.000Z",
+      lastContentHash: "h2", lastRevisionId: "r2", recovery: revision("r2", "2026-11-05T01:11:26.000Z")};
+    const candidateOnly: DeletedEntry = {kind: "deleted", entryId: "candidate", path: "candidate.md",
+      deletedAt: "2026-09-10T00:00:00Z", lastContentHash: "h3", lastRevisionId: "r3",
+      recovery: revision("r3", "2026-10-10T00:00:00Z"), history: [revision("conflict-candidate", "2026-10-18T12:00:00Z")]};
+    const openWith = (deleted: DeletedEntry[]) => {
+      const controller = {...issueController([]), getDeletedRecoveries: () => deleted};
+      const modal = new StatusModal({} as App, controller);
+      modal.onOpen();
+      return all(modal.contentEl as unknown as FakeElement);
+    };
+    const originalTimeZone = process.env.TZ;
+    beforeAll(() => {process.env.TZ = "Asia/Shanghai";});
+    afterAll(() => {process.env.TZ = originalTimeZone;});
+    beforeEach(() => {vi.useFakeTimers({toFake: ["Date"]}); vi.setSystemTime(new Date(now));});
+    afterEach(() => {vi.useRealTimers();});
+
+    it("lists only deleted files that still have unexpired recovery content", () => {
+      const texts = openWith([expired, fresh, candidateOnly]).map(node => node.text);
+      expect(texts).toContain("已删除的文件（30 天内可恢复）");
+      expect(texts).not.toContain("expired.md");
+      expect(texts).toContain("fresh.md");
+      expect(texts).toContain("candidate.md");
     });
   });
 });

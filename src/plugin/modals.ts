@@ -98,6 +98,16 @@ const conflictReasonLabels: Record<ConflictedEntry["reason"], string> = {
   "edit-edit": "本地和远端都有修改",
 };
 
+// 下面几项只用于显示，按设备时间判断；恢复操作仍按 AWS 时间判断 30 天期限。
+// 与恢复规则一致：没有到期时间的版本不算过期。
+const isUnexpired = (revision: RevisionRef, now: number): boolean =>
+  revision.expiresAt === undefined || Date.parse(revision.expiresAt) > now;
+
+/** 已删除文件里仍未过期的可恢复内容（恢复副本和历史版本） */
+const unexpiredRecoveries = (entry: DeletedEntry, now: number): RevisionRef[] =>
+  [...(entry.recovery ? [entry.recovery] : []), ...(entry.history ?? [])]
+    .filter(revision => isUnexpired(revision, now));
+
 const renderIssueGuidance = (container: HTMLElement, issue: LocalSyncIssue): void => {
   const detail = container.createEl("details");
   detail.createEl("summary", {text: "为什么需要处理"});
@@ -503,7 +513,9 @@ export class StatusModal extends Modal {
   }
 
   private renderDeletedRecoveries(container: HTMLElement): void {
-    const deleted = this.controller.getDeletedRecoveries();
+    const now = Date.now();
+    const deleted = this.controller.getDeletedRecoveries()
+      .filter(entry => unexpiredRecoveries(entry, now).length > 0);
     if (deleted.length === 0) {
       return;
     }
