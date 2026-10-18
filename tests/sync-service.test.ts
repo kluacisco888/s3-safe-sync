@@ -6521,4 +6521,45 @@ describe("a base Revision purged from the remote record", () => {
     expect(after.head.etag).toBe(before.head.etag);
     expect(await fixture.objects.list("")).toEqual(keysBefore);
   });
+
+  // 电脑 v0 -> v1 -> 改回 v0 -> v2：清理掉手机 base 那个 v0 之后，记录里仍有另一个内容同为 v0 的版本
+  const purgedBaseWithReferencedCopy = async () => {
+    const fixture = await setup();
+    const base = await fixture.liveEntry();
+    for (const content of ["v1", "v0", "v2"]) {
+      await fixture.desktopVault.write("note.md", text(content));
+      await fixture.desktop.synchronize();
+    }
+    await purgeRevisions(fixture.observer, fixture.objects, [base.revision.revisionId], true);
+    const copy = (await fixture.liveEntry()).history?.find((revision) => revision.contentHash === base.revision.contentHash);
+    if (!copy) throw new Error("Expected another referenced copy of v0");
+    return { ...fixture, copy };
+  };
+
+  it("still reports a network failure while authenticating content the record still references", async () => {
+    const fixture = await purgedBaseWithReferencedCopy();
+    fixture.objects.onGet = (key) => {
+      if (key.endsWith(`/blobs/${fixture.copy.blobId}`)) {
+        fixture.objects.onGet = undefined;
+        throw new Error("temporary recovery read network failure");
+      }
+    };
+
+    const synchronization = fixture.phone.synchronize();
+
+    await expect(synchronization).rejects.toThrow("temporary recovery read network failure");
+    await expect(synchronization).rejects.not.toBeInstanceOf(RemoteStateError);
+    expect(fixture.phoneVault.readText("note.md")).toBe("v0");
+  });
+
+  it("still reports an integrity failure when content the record still references cannot be authenticated", async () => {
+    const fixture = await purgedBaseWithReferencedCopy();
+    await fixture.objects.put(`${prefix}/v1/blobs/${fixture.copy.blobId}`, text("damaged"));
+
+    const synchronization = fixture.phone.synchronize();
+
+    await expect(synchronization).rejects.toBeInstanceOf(RemoteStateError);
+    await expect(synchronization).rejects.toMatchObject({ integrityCheck: { kind: "recovery" } });
+    expect(fixture.phoneVault.readText("note.md")).toBe("v0");
+  });
 });
