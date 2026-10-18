@@ -1490,22 +1490,32 @@ describe("expired content cleanup that keeps losing the Head race", () => {
     const { HeadChangedError } = await import("../src/storage/remote-store");
     const cleanup = vi.spyOn(SyncService.prototype, "cleanupExpiredContent").mockRejectedValue(new HeadChangedError());
 
-    // 重试之间的等待用的是假计时器，一点点往前拨直到这次同步结束
+    // 重试之间的等待用的是假计时器，一点点往前拨直到这次同步结束。同步里的加密运算走真实线程，假时钟管不到：
+    // 机器忙时一口气拨完，加密还没做完，重试的等待就落在拨完之后、再没人拨。所以每拨 50 毫秒都真等 1 毫秒让加密跑完；
+    // 拨满 100 秒（远超最长约 7.5 秒的重试等待，又不到 120 秒的定时同步）还没结束就直接报错，不干等到超时
     const settle = async (run: Promise<void>) => {
       let done = false;
       void run.finally(() => { done = true; });
-      for (let step = 0; step < 200 && !done; step++) await vi.advanceTimersByTimeAsync(250);
+      for (let step = 0; !done; step++) {
+        if (step >= 2_000) throw new Error("同步一直没有结束");
+        await vi.advanceTimersByTimeAsync(50);
+        if (!done) await realDelay(1);
+      }
       await run;
     };
-    await settle(plugin.togglePause());
+    // 无论成败都撤掉模拟失败，免得后面启用清理的测试也一直抢不到记录
+    try {
+      await settle(plugin.togglePause());
 
-    expect(cleanup).toHaveBeenCalledTimes(5);
-    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
-    expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({ outcome: "complete" });
-    expect(plugin.getDiagnostics().records.at(-1)!.expiredContentCleanup).toBeUndefined();
-    await settle(plugin.syncNow());
-    expect(cleanup).toHaveBeenCalledTimes(10);
-    cleanup.mockRestore();
+      expect(cleanup).toHaveBeenCalledTimes(5);
+      expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+      expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({ outcome: "complete" });
+      expect(plugin.getDiagnostics().records.at(-1)!.expiredContentCleanup).toBeUndefined();
+      await settle(plugin.syncNow());
+      expect(cleanup).toHaveBeenCalledTimes(10);
+    } finally {
+      cleanup.mockRestore();
+    }
     plugin.onunload();
   });
 });
