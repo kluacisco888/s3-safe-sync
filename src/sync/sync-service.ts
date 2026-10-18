@@ -37,6 +37,21 @@ const retainedRevisions = (entry: VaultEntry): RevisionRef[] => [
   ...(entry.history ?? []),
 ];
 
+// 本机缓存里的 Revision 仍在远端当前记录（本次 CAS 所对 Head 的快照）里时，返回记录里的那一份；
+// 不在就当它已被过期清理，不论数据块还在不在
+const retainedInRecord = (
+  snapshot: VaultSnapshot,
+  entryId: string,
+  revision: RevisionRef,
+): RevisionRef | undefined => {
+  const entry = snapshot.entries[entryId];
+  return entry
+    ? retainedRevisions(entry).find(
+        (retained) => retained.revisionId === revision.revisionId && retained.blobId === revision.blobId,
+      )
+    : undefined;
+};
+
 // 本机缓存里这个 Entry 已接受的本机内容：当前版本，或冲突时已落地的那个候选
 const acceptedContentHash = (base: VaultSnapshot | undefined, entryId: string): string | undefined => {
   const entry = base?.entries[entryId];
@@ -1540,7 +1555,9 @@ export class SyncService {
           change.kind === "delete-remote" ? [change.recoveryRevision] : [],
         ),
         ...sharedConflicts.flatMap((conflict) =>
-          conflict.kind === "delete-edit" ? [conflict.baseRevision] : [],
+          // 已不在远端记录里的 base 不会写进冲突，也就不必核实
+          conflict.kind === "delete-edit" && retainedInRecord(remote, conflict.entryId, conflict.baseRevision)
+            ? [conflict.baseRevision] : [],
         ),
       ],
     );
@@ -1830,6 +1847,8 @@ export class SyncService {
           if (remoteEntry?.kind !== "live") {
             throw new Error(`文件 ${conflict.entryId} 应为当前版本`);
           }
+          // base 已被过期清理出记录时冲突照样记，只是不带这个旧版本：重新引用它会和数据块删除抢时间
+          const retainedBase = retainedInRecord(remote, conflict.entryId, conflict.baseRevision);
           changedEntry = {
             candidates: [remoteEntry.revision],
             deletedAt: createdAt,
@@ -1840,7 +1859,7 @@ export class SyncService {
             lastRevisionId: conflict.baseRevisionId,
             path: conflict.path,
             reason: "delete-edit",
-            recovery: keepForRecovery(conflict.baseRevision, createdAt),
+            ...(retainedBase ? { recovery: keepForRecovery(retainedBase, createdAt) } : {}),
           };
           unresolvedConflicts += 1;
           nextEntries[conflict.entryId] = changedEntry;

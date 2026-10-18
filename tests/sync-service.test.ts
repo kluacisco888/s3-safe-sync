@@ -6423,4 +6423,29 @@ describe("a base Revision purged from the remote record", () => {
     expect(deleted?.history?.map((revision) => revision.revisionId) ?? []).not.toContain(first.revision.revisionId);
     await expect(fixture.desktop.synchronize()).resolves.toMatchObject({ deleted: 1, status: "complete" });
   });
+
+  it.each([
+    ["purged from the record", false],
+    ["purged and its blob deleted", true],
+  ])("records a delete-edit Conflict without a base that was %s", async (_label, deleteBlobs) => {
+    const fixture = await setup();
+    const base = await fixture.liveEntry();
+    await fixture.desktopVault.write("note.md", text("v1"));
+    await fixture.desktop.synchronize();
+    const edited = await fixture.liveEntry();
+    await purgeRevisions(fixture.observer, fixture.objects, [base.revision.revisionId], deleteBlobs);
+    await fixture.phoneVault.delete("note.md");
+
+    await expect(fixture.phone.synchronize()).resolves.toMatchObject({ status: "action-required" });
+
+    const conflicted = (await readCurrent(await fixture.open())).snapshot.entries[base.entryId];
+    expect(conflicted).toMatchObject({
+      candidates: [{ revisionId: edited.revision.revisionId }],
+      kind: "conflicted",
+      lastContentHash: base.revision.contentHash,
+      reason: "delete-edit",
+    });
+    expect(conflicted?.kind === "conflicted" ? conflicted.recovery : "missing").toBeUndefined();
+    await expect(fixture.desktop.synchronize()).resolves.toMatchObject({ status: "action-required" });
+  });
 });
