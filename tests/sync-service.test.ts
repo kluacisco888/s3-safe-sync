@@ -6502,9 +6502,10 @@ describe("a base Revision purged from the remote record", () => {
     const keysBefore = await fixture.objects.list("");
     await fixture.phoneVault.delete("note.md");
     // 人为构造违规提交：让删除记录带回已被清理的旧版本
-    const reconcile = SyncEngine.prototype.reconcile;
-    const spy = vi.spyOn(SyncEngine.prototype, "reconcile").mockImplementation(function (this: SyncEngine, input) {
-      const plan = reconcile.call(this, input);
+    // 先绑定原方法再打桩，避免桩调到自己
+    const reconcile = SyncEngine.prototype.reconcile.bind(new SyncEngine());
+    const spy = vi.spyOn(SyncEngine.prototype, "reconcile").mockImplementation((input) => {
+      const plan = reconcile(input);
       return {
         ...plan,
         remoteChanges: plan.remoteChanges.map((change) =>
