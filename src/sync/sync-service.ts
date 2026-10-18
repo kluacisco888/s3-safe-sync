@@ -19,6 +19,7 @@ import {
   type RemoteIntegrityCheck,
   RemoteStateError,
   RemoteStore,
+  snapshotBlobReferences,
 } from "../storage/remote-store";
 import { LocalStateChangedError } from "./errors";
 import type { PersistedPathRename } from "./path-rename-tracker";
@@ -26,6 +27,47 @@ import { sha256Content as sha256 } from "./content-hash";
 import { canonicalVaultPath } from "./canonical-path";
 import { PathCollisionReviewer, type PathCollisionReview, type PathCollisionResolution } from "./path-collision-review";
 import type { CollisionRenameJournal } from "./collision-rename-journal";
+import {
+  planExpiredContentCleanup,
+  type ExpiredRecoveryRemoval,
+  type MissingExpiryItem,
+} from "./expired-content-cleanup";
+import {
+  MAX_BLOB_DELETIONS_PER_RUN,
+  planUnreferencedBlobDeletion,
+  summarizeBlobs,
+  type BlobUsageSummary,
+  type UnreferencedBlobMarks,
+} from "./unreferenced-blob-cleanup";
+
+export interface ExpiredContentPreview {
+  // 将删除的数据块（四条判据都满足）和「明天起删」的（第一次判定还不满 24 小时），按上传月份汇总
+  blobs: { deletable: BlobUsageSummary; startingTomorrow: BlobUsageSummary };
+  missingExpiry: MissingExpiryItem[];
+  removedHistory: number;
+  removedRecoveries: ExpiredRecoveryRemoval[];
+  serverDate: string;
+}
+
+export type UnreferencedBlobCleanupResult =
+  | { kind: "no-head" }
+  | {
+      deletedBlobs: number;
+      deletedBytes: number;
+      kind: "checked";
+      marks: UnreferencedBlobMarks;
+      serverDate: string;
+    };
+
+export type ExpiredContentCleanupResult =
+  | { kind: "no-head" }
+  | {
+      commitId?: string;
+      kind: "committed" | "nothing-to-clean";
+      removedHistory: number;
+      removedRecoveries: number;
+      serverDate: string;
+    };
 
 // 下载阶段最多每隔这么久把已落地的文件写进 Sync Cache 一次；打断前和开始上传前另外各写一次
 const DOWNLOAD_PROGRESS_SAVE_INTERVAL_MS = 2_000;
@@ -36,6 +78,38 @@ const retainedRevisions = (entry: VaultEntry): RevisionRef[] => [
   ...(entry.kind !== "live" && entry.recovery ? [entry.recovery] : []),
   ...(entry.history ?? []),
 ];
+
+// 本机缓存里的 Revision 仍在远端当前记录（本次 CAS 所对 Head 的快照）里时，返回记录里的那一份；
+// 不在就当它已被过期清理，不论数据块还在不在
+const retainedInRecord = (
+  snapshot: VaultSnapshot,
+  entryId: string,
+  revision: RevisionRef,
+): RevisionRef | undefined => {
+  const entry = snapshot.entries[entryId];
+  return entry
+    ? retainedRevisions(entry).find(
+        (retained) => retained.revisionId === revision.revisionId && retained.blobId === revision.blobId,
+      )
+    : undefined;
+};
+
+// 本机缓存里这个 Entry 已接受的本机内容：当前版本，或冲突时已落地的那个候选
+const acceptedContentHash = (base: VaultSnapshot | undefined, entryId: string): string | undefined => {
+  const entry = base?.entries[entryId];
+  return entry?.kind === "live" ? entry.revision.contentHash
+    : entry?.kind === "conflicted" ? entry.materializedContentHash : undefined;
+};
+
+// 不变量 9 的例外：本机内容等于已接受的内容，而远端当前记录里这个 Entry 已没有任何同内容的 Revision
+// （旧版本已过期并被清理出记录）。这时不再要求远端恢复副本，本机旧字节进本机回收站
+const acceptedContentPurgedFromRecord = (
+  entry: VaultEntry,
+  localContentHash: string,
+  acceptedContentHash: string | undefined,
+): boolean =>
+  acceptedContentHash === localContentHash &&
+  !retainedRevisions(entry).some((revision) => revision.contentHash === localContentHash);
 
 export interface LocalFileInfo {
   modifiedAt: number;
@@ -458,12 +532,15 @@ export class SyncService {
       throw new Error(`本设备不支持这个路径：${entry.path}`);
     }
     const cached = await this.options.cache.load();
-    const expectedContentHash = cached?.files[entry.path]?.contentHash ?? null;
+    const cachedFile = cached?.files[entry.path];
+    const expectedContentHash = cachedFile?.contentHash ?? null;
     await this.assertLocalContent(entry.path, expectedContentHash);
     await this.assertRemoteRecoveryForLocalContent(
       snapshot,
       entry.entryId,
       expectedContentHash,
+      // 缓存里这个路径记的是本 Entry 时，记下的内容就是它已接受的本机 base
+      cachedFile?.entryId === entry.entryId ? cachedFile.contentHash : undefined,
     );
     const plaintext = await this.options.remote.readBlob(entry.revision.blobId);
     if (
@@ -1012,6 +1089,150 @@ export class SyncService {
     await this.acceptReviewedEntries({...snapshot, commitId}, [restoredEntry]);
   }
 
+  // 预览只读：只读远端 Head、它的快照和数据块列表，不写 S3、不改本机缓存，也不更新第一次判定记录
+  async previewExpiredContentCleanup(
+    vaultId: string,
+    blobMarks?: Readonly<UnreferencedBlobMarks>,
+  ): Promise<ExpiredContentPreview> {
+    const versionedHead = await this.options.remote.readHead();
+    if (!versionedHead || versionedHead.value.vaultId !== vaultId) {
+      throw new Error("远端 Head 指针缺失，或属于另一个仓库");
+    }
+    const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
+    const plan = planExpiredContentCleanup(snapshot, versionedHead.serverDate);
+    // 数据块按清理提交之后的记录判定：只被过期内容引用的，清理后就没人用了
+    const cleaned: VaultSnapshot = {
+      ...snapshot,
+      entries: { ...snapshot.entries, ...Object.fromEntries(plan.changedEntries.map((entry) => [entry.entryId, entry])) },
+    };
+    const blobPlan = planUnreferencedBlobDeletion({
+      headLastModified: versionedHead.lastModified,
+      marks: blobMarks,
+      objects: await this.options.remote.listBlobObjects(),
+      referenced: new Set(snapshotBlobReferences(cleaned).keys()),
+      serverDate: versionedHead.serverDate,
+    });
+    return {
+      blobs: { deletable: summarizeBlobs(blobPlan.deletable), startingTomorrow: summarizeBlobs(blobPlan.waiting) },
+      missingExpiry: plan.missingExpiry,
+      removedHistory: plan.removedHistory,
+      removedRecoveries: plan.removedRecoveries,
+      serverDate: versionedHead.serverDate,
+    };
+  }
+
+  /**
+   * 删除本仓库文件夹里没人用的数据块（见 unreferenced-blob-cleanup.ts 的四条判据）。
+   * 引用集只用同一次 readHead 读到的 Head 和它的快照计算，绝不读本机缓存；删除前重读 Head、重算引用，
+   * 这期间被新提交引用的候选不删。每次最多 200 个。任何一步出错都直接抛出：宁可少删。
+   * marks 是上一次检查留下的第一次判定记录（调用方保存在本地，绑定目标和 vaultId）。
+   */
+  async deleteUnreferencedBlobs(
+    vaultId: string,
+    marks?: Readonly<UnreferencedBlobMarks>,
+  ): Promise<UnreferencedBlobCleanupResult> {
+    const remote = this.options.remote;
+    const versionedHead = await remote.readHead();
+    if (!versionedHead || versionedHead.value.vaultId !== vaultId) {
+      return { kind: "no-head" };
+    }
+    const snapshot = await remote.readSnapshot(versionedHead.value);
+    const plan = planUnreferencedBlobDeletion({
+      headLastModified: versionedHead.lastModified,
+      marks,
+      objects: await remote.listBlobObjects(),
+      referenced: new Set(snapshotBlobReferences(snapshot).keys()),
+      serverDate: versionedHead.serverDate,
+    });
+    const nextMarks = { ...plan.marks };
+    let deletedBlobs = 0;
+    let deletedBytes = 0;
+    if (plan.deletable.length > 0) {
+      const current = await remote.readHead();
+      if (!current || current.value.vaultId !== vaultId) {
+        throw new Error("删除数据块前重读 Head 指针失败，这次不删除数据块。");
+      }
+      const stillReferenced = snapshotBlobReferences(await remote.readSnapshot(current.value));
+      for (const blobId of stillReferenced.keys()) delete nextMarks[blobId];
+      const batch = plan.deletable
+        .filter((object) => !stillReferenced.has(object.blobId))
+        .slice(0, MAX_BLOB_DELETIONS_PER_RUN);
+      for (const object of batch) {
+        await remote.deleteBlob(object.blobId);
+        delete nextMarks[object.blobId];
+        deletedBlobs += 1;
+        deletedBytes += object.size;
+      }
+    }
+    return { deletedBlobs, deletedBytes, kind: "checked", marks: nextMarks, serverDate: versionedHead.serverDate };
+  }
+
+  // 清理提交：只用同一次 readHead 读到的 Head 和它的快照计算，CAS 也对这个 Head，绝不拿本机缓存构造
+  // （否则会把别的设备的新改动覆盖回旧版本）。被别的设备抢先时抛 HeadChangedError，由调用方重读重算。
+  async cleanupExpiredContent(vaultId: string): Promise<ExpiredContentCleanupResult> {
+    const versionedHead = await this.options.remote.readHead();
+    if (!versionedHead || versionedHead.value.vaultId !== vaultId) {
+      return { kind: "no-head" };
+    }
+    const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
+    const plan = planExpiredContentCleanup(snapshot, versionedHead.serverDate);
+    const counts = {
+      removedHistory: plan.removedHistory,
+      removedRecoveries: plan.removedRecoveries.length,
+      serverDate: versionedHead.serverDate,
+    };
+    if (plan.changedEntries.length === 0) {
+      return { kind: "nothing-to-clean", ...counts };
+    }
+    // 清理只去掉引用；发布前总检查照样适用
+    this.assertCommitReferencesAcceptedOrUploaded(snapshot, plan.changedEntries, new Set());
+    const createdAt = versionedHead.serverDate;
+    const commitId = crypto.randomUUID();
+    const nextSnapshot: VaultSnapshot = {
+      commitId,
+      entries: {
+        ...snapshot.entries,
+        ...Object.fromEntries(plan.changedEntries.map((entry) => [entry.entryId, entry])),
+      },
+      protocolVersion: 1,
+      vaultId: snapshot.vaultId,
+    };
+    const head: HeadRecord = {
+      commitId,
+      generation: versionedHead.value.generation + 1,
+      protocolVersion: 1,
+      snapshotId: versionedHead.value.snapshotId,
+      vaultId: snapshot.vaultId,
+    };
+    // 与同步提交同一条规则：每 100 次写一份完整快照
+    if (head.generation % 100 === 0) {
+      const snapshotId = crypto.randomUUID();
+      await this.options.remote.writeSnapshot(snapshotId, nextSnapshot);
+      head.snapshotId = snapshotId;
+    }
+    await this.options.remote.advance({
+      commit: {
+        changes: plan.changedEntries.map((entry) => ({ entry, kind: "set-entry" })),
+        commitId,
+        createdAt,
+        parentIds: [versionedHead.value.commitId],
+        protocolVersion: 1,
+        replicaId: this.options.replicaId,
+        vaultId: snapshot.vaultId,
+      },
+      expectedHeadEtag: versionedHead.etag,
+      head,
+    });
+    this.options.onRemotePublished?.(commitId);
+    // 本机缓存正好停在这次读到的 Head 时才直接接受清理后的记录（清理不改任何当前版本和路径，
+    // 本机文件记录照旧有效）；缓存落后或超前都不碰，留给下一次同步
+    const cached = await this.options.cache.load();
+    if (cached?.snapshot.commitId === versionedHead.value.commitId && cached.snapshot.vaultId === snapshot.vaultId) {
+      await this.options.cache.save({ ...cached, snapshot: nextSnapshot });
+    }
+    return { commitId, kind: "committed", ...counts };
+  }
+
   async readDeletedRecovery(
     entryId: string,
     revisionId?: string,
@@ -1530,7 +1751,9 @@ export class SyncService {
           change.kind === "delete-remote" ? [change.recoveryRevision] : [],
         ),
         ...sharedConflicts.flatMap((conflict) =>
-          conflict.kind === "delete-edit" ? [conflict.baseRevision] : [],
+          // 已不在远端记录里的 base 不会写进冲突，也就不必核实
+          conflict.kind === "delete-edit" && retainedInRecord(remote, conflict.entryId, conflict.baseRevision)
+            ? [conflict.baseRevision] : [],
         ),
       ],
     );
@@ -1608,6 +1831,7 @@ export class SyncService {
           if (remoteEntry?.kind === "deleted") {
             await this.assertRecoveryBeforeDelete(
               remoteEntry,
+              expectedLocalContentByPath.get(action.path) ?? null,
               versionedHead.serverDate,
             );
           }
@@ -1627,7 +1851,8 @@ export class SyncService {
             expectedLocalContentByPath.get(action.fromPath) ?? null;
           const expectedTargetHash = expectedLocalContentByPath.get(action.toPath) ?? null;
           if (expectedTargetHash !== null) {
-            await this.assertRemoteRecoveryForLocalContent(remote, action.entryId, expectedContentHash);
+            await this.assertRemoteRecoveryForLocalContent(remote, action.entryId, expectedContentHash,
+              acceptedContentHash(reconciliationBase, action.entryId));
             await this.assertLocalContent(action.toPath, expectedTargetHash);
           }
           await this.assertLocalContent(action.fromPath, expectedContentHash);
@@ -1671,6 +1896,7 @@ export class SyncService {
             remote,
             action.entryId,
             expectedContentHash,
+            acceptedContentHash(reconciliationBase, action.entryId),
           );
           await this.assertLocalContent(action.path, expectedContentHash);
           await this.options.local.write(
@@ -1741,6 +1967,8 @@ export class SyncService {
       const createdAt = versionedHead.serverDate;
       const changedEntries: VaultEntry[] = [];
       const nextEntries = { ...remote.entries };
+      // 本次尝试新上传并核实过的数据块；新提交只能引用它们或 Head 已引用的数据块
+      const uploadedBlobIds = new Set<string>();
       const deleteAfterCommit: Array<{
         expectedContentHash: string;
         path: string;
@@ -1783,6 +2011,7 @@ export class SyncService {
           }
           const blobId = crypto.randomUUID();
           await this.options.remote.writeBlob(blobId, plaintext);
+          uploadedBlobIds.add(blobId);
           reportUpload(change.path, change.file.size);
           const current = remote.entries[change.entryId];
           const previousRevisions =
@@ -1818,6 +2047,8 @@ export class SyncService {
           if (remoteEntry?.kind !== "live") {
             throw new Error(`文件 ${conflict.entryId} 应为当前版本`);
           }
+          // base 已被过期清理出记录时冲突照样记，只是不带这个旧版本：重新引用它会和数据块删除抢时间
+          const retainedBase = retainedInRecord(remote, conflict.entryId, conflict.baseRevision);
           changedEntry = {
             candidates: [remoteEntry.revision],
             deletedAt: createdAt,
@@ -1828,7 +2059,7 @@ export class SyncService {
             lastRevisionId: conflict.baseRevisionId,
             path: conflict.path,
             reason: "delete-edit",
-            recovery: keepForRecovery(conflict.baseRevision, createdAt),
+            ...(retainedBase ? { recovery: keepForRecovery(retainedBase, createdAt) } : {}),
           };
           unresolvedConflicts += 1;
           nextEntries[conflict.entryId] = changedEntry;
@@ -1846,6 +2077,7 @@ export class SyncService {
         }
         const blobId = crypto.randomUUID();
         await this.options.remote.writeBlob(blobId, plaintext);
+        uploadedBlobIds.add(blobId);
         const localRevision = {
           blobId,
           contentHash: conflict.localFile.contentHash,
@@ -1883,22 +2115,26 @@ export class SyncService {
           ) {
             throw new Error(`文件 ${conflict.entryId} 应为当前版本或已恢复`);
           }
-          const baseContent =
+          // base 已被过期清理出记录时不读取它（数据块可能已删），也就不合并：两份都进冲突中心
+          const mergeBase =
             baseEntry.kind === "live"
-              ? await this.options.remote.readBlob(baseEntry.revision.blobId)
+              ? retainedInRecord(remote, conflict.entryId, baseEntry.revision)
               : undefined;
+          const baseContent = mergeBase
+            ? await this.options.remote.readBlob(mergeBase.blobId)
+            : undefined;
           const remoteContent = await this.options.remote.readBlob(
             remoteEntry.revision.blobId,
           );
-          if ((baseEntry.kind === "live" && !baseContent) || !remoteContent) {
+          if ((mergeBase && !baseContent) || !remoteContent) {
             throw new Error(`${conflict.path} 的冲突历史不完整`);
           }
           if (
-            (baseEntry.kind === "live" &&
+            (mergeBase &&
               (!baseContent ||
-                baseContent.byteLength !== baseEntry.revision.size ||
+                baseContent.byteLength !== mergeBase.size ||
                 (await sha256(baseContent)) !==
-                  baseEntry.revision.contentHash)) ||
+                  mergeBase.contentHash)) ||
             remoteContent.byteLength !== remoteEntry.revision.size ||
             (await sha256(remoteContent)) !== remoteEntry.revision.contentHash
           ) {
@@ -1920,6 +2156,7 @@ export class SyncService {
           if (merged) {
             const mergedBlobId = crypto.randomUUID();
             await this.options.remote.writeBlob(mergedBlobId, merged);
+            uploadedBlobIds.add(mergedBlobId);
             const mergedRevision: RevisionRef = {
               blobId: mergedBlobId,
               contentHash: await sha256(merged),
@@ -2000,6 +2237,8 @@ export class SyncService {
         changedEntries.push(changedEntry);
       }
       publishedChanges = changedEntries.length;
+      // 发布前总检查：放在写快照和发布 Head 之前、提交后的本地删除和改写之前
+      this.assertCommitReferencesAcceptedOrUploaded(remote, changedEntries, uploadedBlobIds);
       const commitId = crypto.randomUUID();
       const commit: CommitRecord = {
         changes: changedEntries.map((entry) => ({
@@ -2229,10 +2468,16 @@ export class SyncService {
           ? entry.revision
           : entry.history?.find(
               (revision) => revision.contentHash === cachedFile.contentHash,
-            );
-      if (!priorRevision) {
-        continue;
-      }
+            ) ?? {
+              // 旧 Revision 已被过期清理出记录（缓存接受了清理后的快照）时，仍以缓存记下的本机内容为 base，
+              // 否则本机旧内容会被当成本机修改上传。这个 Revision 不在远端记录里、不对应任何数据块：
+              // 只用于比对内容，下载覆盖按已清理的 base 处理，合并时不读取它，也不会写进新提交
+              blobId: `purged-local-base:${entry.entryId}`,
+              contentHash: cachedFile.contentHash,
+              createdAt: entry.revision.createdAt,
+              revisionId: `purged-local-base:${entry.entryId}`,
+              size: cachedFile.size,
+            };
       const priorEntry: LiveEntry = {
         ...entry,
         path: cachedFile.path,
@@ -2311,6 +2556,26 @@ export class SyncService {
     }
   }
 
+  // 发布前总检查：新提交里引用的每个数据块，必须已被本次 CAS 所对的 Head 的快照引用，
+  // 或者是本次尝试新上传的。从本机缓存带出来的旧版本可能已被过期清理、数据块正被删除，
+  // 有了 Head CAS 的先后顺序，这条规则保证被删除的数据块不会再被引用回来
+  private assertCommitReferencesAcceptedOrUploaded(
+    head: VaultSnapshot,
+    entries: readonly VaultEntry[],
+    uploadedBlobIds: ReadonlySet<string>,
+  ): void {
+    const referenced = new Set(
+      Object.values(head.entries).flatMap((entry) => retainedRevisions(entry).map((revision) => revision.blobId)),
+    );
+    for (const entry of entries) {
+      for (const revision of retainedRevisions(entry)) {
+        if (!referenced.has(revision.blobId) && !uploadedBlobIds.has(revision.blobId)) {
+          throw new Error(`新提交引用了 ${entry.path} 一个不在远端当前记录里的版本，已停止发布。请重新同步。`);
+        }
+      }
+    }
+  }
+
   private assertRemotePathAvailable(
     snapshot: VaultSnapshot,
     entryId: string,
@@ -2348,7 +2613,10 @@ export class SyncService {
           this.exceedsAutomaticFileLimit(entry.path, revision.size))) {
           throw new Error(`完整校验超过了本设备的传输限制：${entry.path}。请连接 Wi-Fi 或在桌面端重试。`);
         }
-        await this.assertRemoteRecoveryForLocalContent(snapshot, check.entryId, check.contentHash);
+        // 与同步用同一判据：这份内容是本机已接受的 base，而远端当前记录里已没有同内容的 Revision
+        // （已被过期清理），这项恢复要求随之失效。之后的同步仍只在本机内容等于 base 时才覆盖
+        await this.assertRemoteRecoveryForLocalContent(snapshot, check.entryId, check.contentHash,
+          acceptedContentHash(this.buildReconciliationBase(await this.options.cache.load()), check.entryId));
       } else if (check.kind === "blob") {
         for (const entry of Object.values(snapshot.entries)) {
           for (const revision of retainedRevisions(entry).filter(revision => revision.blobId === check.blobId)) {
@@ -2389,10 +2657,15 @@ export class SyncService {
       : plan;
   }
 
+  // acceptedBaseContentHash 是这个 Entry 已接受的本机 base 内容。本机内容等于它、
+  // 而远端当前记录里已没有任何同内容的 Revision（旧版本已过期并被清理出记录）时，
+  // 不再要求远端恢复副本：被替换的本机旧字节由安全写入挪进本机回收站。
+  // 远端记录仍引用同内容的 Revision 时照旧逐个核实，读不到或校验失败仍是完整性错误。
   private async assertRemoteRecoveryForLocalContent(
     snapshot: VaultSnapshot,
     entryId: string,
     expectedContentHash: string | null,
+    acceptedBaseContentHash?: string,
   ): Promise<void> {
     if (expectedContentHash === null) {
       return;
@@ -2400,6 +2673,9 @@ export class SyncService {
     const entry = snapshot.entries[entryId];
     if (!entry) {
       throw new Error(`文件 ${entryId} 的本地内容在远端没有可用的恢复副本`);
+    }
+    if (acceptedContentPurgedFromRecord(entry, expectedContentHash, acceptedBaseContentHash)) {
+      return;
     }
     const revisions = retainedRevisions(entry).filter((revision) => revision.contentHash === expectedContentHash);
     for (const revision of revisions) {
@@ -2449,8 +2725,13 @@ export class SyncService {
     await this.options.onIntegrityVerified?.({kind: "blob", blobId: revision.blobId});
   }
 
+  // localContentHash 是本机要删的内容。删除不满 30 天必须有恢复副本，例外同不变量 9：
+  // 本机要删的正是这条删除记录的 lastContentHash，而远端当前记录里已没有同内容的 Revision
+  // （delete-edit 冲突的 base 已被清理、用户选了「保留删除」），这时照常删，旧字节进本地回收站。
+  // 记录里仍有同内容的 Revision 却没有恢复副本，说明记录本身有问题，照旧报错。
   private async assertRecoveryBeforeDelete(
     deleted: DeletedEntry,
+    localContentHash: string | null,
     serverDate: string,
   ): Promise<void> {
     const recoveryRequiredUntil = Date.parse(
@@ -2459,6 +2740,12 @@ export class SyncService {
     const serverTime = Date.parse(serverDate);
     if (serverTime < recoveryRequiredUntil) {
       if (!deleted.recovery) {
+        if (
+          localContentHash !== null &&
+          acceptedContentPurgedFromRecord(deleted, localContentHash, deleted.lastContentHash)
+        ) {
+          return;
+        }
         throw new Error(
           `已删除的文件 ${deleted.entryId} 缺少恢复副本`,
         );

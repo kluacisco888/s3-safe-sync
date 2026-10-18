@@ -264,4 +264,70 @@ describe("AwsS3ObjectStore", () => {
       "https://china-test-bucket.s3.cn-northwest-1.amazonaws.com.cn/integration/head",
     );
   });
+
+  const listingStore = (pages: string[], seen: URL[] = []) => new AwsS3ObjectStore({
+    accessKeyId: "test", secretAccessKey: "test", bucket: "example-bucket", region: "us-east-1",
+    execute: async request => {
+      const url = new URL(request.url);
+      seen.push(url);
+      const token = url.searchParams.get("continuation-token");
+      const page = pages[token === null ? 0 : Number(token)];
+      if (page === undefined) throw new Error(`Unexpected page ${token}`);
+      return { status: 200, headers: {}, body: new TextEncoder().encode(page) };
+    },
+  });
+
+  it("lists every page of objects with their LastModified as text and Size as a number", async () => {
+    const seen: URL[] = [];
+    const store = listingStore([
+      "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>1</NextContinuationToken>" +
+        "<Contents><Key>p/v1/blobs/0123</Key><LastModified>2026-09-05T01:02:03.000Z</LastModified><Size>1024</Size></Contents>" +
+        "<Contents><Key>p/v1/blobs/1e5</Key><LastModified>2026-09-06T00:00:00.000Z</LastModified><Size>0</Size></Contents>" +
+        "</ListBucketResult>",
+      "<ListBucketResult><IsTruncated>false</IsTruncated>" +
+        "<Contents><Key>p/v1/blobs/true</Key><LastModified>2026-09-07T00:00:00.000Z</LastModified><Size>7</Size></Contents>" +
+        "</ListBucketResult>",
+    ], seen);
+
+    await expect(store.listObjects("p/v1/blobs/")).resolves.toEqual([
+      { key: "p/v1/blobs/0123", lastModified: "2026-09-05T01:02:03.000Z", size: 1024 },
+      { key: "p/v1/blobs/1e5", lastModified: "2026-09-06T00:00:00.000Z", size: 0 },
+      { key: "p/v1/blobs/true", lastModified: "2026-09-07T00:00:00.000Z", size: 7 },
+    ]);
+    expect(seen.map(url => url.searchParams.get("prefix"))).toEqual(["p/v1/blobs/", "p/v1/blobs/"]);
+  });
+
+  it.each([
+    ["a truncated page without a continuation token", "<ListBucketResult><IsTruncated>true</IsTruncated>" +
+      "<Contents><Key>p/v1/blobs/a</Key><LastModified>2026-09-05T00:00:00.000Z</LastModified><Size>1</Size></Contents></ListBucketResult>"],
+    ["an object without LastModified", "<ListBucketResult><IsTruncated>false</IsTruncated>" +
+      "<Contents><Key>p/v1/blobs/a</Key><Size>1</Size></Contents></ListBucketResult>"],
+    ["an object with an unreadable LastModified", "<ListBucketResult><IsTruncated>false</IsTruncated>" +
+      "<Contents><Key>p/v1/blobs/a</Key><LastModified>yesterday</LastModified><Size>1</Size></Contents></ListBucketResult>"],
+    ["an object without a Size", "<ListBucketResult><IsTruncated>false</IsTruncated>" +
+      "<Contents><Key>p/v1/blobs/a</Key><LastModified>2026-09-05T00:00:00.000Z</LastModified></Contents></ListBucketResult>"],
+    ["an object with a negative Size", "<ListBucketResult><IsTruncated>false</IsTruncated>" +
+      "<Contents><Key>p/v1/blobs/a</Key><LastModified>2026-09-05T00:00:00.000Z</LastModified><Size>-1</Size></Contents></ListBucketResult>"],
+    ["an object without a Key", "<ListBucketResult><IsTruncated>false</IsTruncated>" +
+      "<Contents><LastModified>2026-09-05T00:00:00.000Z</LastModified><Size>1</Size></Contents></ListBucketResult>"],
+    ["a document that is not a listing", "<Error><Code>InternalError</Code></Error>"],
+  ])("refuses a listing with %s instead of returning a partial list", async (_name, page) => {
+    await expect(listingStore([page]).listObjects("p/v1/blobs/")).rejects.toThrow("列表");
+  });
+
+  it("sends DELETE for exactly the given key without a versionId, so a versioned bucket only adds a delete marker", async () => {
+    const requests: HttpRequestInput[] = [];
+    const store = new AwsS3ObjectStore({
+      accessKeyId: "test", secretAccessKey: "test", bucket: "example-bucket", region: "us-east-1",
+      execute: async request => { requests.push(request); return { status: 204, headers: {}, body: new Uint8Array() }; },
+    });
+
+    await store.delete("p/v1/blobs/0b6f3a52-5d0e-4c1b-9a7e-2f0d1c3b4a59");
+
+    expect(requests).toHaveLength(1);
+    const url = new URL(requests[0]!.url);
+    expect(requests[0]!.method).toBe("DELETE");
+    expect(url.pathname).toBe("/p/v1/blobs/0b6f3a52-5d0e-4c1b-9a7e-2f0d1c3b4a59");
+    expect([...url.searchParams.keys()]).toEqual([]);
+  });
 });

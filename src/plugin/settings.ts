@@ -5,9 +5,12 @@ import {
   Setting,
   type ButtonComponent,
   type TextComponent,
+  type ToggleComponent,
 } from "obsidian";
 
 import type { AwsCredentials } from "./credential-store";
+import type { ExpiredContentPreview } from "../sync/sync-service";
+import { MAX_BLOB_DELETIONS_PER_RUN, type BlobUsageSummary } from "../sync/unreferenced-blob-cleanup";
 import {
   DEFAULT_FULL_HASH_VERIFICATION_INTERVAL_DAYS,
   SUPPORTED_FULL_HASH_VERIFICATION_INTERVAL_DAYS,
@@ -46,6 +49,12 @@ export interface SyncStatusDisplay {
 }
 
 export interface SettingsController {
+  getPluginVersion(): string;
+  // 清理过期内容只在电脑上可用；手机上这一节不显示
+  isExpiredContentCleanupAvailable(): boolean;
+  isExpiredContentCleanupEnabled(): boolean;
+  previewExpiredContentCleanup(): Promise<ExpiredContentPreview>;
+  setExpiredContentCleanupEnabled(enabled: boolean, allDevicesUpdated: boolean): Promise<void>;
   openStatus(): void;
   getProgressLabel(): string | undefined;
   getSettings(): S3VaultSyncSettings;
@@ -69,6 +78,43 @@ const asPasswordInput = (component: TextComponent): TextComponent => {
   component.inputEl.autocapitalize = "none";
   component.inputEl.spellcheck = false;
   return component;
+};
+
+const twoDigits = (value: number): string => String(value).padStart(2, "0");
+
+/** 按本机时区显示日期 YYYY-MM-DD；无法解析时原样显示 */
+const formatLocalDate = (value: string): string => {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return value;
+  return `${date.getFullYear()}-${twoDigits(date.getMonth() + 1)}-${twoDigits(date.getDate())}`;
+};
+
+// 数据块大小只用于显示，按 1024 进位
+const formatBytes = (bytes: number): string =>
+  bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(1)} GB`
+    : bytes >= 1024 ** 2 ? `${(bytes / 1024 ** 2).toFixed(1)} MB`
+      : `${(bytes / 1024).toFixed(1)} KB`;
+
+// 上传月份 2026-09 → 2026 年 9 月
+const formatMonth = (month: string): string => {
+  const [year, value] = month.split("-");
+  return `${year} 年 ${Number(value)} 月`;
+};
+
+const blobSummary = (preview: ExpiredContentPreview): string => {
+  const { deletable, startingTomorrow } = preview.blobs;
+  if (deletable.count === 0 && startingTomorrow.count === 0) return "S3 上没有要删除的数据块。";
+  const waiting = startingTomorrow.count > 0
+    ? `另有 ${startingTomorrow.count} 个（${formatBytes(startingTomorrow.bytes)}）明天起删。` : "";
+  return `S3 上将删除 ${deletable.count} 个没人用的数据块（${formatBytes(deletable.bytes)}）。${waiting}` +
+    `每次最多删 ${MAX_BLOB_DELETIONS_PER_RUN} 个，剩下的之后再删；删掉的在 S3 版本控制里还能恢复 30 天。`;
+};
+
+const previewSummary = (preview: ExpiredContentPreview): string => {
+  const missing = preview.missingExpiry.length > 0
+    ? `另有 ${preview.missingExpiry.length} 项缺到期时间，不会清理。` : "";
+  return `将去掉 ${preview.removedRecoveries.length} 个已删除文件的恢复副本、${preview.removedHistory} 个过期旧版本。${missing}` +
+    `删除记录本身保留，冲突不动。${blobSummary(preview)}`;
 };
 
 const addVisibilityButton = (
@@ -335,6 +381,10 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
         });
       });
 
+    if (this.controller.isExpiredContentCleanupAvailable()) {
+      this.expiredContentCleanupSection();
+    }
+
     renderStatus = (): void => {
       const status = this.controller.getStatusText();
       const progressLabel = this.controller.getProgressLabel();
@@ -368,6 +418,99 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
     this.stopStatusUpdates?.();
     this.stopStatusUpdates = undefined;
     super.hide();
+  }
+
+  private expiredContentCleanupSection(): void {
+    const { containerEl } = this;
+    const enabled = this.controller.isExpiredContentCleanupEnabled();
+    let previewed = false;
+    let confirmed = false;
+    let enableToggle: ToggleComponent | undefined;
+    // 已打开时随时可以关；没打开时必须先看过预览、并确认所有设备都已更新
+    const updateEnableToggle = (): void => {
+      enableToggle?.setDisabled(!enabled && !(previewed && confirmed));
+    };
+    const previewSetting = new Setting(containerEl)
+      .setName("预览过期内容")
+      .setDesc("只读取远端记录，列出清理过期内容时会去掉什么，不做任何修改。")
+      .addButton((button) =>
+        button.setButtonText("预览").onClick(async () => {
+          button.setDisabled(true);
+          try {
+            const preview = await this.controller.previewExpiredContentCleanup();
+            previewSetting.setDesc(previewSummary(preview));
+            this.renderExpiredContentPreview(previewList, preview);
+            previewed = true;
+            updateEnableToggle();
+          } catch (error) {
+            previewSetting.setDesc(error instanceof Error ? error.message : "预览失败。请重试，或打开同步状态查看。");
+          } finally {
+            button.setDisabled(false);
+          }
+        }),
+      );
+    const previewList = containerEl.createDiv();
+    new Setting(containerEl)
+      .setName(`所有设备都已更新到 ${this.controller.getPluginVersion()} 或更高`)
+      .setDesc("没升级的设备在清理后可能卡在修复模式。请先在每台设备上把本插件更新到这个版本或更高，再打开清理。")
+      .addToggle((toggle) =>
+        toggle.setValue(false).onChange((value) => {
+          confirmed = value;
+          updateEnableToggle();
+        }),
+      );
+    const enableSetting = new Setting(containerEl)
+      .setName("启用清理过期内容")
+      .setDesc(
+        "只在本电脑上运行：每天最多一次，在一次完全成功的同步之后，先把已过恢复期的已删除文件恢复副本和过期旧版本从同步记录里去掉，" +
+        "再删除本仓库文件夹里没有任何记录引用、上传满 30 天、相隔至少 24 小时的两次检查都判定没人用的数据块，每次最多 200 个。删除记录本身保留，冲突不动。默认关闭。",
+      )
+      .addToggle((toggle) => {
+        enableToggle = toggle;
+        toggle.setValue(enabled).onChange(async (value) => {
+          try {
+            await this.controller.setExpiredContentCleanupEnabled(value, confirmed);
+            this.display();
+          } catch (error) {
+            enableSetting.setDesc(error instanceof Error ? error.message : "保存失败。请重试。");
+          }
+        });
+        updateEnableToggle();
+      });
+  }
+
+  private renderExpiredContentPreview(listEl: HTMLElement, preview: ExpiredContentPreview): void {
+    listEl.empty();
+    const { deletable, startingTomorrow } = preview.blobs;
+    if (preview.removedRecoveries.length === 0 && preview.removedHistory === 0 && preview.missingExpiry.length === 0 &&
+      deletable.count === 0 && startingTomorrow.count === 0) {
+      listEl.createEl("p", { text: "没有已过期的内容。" });
+      return;
+    }
+    if (preview.removedRecoveries.length > 0) {
+      listEl.createEl("p", { text: "将去掉恢复副本的已删除文件（按删除日期排序）：" });
+      const list = listEl.createEl("ul");
+      for (const removal of preview.removedRecoveries) {
+        list.createEl("li", { text: `${removal.path}（删除于 ${formatLocalDate(removal.deletedAt)}）` });
+      }
+    }
+    if (preview.missingExpiry.length > 0) {
+      listEl.createEl("p", { text: "缺到期时间、不会清理的项：" });
+      const list = listEl.createEl("ul");
+      for (const item of preview.missingExpiry) {
+        list.createEl("li", { text: `${item.path}（${item.kind === "recovery" ? "恢复副本" : "旧版本"}）` });
+      }
+    }
+    const months = (title: string, summary: BlobUsageSummary): void => {
+      if (summary.count === 0) return;
+      listEl.createEl("p", { text: title });
+      const list = listEl.createEl("ul");
+      for (const month of summary.byMonth) {
+        list.createEl("li", { text: `${formatMonth(month.month)}上传：${month.count} 个，${formatBytes(month.bytes)}` });
+      }
+    };
+    months("将删除的数据块（按上传月份）：", deletable);
+    months("明天起删（第一次判定没人用还不满 24 小时）：", startingTomorrow);
   }
 
   private textSetting(

@@ -4,8 +4,22 @@ import type { App } from "obsidian";
 const mocks = vi.hoisted(() => {
   class Element {
     classes = new Set<string>();
-    empty() {}
+    children: Element[] = [];
+    text = "";
+    empty() { this.children = []; }
     addClass(value: string) { this.classes.add(value); }
+    createEl(_tag: string, options: { text?: string } = {}) {
+      const child = new Element();
+      child.text = options.text ?? "";
+      this.children.push(child);
+      return child;
+    }
+    createDiv() {
+      const child = new Element();
+      this.children.push(child);
+      return child;
+    }
+    allText(): string[] { return [this.text, ...this.children.flatMap((child) => child.allText())].filter(Boolean); }
   }
 
   class TextComponent {
@@ -30,8 +44,13 @@ const mocks = vi.hoisted(() => {
   }
 
   class ToggleComponent {
-    setValue() { return this; }
-    onChange() { return this; }
+    value = false;
+    disabled = false;
+    private change: (value: boolean) => unknown = () => {};
+    setValue(value: boolean) { this.value = value; return this; }
+    setDisabled(value: boolean) { this.disabled = value; return this; }
+    onChange(callback: (value: boolean) => unknown) { this.change = callback; return this; }
+    async trigger(value: boolean) { this.value = value; await this.change(value); }
   }
 
   class DropdownComponent {
@@ -47,6 +66,7 @@ const mocks = vi.hoisted(() => {
     readonly settingEl = new Element();
     readonly texts: TextComponent[] = [];
     readonly buttons: ButtonComponent[] = [];
+    readonly toggles: ToggleComponent[] = [];
     constructor(_container: Element) { Setting.instances.push(this); }
     setName(value: string) { this.name = value; return this; }
     setDesc(value: string) { this.description = value; return this; }
@@ -63,7 +83,9 @@ const mocks = vi.hoisted(() => {
       return this;
     }
     addToggle(callback: (component: ToggleComponent) => void) {
-      callback(new ToggleComponent());
+      const component = new ToggleComponent();
+      this.toggles.push(component);
+      callback(component);
       return this;
     }
     addDropdown(callback: (component: DropdownComponent) => void) {
@@ -92,6 +114,15 @@ import {
   type SettingsController,
 } from "../src/plugin/settings";
 
+// 与清理过期内容无关的用例：这一节不显示
+const withoutCleanup = {
+  getPluginVersion: () => "0.1.9",
+  isExpiredContentCleanupAvailable: () => false,
+  isExpiredContentCleanupEnabled: () => false,
+  previewExpiredContentCleanup: async () => { throw new Error("unexpected preview"); },
+  setExpiredContentCleanupEnabled: async () => { throw new Error("unexpected toggle"); },
+};
+
 const findSetting = (name: string): InstanceType<typeof mocks.Setting> => {
   const setting = mocks.Setting.instances.find((candidate) => candidate.name === name);
   if (!setting) throw new Error(`Missing setting ${name}`);
@@ -119,6 +150,7 @@ describe("S3VaultSyncSettingsTab mobile credentials", () => {
       syncNow: async () => {},
       togglePause: async () => {},
       verifyAllFiles: async () => {},
+      ...withoutCleanup,
     };
     const tab = new S3VaultSyncSettingsTab({} as App, controller as never);
 
@@ -169,7 +201,7 @@ describe("S3VaultSyncSettingsTab mobile credentials", () => {
       getSettings: () => ({...DEFAULT_SETTINGS}), getStatusText: () => "Not configured",
       hasAwsCredentials: () => true, isVaultUnlocked: () => false, onStatusChange: () => () => {},
       saveAwsCredentials: async () => {}, saveSettings: async () => {}, syncNow: async () => {},
-      togglePause: async () => {}, verifyAllFiles: async () => {},
+      togglePause: async () => {}, verifyAllFiles: async () => {}, ...withoutCleanup,
     };
     const tab = new S3VaultSyncSettingsTab({} as App, controller as never);
     tab.display();
@@ -185,5 +217,109 @@ describe("S3VaultSyncSettingsTab mobile credentials", () => {
     expect(button.disabled).toBe(false);
     await button.click();
     expect(initializeOrUnlock).toHaveBeenNthCalledWith(2, "typed-password");
+  });
+});
+
+describe("S3VaultSyncSettingsTab expired content cleanup", () => {
+  beforeEach(() => {
+    mocks.Setting.instances = [];
+  });
+
+  const preview = {
+    missingExpiry: [{ kind: "history" as const, path: "notes/undated.md" }],
+    removedHistory: 7,
+    removedRecoveries: [
+      { deletedAt: "2026-08-01T10:00:00.000Z", path: "notes/older.md" },
+      { deletedAt: "2026-08-20T10:00:00.000Z", path: "notes/newer.md" },
+    ],
+    serverDate: "2026-10-18T10:00:00.000Z",
+    blobs: {
+      deletable: { bytes: 3 * 1024 * 1024 + 512 * 1024, count: 242, byMonth: [
+        { bytes: 512 * 1024, count: 241, month: "2026-09" },
+        { bytes: 3 * 1024 * 1024, count: 1, month: "2026-10" },
+      ] },
+      startingTomorrow: { bytes: 56 * 1024 * 1024, count: 302, byMonth: [{ bytes: 56 * 1024 * 1024, count: 302, month: "2026-08" }] },
+    },
+  };
+
+  const controllerWith = (overrides: Partial<SettingsController> = {}) => {
+    const controller = {
+      openStatus: () => {}, initializeOrUnlock: async () => {}, getProgressLabel: () => undefined,
+      getSettings: () => ({ ...DEFAULT_SETTINGS, vaultId: "vault-id" }), getStatusText: () => "空闲",
+      hasAwsCredentials: () => true, isVaultUnlocked: () => true, onStatusChange: () => () => {},
+      saveAwsCredentials: async () => {}, saveSettings: async () => {}, syncNow: async () => {},
+      togglePause: async () => {}, verifyAllFiles: async () => {},
+      getPluginVersion: () => "0.2.0",
+      isExpiredContentCleanupAvailable: () => true,
+      isExpiredContentCleanupEnabled: () => false,
+      previewExpiredContentCleanup: vi.fn(async () => preview),
+      setExpiredContentCleanupEnabled: vi.fn(async () => {}),
+      ...overrides,
+    } satisfies SettingsController;
+    const tab = new S3VaultSyncSettingsTab({} as App, controller as never);
+    tab.display();
+    return { controller, tab };
+  };
+
+  it("does not show the cleanup section on a phone", () => {
+    const { controller } = controllerWith({ isExpiredContentCleanupAvailable: () => false });
+    expect(mocks.Setting.instances.some((setting) => setting.name.includes("清理过期内容"))).toBe(false);
+    expect(controller.previewExpiredContentCleanup).not.toHaveBeenCalled();
+  });
+
+  it("keeps the switch off and locked until the preview is seen and every device is confirmed updated", async () => {
+    const { controller, tab } = controllerWith();
+    const enable = findSetting("启用清理过期内容").toggles[0]!;
+    const confirm = findSetting("所有设备都已更新到 0.2.0 或更高");
+    expect(confirm.description).toContain("没升级的设备在清理后可能卡在修复模式");
+    expect(enable.value).toBe(false);
+    expect(enable.disabled).toBe(true);
+
+    await confirm.toggles[0]!.trigger(true);
+    // 只勾选、没看过预览：仍不能打开
+    expect(enable.disabled).toBe(true);
+
+    await findSetting("预览过期内容").buttons[0]!.click();
+    expect(enable.disabled).toBe(false);
+    const listed = (tab.containerEl as unknown as InstanceType<typeof mocks.Element>).allText();
+    // 按删除日期排序，带本地日期
+    expect(listed.findIndex((line) => line.startsWith("notes/older.md"))).toBeLessThan(
+      listed.findIndex((line) => line.startsWith("notes/newer.md")));
+    expect(listed.some((line) => line.startsWith("notes/older.md（删除于 2026-08-0"))).toBe(true);
+    expect(listed.some((line) => line.startsWith("notes/undated.md"))).toBe(true);
+    expect(findSetting("预览过期内容").description).toContain("2 个已删除文件的恢复副本");
+    expect(findSetting("预览过期内容").description).toContain("7 个过期旧版本");
+    expect(findSetting("预览过期内容").description).toContain("1 项缺到期时间");
+    // 数据块：将删除的数量和大小按上传月份汇总，还没满 24 小时的单独列为「明天起删」
+    expect(findSetting("预览过期内容").description).toContain("S3 上将删除 242 个没人用的数据块（3.5 MB）");
+    expect(findSetting("预览过期内容").description).toContain("另有 302 个（56.0 MB）明天起删");
+    expect(findSetting("预览过期内容").description).toContain("每次最多删 200 个");
+    expect(listed).toContain("2026 年 9 月上传：241 个，512.0 KB");
+    expect(listed).toContain("2026 年 10 月上传：1 个，3.0 MB");
+    expect(listed.indexOf("明天起删（第一次判定没人用还不满 24 小时）：")).toBeGreaterThan(listed.indexOf("2026 年 10 月上传：1 个，3.0 MB"));
+    expect(listed).toContain("2026 年 8 月上传：302 个，56.0 MB");
+
+    await enable.trigger(true);
+    expect(controller.setExpiredContentCleanupEnabled).toHaveBeenCalledWith(true, true);
+  });
+
+  it("does not unlock the switch when the confirmation is withdrawn after the preview", async () => {
+    controllerWith();
+    const enable = findSetting("启用清理过期内容").toggles[0]!;
+    const confirm = findSetting("所有设备都已更新到 0.2.0 或更高").toggles[0]!;
+    await findSetting("预览过期内容").buttons[0]!.click();
+    await confirm.trigger(true);
+    expect(enable.disabled).toBe(false);
+    await confirm.trigger(false);
+    expect(enable.disabled).toBe(true);
+  });
+
+  it("lets an enabled cleanup be turned off without another preview", async () => {
+    const { controller } = controllerWith({ isExpiredContentCleanupEnabled: () => true });
+    const enable = findSetting("启用清理过期内容").toggles[0]!;
+    expect(enable.value).toBe(true);
+    expect(enable.disabled).toBe(false);
+    await enable.trigger(false);
+    expect(controller.setExpiredContentCleanupEnabled).toHaveBeenCalledWith(false, false);
   });
 });

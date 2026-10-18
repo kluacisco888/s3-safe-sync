@@ -18,6 +18,7 @@ const host = vi.hoisted((): {
   domEvents: Map<string, Array<() => void>>;
   mobile: boolean;
   android: boolean;
+  desktop: boolean;
   openedModals: Array<{close(): void}>;
 } => ({
   data: undefined,
@@ -28,6 +29,7 @@ const host = vi.hoisted((): {
   domEvents: new Map(),
   mobile: false,
   android: false,
+  desktop: false,
   openedModals: [],
 }));
 
@@ -48,7 +50,7 @@ vi.mock("obsidian", () => ({
       },
     })};
   },
-  Platform: { isDesktop: false, isDesktopApp: false, get isMobile() {return host.mobile;}, get isAndroidApp() {return host.android;} },
+  Platform: { isDesktop: false, get isDesktopApp() {return host.desktop;}, get isMobile() {return host.mobile;}, get isAndroidApp() {return host.android;} },
   Plugin: class {
     constructor(public app: unknown, public manifest: unknown) {}
     async loadData() { await host.beforeLoad?.(); return structuredClone(host.data); }
@@ -84,6 +86,8 @@ import { withVaultMutationLock } from "../src/plugin/safe-vault-write";
 import { SyncService, type LocalSyncIssue } from "../src/sync/sync-service";
 
 const cleanups: Array<() => Promise<void>> = [];
+// 数据块名和真实仓库一样是 UUID
+const ORIGINAL_BLOB_ID = "5f0c2b1a-8e3d-4c7f-9a6b-1d2e3f4a5b6c";
 
 const setup = async (initialized = true, configDir = ".obsidian", initialFile = {path: "notes/example.md", text: "Original article."}, loopback = false) => {
   vi.useFakeTimers();
@@ -96,7 +100,8 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
   host.beforeLoad = undefined;
   host.registrationCount = 0;
   host.domEvents.clear();
-  const objects = new Map<string, { body: Uint8Array; etag: string }>();
+  // lastModified：写入时的（假）时间，列表和读取都按它报 LastModified
+  const objects = new Map<string, { body: Uint8Array; etag: string; lastModified?: number }>();
   const diagnosticFiles = new Map<string, string>();
   let sequence = 0;
   const hooks: {
@@ -116,10 +121,12 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
     let status = 200;
     let body: Uint8Array = new Uint8Array();
     let etag: string | undefined;
+    let lastModified: number | undefined;
     if (request.method === "GET" && url.searchParams.has("list-type")) {
       const prefix = url.searchParams.get("prefix") ?? "";
       body = new TextEncoder().encode(`<ListBucketResult><IsTruncated>false</IsTruncated>${
-        [...objects.keys()].filter(k => k.startsWith(prefix)).map(k => `<Contents><Key>${k}</Key></Contents>`).join("")
+        [...objects].filter(([k]) => k.startsWith(prefix)).map(([k, v]) => `<Contents><Key>${k}</Key><LastModified>${
+          new Date(v.lastModified ?? Date.now()).toISOString()}</LastModified><Size>${v.body.byteLength}</Size></Contents>`).join("")
       }</ListBucketResult>`);
     } else if (request.method === "GET") {
       if (key.includes("/blobs/")) hooks.beforeBlobRead?.();
@@ -127,6 +134,7 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
       status = stored ? 200 : 404;
       body = stored?.body ?? body;
       etag = stored?.etag;
+      lastModified = stored?.lastModified;
       if (key.endsWith("/head") && hooks.headFailure) {
         status = hooks.headFailure === "network" ? 503 : hooks.headFailure === "forbidden" ? 403 : 200;
         body = new TextEncoder().encode("invalid remote response");
@@ -141,7 +149,7 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
         status = 412;
       } else {
         etag = `"etag-${++sequence}"`;
-        objects.set(key, { body: new Uint8Array(request.body ?? new ArrayBuffer(0)), etag });
+        objects.set(key, { body: new Uint8Array(request.body ?? new ArrayBuffer(0)), etag, lastModified: Date.now() });
       }
     } else if (request.method === "DELETE") {
       objects.delete(key);
@@ -153,7 +161,7 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
     if (request.method === "PUT" && key.endsWith("/head") && status === 200) hooks.afterHeadPut?.();
     return {
       arrayBuffer: body.slice().buffer,
-      headers: { date: new Date().toUTCString(), "last-modified": new Date().toUTCString(), ...(etag ? { etag } : {}) },
+      headers: { date: new Date().toUTCString(), "last-modified": new Date(lastModified ?? Date.now()).toUTCString(), ...(etag ? { etag } : {}) },
       status,
     };
   });
@@ -227,11 +235,11 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
     prefix: "test-prefix", vaultKey,
   });
   const initialBytes = new TextEncoder().encode(initialFile.text);
-  await remote.writeBlob("original-blob", initialBytes);
+  await remote.writeBlob(ORIGINAL_BLOB_ID, initialBytes);
   const entry = {
     entryId: "entry-1", kind: "live" as const, path: initialFile.path,
     revision: {
-      blobId: "original-blob", contentHash: "", createdAt: new Date().toUTCString(),
+      blobId: ORIGINAL_BLOB_ID, contentHash: "", createdAt: new Date().toUTCString(),
       revisionId: "revision-1", size: initialBytes.byteLength,
     },
   };
@@ -308,6 +316,7 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   host.mobile = false;
   host.android = false;
+  host.desktop = false;
   host.requestUrl.mockClear();
   vi.clearAllTimers();
   vi.useRealTimers();
@@ -1301,6 +1310,344 @@ describe("opening sync status when synchronization stops", () => {
     expect(host.openedModals).toHaveLength(2);
     await plugin.syncNow();
     expect(host.openedModals).toHaveLength(2);
+    plugin.onunload();
+  });
+});
+
+describe("expired content cleanup on the desktop", () => {
+  // 远端多一条已删除记录，它的恢复副本早已过期
+  const addExpiredRecovery = async (remote: RemoteStore) => {
+    const body = new TextEncoder().encode("long gone");
+    const blobId = crypto.randomUUID();
+    await remote.writeBlob(blobId, body);
+    const { sha256Content } = await import("../src/sync/content-hash");
+    const head = (await remote.readHead())!;
+    const commitId = crypto.randomUUID();
+    await remote.advance({
+      commit: { changes: [{ kind: "set-entry", entry: {
+        deletedAt: "2020-01-01T00:00:00.000Z", entryId: "gone", kind: "deleted", lastContentHash: await sha256Content(body),
+        lastRevisionId: "gone-revision", path: "old/gone.md",
+        recovery: { blobId, contentHash: await sha256Content(body), createdAt: "2020-01-01T00:00:00.000Z",
+          expiresAt: "2020-01-31T00:00:00.000Z", revisionId: "gone-revision", size: body.byteLength },
+      } }], commitId, createdAt: head.serverDate, parentIds: [head.value.commitId], protocolVersion: 1,
+      replicaId: "phone", vaultId: "vault-1" },
+      expectedHeadEtag: head.etag,
+      head: { ...head.value, commitId, generation: head.value.generation + 1 },
+    });
+  };
+
+  // 数据块删除接在清理提交之后，不运行的条件相同：连一次检查都没做过
+  const blobsUnchecked = () => (host.data as {unreferencedBlobMarks?: unknown}).unreferencedBlobMarks === undefined;
+
+  const goneRecovery = async (remote: RemoteStore) => {
+    const head = (await remote.readHead())!;
+    const entry = (await remote.readSnapshot(head.value)).entries.gone;
+    return { generation: head.value.generation, recovery: entry?.kind === "deleted" ? entry.recovery : undefined };
+  };
+
+  const enabledDesktop = async () => {
+    host.desktop = true;
+    const fixture = await setup();
+    await addExpiredRecovery(fixture.remote);
+    fixture.objects.set("test-prefix/v1/blobs/3c9a7e10-2b4d-4f6a-8c1e-5d7f9a0b2c4e",
+      { body: new Uint8Array(8), etag: "\"orphan\"", lastModified: Date.now() - 40 * 24 * 60 * 60 * 1000 });
+    await fixture.plugin.previewExpiredContentCleanup();
+    await fixture.plugin.setExpiredContentCleanupEnabled(true, true);
+    return fixture;
+  };
+
+  it("cannot be turned on before a preview or without confirming every device is updated", async () => {
+    host.desktop = true;
+    const { plugin, remote } = await setup();
+    await addExpiredRecovery(remote);
+    await expect(plugin.setExpiredContentCleanupEnabled(true, true)).rejects.toThrow("请先预览");
+    const preview = await plugin.previewExpiredContentCleanup();
+    expect(preview.removedRecoveries).toEqual([{ deletedAt: "2020-01-01T00:00:00.000Z", path: "old/gone.md" }]);
+    await expect(plugin.setExpiredContentCleanupEnabled(true, false)).rejects.toThrow("所有设备");
+    expect(plugin.isExpiredContentCleanupEnabled()).toBe(false);
+    await plugin.setExpiredContentCleanupEnabled(true, true);
+    expect(plugin.isExpiredContentCleanupEnabled()).toBe(true);
+    plugin.onunload();
+  });
+
+  it("cleans once after a complete sync, records counts without paths, and waits a day before the next run", async () => {
+    const { plugin, remote } = await enabledDesktop();
+    expect(plugin.isExpiredContentCleanupAvailable()).toBe(true);
+
+    await plugin.togglePause();
+
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+    const after = await goneRecovery(remote);
+    expect(after.recovery).toBeUndefined();
+    // 已删除列表不再有它
+    expect(plugin.getDeletedRecoveries()).toEqual([]);
+    const record = plugin.getDiagnostics().records.at(-1)!;
+    expect(record.expiredContentCleanup).toEqual({ at: expect.any(Number), removedHistory: 0, removedRecoveries: 1 });
+    expect(plugin.exportDiagnostics()).not.toContain("old/gone.md");
+    // 同一天再同步：不再清理
+    await addExpiredRecovery(remote);
+    const generation = (await goneRecovery(remote)).generation;
+    await plugin.syncNow();
+    expect(await goneRecovery(remote)).toMatchObject({ generation, recovery: expect.anything() });
+    expect(plugin.getDiagnostics().records.at(-1)!.expiredContentCleanup).toBeUndefined();
+    // 过了 24 小时（AWS 时间）再同步：再清理一次
+    vi.setSystemTime(Date.now() + 25 * 60 * 60 * 1000);
+    await plugin.syncNow();
+    expect((await goneRecovery(remote)).recovery).toBeUndefined();
+    plugin.onunload();
+  });
+
+  it("neither shows nor runs on a phone even when the stored switch is on", async () => {
+    const { plugin, remote } = await enabledDesktop();
+    host.desktop = false;
+    expect(plugin.isExpiredContentCleanupAvailable()).toBe(false);
+    await expect(plugin.previewExpiredContentCleanup()).rejects.toThrow("电脑");
+    await expect(plugin.setExpiredContentCleanupEnabled(true, true)).rejects.toThrow("电脑");
+
+    await plugin.togglePause();
+
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+    expect((await goneRecovery(remote)).recovery).toBeDefined();
+    expect(blobsUnchecked()).toBe(true);
+    plugin.onunload();
+  });
+
+  it("does not run when the sync needs a Bulk Deletion decision", async () => {
+    const { plugin, remote, setLocalPresent } = await enabledDesktop();
+    setLocalPresent(false);
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
+    expect((await goneRecovery(remote)).recovery).toBeDefined();
+    expect(blobsUnchecked()).toBe(true);
+    plugin.onunload();
+  });
+
+  it("does not run while a Conflict waits for the user, since the sync is not complete", async () => {
+    const { plugin, remote } = await enabledDesktop();
+    const head = (await remote.readHead())!;
+    const commitId = crypto.randomUUID();
+    const body = new TextEncoder().encode("candidate");
+    await remote.writeBlob("candidate-blob", body);
+    const { sha256Content } = await import("../src/sync/content-hash");
+    await remote.advance({
+      commit: { changes: [{ kind: "set-entry", entry: { candidates: [{ blobId: "candidate-blob",
+        contentHash: await sha256Content(body), createdAt: head.serverDate, revisionId: "candidate", size: body.byteLength }],
+        entryId: "conflict", kind: "conflicted", path: "other/conflict.md", reason: "edit-edit" } }],
+      commitId, createdAt: head.serverDate, parentIds: [head.value.commitId], protocolVersion: 1, replicaId: "phone", vaultId: "vault-1" },
+      expectedHeadEtag: head.etag, head: { ...head.value, commitId, generation: head.value.generation + 1 },
+    });
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
+    expect((await goneRecovery(remote)).recovery).toBeDefined();
+    expect(blobsUnchecked()).toBe(true);
+    plugin.onunload();
+  });
+
+  it("does not run after a sync that failed on the network", async () => {
+    const { plugin, remote, hooks } = await enabledDesktop();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    hooks.headFailure = undefined;
+    expect(plugin.getStatusText()).not.toMatch(/^空闲：/u);
+    expect((await goneRecovery(remote)).recovery).toBeDefined();
+    expect(blobsUnchecked()).toBe(true);
+    plugin.onunload();
+  });
+
+  it("does not run in Repair Mode with an integrity check left to recheck", async () => {
+    const { plugin, remote, hooks } = await enabledDesktop();
+    hooks.headFailure = "corrupt";
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：修复模式/u);
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：修复模式/u);
+    hooks.headFailure = undefined;
+    expect((await goneRecovery(remote)).recovery).toBeDefined();
+    expect(blobsUnchecked()).toBe(true);
+    plugin.onunload();
+  });
+
+  it("does not run when the remote Head does not exist", async () => {
+    const { plugin, objects } = await enabledDesktop();
+    const puts = () => host.requestUrl.mock.calls.filter(([request]) => (request as {method: string}).method === "PUT").length;
+    objects.delete("test-prefix/v1/head");
+    const before = puts();
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：修复模式/u);
+    expect(objects.has("test-prefix/v1/head")).toBe(false);
+    expect(puts()).toBe(before);
+    expect(blobsUnchecked()).toBe(true);
+    plugin.onunload();
+  });
+});
+
+describe("expired content cleanup that keeps losing the Head race", () => {
+  it("gives up quietly after the retries and tries again after the next sync", async () => {
+    host.desktop = true;
+    const { plugin } = await setup();
+    await plugin.previewExpiredContentCleanup();
+    await plugin.setExpiredContentCleanupEnabled(true, true);
+    const { HeadChangedError } = await import("../src/storage/remote-store");
+    const cleanup = vi.spyOn(SyncService.prototype, "cleanupExpiredContent").mockRejectedValue(new HeadChangedError());
+
+    // 重试之间的等待用的是假计时器，一点点往前拨直到这次同步结束。同步里的加密运算走真实线程，假时钟管不到：
+    // 机器忙时一口气拨完，加密还没做完，重试的等待就落在拨完之后、再没人拨。所以每拨 50 毫秒都真等 1 毫秒让加密跑完；
+    // 拨满 100 秒（远超最长约 7.5 秒的重试等待，又不到 120 秒的定时同步）还没结束就直接报错，不干等到超时
+    const settle = async (run: Promise<void>) => {
+      let done = false;
+      void run.finally(() => { done = true; });
+      for (let step = 0; !done; step++) {
+        if (step >= 2_000) throw new Error("同步一直没有结束");
+        await vi.advanceTimersByTimeAsync(50);
+        if (!done) await realDelay(1);
+      }
+      await run;
+    };
+    // 无论成败都撤掉模拟失败，免得后面启用清理的测试也一直抢不到记录
+    try {
+      await settle(plugin.togglePause());
+
+      expect(cleanup).toHaveBeenCalledTimes(5);
+      expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+      expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({ outcome: "complete" });
+      expect(plugin.getDiagnostics().records.at(-1)!.expiredContentCleanup).toBeUndefined();
+      await settle(plugin.syncNow());
+      expect(cleanup).toHaveBeenCalledTimes(10);
+    } finally {
+      cleanup.mockRestore();
+    }
+    plugin.onunload();
+  });
+});
+
+describe("unreferenced blob deletion on the desktop", () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const ORPHANS = ["3c9a7e10-2b4d-4f6a-8c1e-5d7f9a0b2c4e", "7e1d2c3b-4a5f-4b6c-8d7e-9f0a1b2c3d4e", "a0b1c2d3-e4f5-4a6b-9c7d-8e9f0a1b2c3d"];
+  const blobKeyOf = (blobId: string) => `test-prefix/v1/blobs/${blobId}`;
+  type Objects = Map<string, { body: Uint8Array; etag: string; lastModified?: number }>;
+  type StoredMarks = { unreferencedBlobMarks?: { target: string; firstSeen: Record<string, string> } };
+  // 40 天前上传、没有任何记录引用的数据块（早于 Head 对象的 LastModified）
+  const plant = (objects: Objects, blobIds = [ORPHANS[0]!]) => {
+    for (const blobId of blobIds) {
+      objects.set(blobKeyOf(blobId), { body: new Uint8Array(1234), etag: `"orphan-${blobId}"`, lastModified: Date.now() - 40 * DAY_MS });
+    }
+  };
+  const deletes = () => host.requestUrl.mock.calls.map(([request]) => request as { method: string; url: string })
+    .filter((request) => request.method === "DELETE");
+  // AWS 时间（假 S3 的 date 头）和设备时间一起往前拨，满 24 小时
+  const nextDay = () => vi.setSystemTime(Date.now() + 25 * 60 * 60 * 1000);
+  const enabled = async (blobIds?: string[]) => {
+    host.desktop = true;
+    const fixture = await setup();
+    plant(fixture.objects, blobIds);
+    await fixture.plugin.previewExpiredContentCleanup();
+    await fixture.plugin.setExpiredContentCleanupEnabled(true, true);
+    return fixture;
+  };
+
+  it("deletes an old unreferenced blob on a later daily run, without a versionId, and records only counts", async () => {
+    const { plugin, objects } = await enabled();
+
+    // 第一次：只记下第一次判定，不删
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(true);
+    expect(deletes()).toEqual([]);
+    expect(plugin.getDiagnostics().records.at(-1)!.blobCleanup).toEqual({ deletedBlobs: 0, deletedBytes: 0 });
+    expect((host.data as StoredMarks).unreferencedBlobMarks?.firstSeen).toHaveProperty(ORPHANS[0]!);
+
+    nextDay();
+    await plugin.syncNow();
+
+    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(false);
+    expect(deletes()).toHaveLength(1);
+    const url = new URL(deletes()[0]!.url);
+    expect(url.pathname).toBe(`/${blobKeyOf(ORPHANS[0]!)}`);
+    expect([...url.searchParams.keys()]).toEqual([]);
+    expect(plugin.getDiagnostics().records.at(-1)!.blobCleanup).toEqual({ deletedBlobs: 1, deletedBytes: 1234 });
+    expect(plugin.exportDiagnostics()).not.toContain(ORPHANS[0]!);
+    // 删除后再同步：读 Head 的存在性检查照常通过
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+    plugin.onunload();
+  });
+
+  it("never checks or deletes blobs on a phone, even with a first judgment already recorded", async () => {
+    const { plugin, objects } = await enabled();
+    await plugin.togglePause();
+    host.desktop = false;
+    nextDay();
+
+    await plugin.syncNow();
+
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(true);
+    expect(deletes()).toEqual([]);
+    plugin.onunload();
+  });
+
+  it.each(["bucket", "region", "prefix"] as const)("sends no further DELETE once the %s changes during the run", async (field) => {
+    const { plugin, objects } = await enabled(ORPHANS);
+    await plugin.togglePause();
+    nextDay();
+    const execute = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;
+    host.requestUrl.mockImplementation(async (request: Parameters<ObsidianRequestExecutor>[0]) => {
+      const response = await execute(request);
+      if (request.method === "DELETE") plugin.getSettings()[field] = field === "region" ? "eu-west-1" : `other-${field}`;
+      return response;
+    });
+
+    await plugin.syncNow();
+
+    expect(deletes()).toHaveLength(1);
+    expect(ORPHANS.filter((blobId) => objects.has(blobKeyOf(blobId)))).toHaveLength(2);
+    expect(plugin.getStatusText()).toContain("S3 目标被改了");
+    plugin.onunload();
+  });
+
+  const markChanges: Array<[string, (data: StoredMarks) => void]> = [
+    ["is lost", (data: StoredMarks) => { delete data.unreferencedBlobMarks; }],
+    ...(["bucket", "region", "prefix", "vaultId"] as const).map((field, index): [string, (data: StoredMarks) => void] => [
+      `belongs to another ${field}`,
+      (data: StoredMarks) => {
+        // 记录绑定 [桶, 区域, 前缀, vaultId]
+        const target = JSON.parse(data.unreferencedBlobMarks!.target) as string[];
+        target[index] = `other-${field}`;
+        data.unreferencedBlobMarks!.target = JSON.stringify(target);
+      },
+    ]),
+  ];
+  it.each(markChanges)("restarts the 24-hour wait when the local first-judgment record %s", async (_name, change) => {
+    const { plugin, app, objects } = await enabled();
+    await plugin.togglePause();
+    plugin.onunload();
+    change(host.data as StoredMarks);
+    const replacement = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
+    await replacement.onload();
+    await replacement.previewExpiredContentCleanup();
+    await replacement.setExpiredContentCleanupEnabled(true, true);
+
+    nextDay();
+    await replacement.syncNow();
+    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(true);
+    expect(deletes()).toEqual([]);
+    nextDay();
+    await replacement.syncNow();
+    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(false);
+    replacement.onunload();
+  });
+
+  it("deletes nothing and reports it when the blob folder holds an unexpected name", async () => {
+    const { plugin, objects } = await enabled();
+    await plugin.togglePause();
+    nextDay();
+    objects.set("test-prefix/v1/blobs/not-a-uuid", { body: new Uint8Array(1), etag: "\"stray\"", lastModified: Date.now() - 40 * DAY_MS });
+
+    await plugin.syncNow();
+
+    expect(deletes()).toEqual([]);
+    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(true);
+    expect(plugin.getStatusText()).toContain("这次不删除任何数据块");
     plugin.onunload();
   });
 });

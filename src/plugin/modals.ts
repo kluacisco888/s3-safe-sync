@@ -98,6 +98,41 @@ const conflictReasonLabels: Record<ConflictedEntry["reason"], string> = {
   "edit-edit": "本地和远端都有修改",
 };
 
+// 下面几项只用于显示，按设备时间判断；恢复操作仍按 AWS 时间判断 30 天期限。
+// 与恢复规则一致：没有到期时间的版本不算过期。
+const isUnexpired = (revision: RevisionRef, now: number): boolean =>
+  revision.expiresAt === undefined || Date.parse(revision.expiresAt) > now;
+
+/** 已删除文件里仍未过期的可恢复内容（恢复副本和历史版本） */
+const unexpiredRecoveries = (entry: DeletedEntry, now: number): RevisionRef[] =>
+  [...(entry.recovery ? [entry.recovery] : []), ...(entry.history ?? [])]
+    .filter(revision => isUnexpired(revision, now));
+
+const twoDigits = (value: number): string => String(value).padStart(2, "0");
+
+/** 按本机时区显示为 YYYY-MM-DD HH:mm；无法解析时原样显示 */
+const formatLocalTime = (value: string): string => {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return value;
+  return `${date.getFullYear()}-${twoDigits(date.getMonth() + 1)}-${twoDigits(date.getDate())} ${twoDigits(date.getHours())}:${twoDigits(date.getMinutes())}`;
+};
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** 剩余天数向下取整，不足 1 天单独说明 */
+const formatDaysLeft = (expiresAt: number, now: number): string => {
+  const days = Math.floor((expiresAt - now) / DAY_MS);
+  return days < 1 ? "不到 1 天" : `还剩 ${days} 天`;
+};
+
+/** 已删除列表每行的说明：删除时间，以及最晚一项可恢复内容的剩余天数 */
+const deletedRowSummary = (entry: DeletedEntry, now: number): string => {
+  const deadlines = unexpiredRecoveries(entry, now)
+    .flatMap(revision => revision.expiresAt === undefined ? [] : [Date.parse(revision.expiresAt)]);
+  const deletedAt = `删除于 ${formatLocalTime(entry.deletedAt)}`;
+  return deadlines.length === 0 ? deletedAt : `${deletedAt} · ${formatDaysLeft(Math.max(...deadlines), now)}`;
+};
+
 const renderIssueGuidance = (container: HTMLElement, issue: LocalSyncIssue): void => {
   const detail = container.createEl("details");
   detail.createEl("summary", {text: "为什么需要处理"});
@@ -266,7 +301,7 @@ class DeletedFilePreviewModal extends Modal {
       cls: "s3-vault-sync-muted",
       text: `${this.revision.size} 字节${
         this.revision.expiresAt
-          ? ` · 可恢复至 ${this.revision.expiresAt}`
+          ? ` · 可恢复至 ${formatLocalTime(this.revision.expiresAt)}`
           : ""
       }`,
     });
@@ -503,13 +538,16 @@ export class StatusModal extends Modal {
   }
 
   private renderDeletedRecoveries(container: HTMLElement): void {
-    const deleted = this.controller.getDeletedRecoveries();
+    const now = Date.now();
+    const deleted = this.controller.getDeletedRecoveries()
+      .filter(entry => unexpiredRecoveries(entry, now).length > 0);
     if (deleted.length === 0) {
       return;
     }
     container.createEl("h3", { text: "已删除的文件（30 天内可恢复）" });
     for (const entry of deleted) {
-      const recovery = entry.recovery;
+      // 恢复副本已过期时按不可用处理，只提供历史版本
+      const recovery = entry.recovery && isUnexpired(entry.recovery, now) ? entry.recovery : undefined;
       const item = container.createDiv({ cls: "s3-vault-sync-deleted-row" });
       const previewTarget = item.createDiv({
         cls: "s3-vault-sync-deleted-preview",
@@ -517,6 +555,10 @@ export class StatusModal extends Modal {
       previewTarget.createDiv({
         cls: "s3-vault-sync-selectable-path",
         text: entry.path,
+      });
+      previewTarget.createDiv({
+        cls: "s3-vault-sync-muted",
+        text: deletedRowSummary(entry, now),
       });
       previewTarget.createDiv({
         cls: "s3-vault-sync-muted",
@@ -720,7 +762,7 @@ export class VersionHistoryModal extends Modal {
     this.contentEl.createEl("p", {text: "被替换或手动选择后保留下来的版本可在 30 天内恢复。恢复前请先预览；恢复时也会保留当前版本。"});
     for (const revision of history) {
       const row = this.contentEl.createDiv({ cls: "s3-vault-sync-history" });
-      row.createSpan({ text: `版本记录时间：${revision.createdAt} · ${revision.size} 字节${revision.expiresAt ? ` · 可恢复至 ${revision.expiresAt}` : ""}` });
+      row.createSpan({ text: `版本记录时间：${revision.createdAt} · ${revision.size} 字节${revision.expiresAt ? ` · 可恢复至 ${formatLocalTime(revision.expiresAt)}` : ""}` });
       row.createEl("button", {text: "预览"}).addEventListener("click", () => {
         new DeletedFilePreviewModal(this.app, this.entry, revision,
           () => this.controller.readHistoricalRevision(this.entry.entryId, revision.revisionId), "历史版本预览").open();

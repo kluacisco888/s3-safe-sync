@@ -4,6 +4,7 @@ import { SignatureV4 } from "@smithy/signature-v4";
 import { XMLParser } from "fast-xml-parser";
 
 import {
+  type ListedObject,
   type ObjectGetOptions,
   ObjectPreconditionError,
   type ObjectPutOptions,
@@ -161,6 +162,48 @@ const throwIfPreconditionFailed = (response: HttpResponseOutput): void => {
   if (response.status === 409 || response.status === 412) {
     throw new ObjectPreconditionError();
   }
+};
+
+const incompleteListing = (detail: string): Error =>
+  new Error(`AWS S3 返回的对象列表不完整：${detail}`);
+
+// 带 LastModified 和大小的 ListObjectsV2 结果；任何一项读不懂就整页作废
+const readDetailedListResult = (value: unknown): {
+  nextContinuationToken?: string;
+  objects: ListedObject[];
+} => {
+  if (typeof value !== "object" || value === null || !("ListBucketResult" in value)) {
+    throw incompleteListing("不是 ListObjectsV2 文档");
+  }
+  const root = (value as Record<string, unknown>)["ListBucketResult"];
+  if (typeof root !== "object" || root === null) {
+    throw incompleteListing("ListObjectsV2 结果无效");
+  }
+  const document = root as Record<string, unknown>;
+  const contents = document["Contents"] ?? [];
+  const items = Array.isArray(contents) ? contents : [contents];
+  const objects = items.map((item): ListedObject => {
+    if (typeof item !== "object" || item === null) throw incompleteListing("有一项无法读取");
+    const record = item as Record<string, unknown>;
+    const key = record["Key"];
+    const lastModified = record["LastModified"];
+    const rawSize = record["Size"];
+    if (typeof key !== "string" || key === "") throw incompleteListing("有一项缺少对象名");
+    if (typeof lastModified !== "string" || !Number.isFinite(Date.parse(lastModified))) {
+      throw incompleteListing("有一项缺少可读的 LastModified");
+    }
+    const size = typeof rawSize === "string" && /^\d+$/u.test(rawSize) ? Number(rawSize) : Number.NaN;
+    if (!Number.isSafeInteger(size)) throw incompleteListing("有一项缺少可读的大小");
+    return { key, lastModified, size };
+  });
+  const truncated = document["IsTruncated"];
+  const token = document["NextContinuationToken"];
+  if (truncated === "true") {
+    if (typeof token !== "string" || token === "") throw incompleteListing("还有下一页，但没有给出续页标记");
+    return { nextContinuationToken: token, objects };
+  }
+  if (truncated !== undefined && truncated !== "false") throw incompleteListing("无法判断是否还有下一页");
+  return { objects };
 };
 
 export class AwsS3ObjectStore implements ObjectStore {
@@ -346,6 +389,32 @@ export class AwsS3ObjectStore implements ObjectStore {
       continuationToken = result.nextContinuationToken;
     } while (continuationToken);
     return keys;
+  }
+
+  async listObjects(prefix: string): Promise<ListedObject[]> {
+    const objects: ListedObject[] = [];
+    let continuationToken: string | undefined;
+    do {
+      const query: Record<string, string> = {
+        "list-type": "2",
+        prefix,
+      };
+      if (continuationToken) {
+        query["continuation-token"] = continuationToken;
+      }
+      const response = await this.request("GET", "/", undefined, { "cache-control": "no-cache" }, query);
+      if (response.status !== 200) {
+        this.throwResponseError(response, `列出 ${prefix}`);
+      }
+      // 所有值按文本读：默认解析会把 0123、1e5、true 这类名字和大小转成数字或布尔值
+      const parsed = new XMLParser({ parseTagValue: false }).parse(
+        new TextDecoder().decode(response.body),
+      ) as unknown;
+      const result = readDetailedListResult(parsed);
+      objects.push(...result.objects);
+      continuationToken = result.nextContinuationToken;
+    } while (continuationToken);
+    return objects;
   }
 
   async put(

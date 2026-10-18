@@ -41,7 +41,8 @@ const fixture = async () => {
   vi.stubGlobal("navigator", {});
   const data = new Map<string, StoredObject>(); let sequence = 0;
   const objects: ObjectStore = {
-    get: async key => data.get(key), list: async prefix => [...data.keys()].filter(key => key.startsWith(prefix)), delete: async key => {data.delete(key);},
+    get: async key => data.get(key), list: async prefix => [...data.keys()].filter(key => key.startsWith(prefix)),
+      listObjects: async prefix => [...data].filter(([key]) => key.startsWith(prefix)).map(([key, value]) => ({key, lastModified: value.lastModified, size: value.body.byteLength})), delete: async key => {data.delete(key);},
     put: async (key, body) => {const value = {body, etag: `"test-${++sequence}"`, lastModified: "Fri, 18 Sep 2026 00:00:00 GMT"}; data.set(key, value); return value;},
   };
   const vaultKey = new Uint8Array(32);

@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { App } from "obsidian";
+import type { DeletedEntry } from "../src/sync/sync-engine";
 
 const { Element, opened, dropdowns } = vi.hoisted(() => {
   class Element {
@@ -12,6 +13,7 @@ const { Element, opened, dropdowns } = vi.hoisted(() => {
     constructor(readonly tag: string) {}
     empty() { this.children = []; }
     addClass() {}
+    setAttr() {}
     addEventListener(name: string, handler: () => void) { this.events.set(name, handler); }
     setText(text: string) { this.text = text; }
     createEl(tag: string, options: { text?: string } = {}) {
@@ -71,6 +73,14 @@ const reviewActions = {
 };
 
 describe("StatusModal", () => {
+  // 时间按本机时区显示，测试固定用上海时区（UTC+8）
+  const originalTimeZone = process.env.TZ;
+  beforeAll(() => {process.env.TZ = "Asia/Shanghai";});
+  afterAll(() => {
+    if (originalTimeZone === undefined) delete process.env.TZ;
+    else process.env.TZ = originalTimeZone;
+  });
+
   it.each([true, false])("exports the diagnostic payload when clipboard availability is %s", async available => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     vi.stubGlobal("navigator", available ? {clipboard: {writeText}} : {});
@@ -178,7 +188,7 @@ describe("StatusModal", () => {
     type FakeElement = InstanceType<typeof Element>;
     const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
     const nodes = all(modal.contentEl as unknown as FakeElement);
-    expect(nodes.some(node => node.text.includes("可恢复至 2026-10-18T10:00:00Z"))).toBe(true);
+    expect(nodes.some(node => node.text.includes("可恢复至 2026-10-18 18:00"))).toBe(true);
     nodes.find(node => node.text === "预览")!.events.get("click")!();
     const preview = opened.at(-1)!;
     await vi.waitFor(() => expect(all(preview.contentEl).some(node => node.text === "unsynced draft")).toBe(true));
@@ -588,6 +598,67 @@ describe("StatusModal", () => {
       confirm.events.get("click")!();
       expect(resolvePossibleRename).toHaveBeenCalledWith({kind: "moves", reviewToken: "review-2",
         pairs: [{fromPath: "old/a.pdf", toPath: "new/x.pdf"}, {fromPath: "old/b.pdf", toPath: "new/y.pdf"}]});
+    });
+  });
+
+  describe("deleted files list", () => {
+    type FakeElement = InstanceType<typeof Element>;
+    const all = (root: FakeElement): FakeElement[] => [root, ...root.children.flatMap(all)];
+    const revision = (id: string, expiresAt: string) => ({revisionId: id, blobId: `${id}-blob`, contentHash: `${id}-hash`,
+      size: 5, createdAt: "2026-09-01T00:00:00Z", expiresAt});
+    // 设备时间 2026-10-18 10:00（上海时区），只影响显示
+    const now = "2026-10-18T02:00:00Z";
+    const expired: DeletedEntry = {kind: "deleted", entryId: "expired", path: "expired.md", deletedAt: "2026-09-01T00:00:00Z",
+      lastContentHash: "h1", lastRevisionId: "r1", recovery: revision("r1", "2026-10-01T00:00:00Z"),
+      history: [revision("old1", "2026-09-30T00:00:00Z")]};
+    const fresh: DeletedEntry = {kind: "deleted", entryId: "fresh", path: "fresh.md", deletedAt: "2026-10-06T01:11:26.000Z",
+      lastContentHash: "h2", lastRevisionId: "r2", recovery: revision("r2", "2026-11-05T01:11:26.000Z")};
+    const candidateOnly: DeletedEntry = {kind: "deleted", entryId: "candidate", path: "candidate.md",
+      deletedAt: "2026-09-10T00:00:00Z", lastContentHash: "h3", lastRevisionId: "r3",
+      recovery: revision("r3", "2026-10-10T00:00:00Z"), history: [revision("conflict-candidate", "2026-10-18T12:00:00Z")]};
+    const openWith = (deleted: DeletedEntry[]) => {
+      const controller = {...issueController([]), getDeletedRecoveries: () => deleted};
+      const modal = new StatusModal({} as App, controller);
+      modal.onOpen();
+      return all(modal.contentEl as unknown as FakeElement);
+    };
+    beforeEach(() => {vi.useFakeTimers({toFake: ["Date"]}); vi.setSystemTime(new Date(now));});
+    afterEach(() => {vi.useRealTimers();});
+
+    it("lists only deleted files that still have unexpired recovery content", () => {
+      const texts = openWith([expired, fresh, candidateOnly]).map(node => node.text);
+      expect(texts).toContain("已删除的文件（30 天内可恢复）");
+      expect(texts).not.toContain("expired.md");
+      expect(texts).toContain("fresh.md");
+      expect(texts).toContain("candidate.md");
+    });
+
+    it("shows each deletion time in the device time zone with the days left", () => {
+      const texts = openWith([fresh, candidateOnly]).map(node => node.text).filter(text => text.startsWith("删除于"));
+      // fresh 还剩 17 天 23 小时 11 分，向下取整；candidate 只剩 10 小时
+      expect(texts).toEqual(["删除于 2026-10-06 09:11 · 还剩 17 天", "删除于 2026-09-10 08:00 · 不到 1 天"]);
+    });
+
+    it("hides the section when every deleted file is past its recovery period", () => {
+      const texts = openWith([expired]).map(node => node.text);
+      expect(texts).not.toContain("已删除的文件（30 天内可恢复）");
+      expect(texts).not.toContain("expired.md");
+    });
+
+    it("offers version history but not the expired recovery copy", () => {
+      const nodes = openWith([candidateOnly]);
+      expect(nodes.some(node => node.text === "恢复副本不可用，请打开历史版本")).toBe(true);
+      expect(nodes.some(node => node.text === "点击预览")).toBe(false);
+      expect(nodes.some(node => node.tag === "button" && node.text === "恢复")).toBe(false);
+      expect(nodes.some(node => node.tag === "button" && node.text === "历史版本")).toBe(true);
+    });
+
+    it("shows the recovery deadline in the deleted preview in local time", () => {
+      const nodes = openWith([fresh]);
+      const target = nodes.find(node => node.events.has("keydown"))!;
+      (target.events.get("keydown") as unknown as (event: {key: string; preventDefault(): void}) => void)(
+        {key: "Enter", preventDefault() {}});
+      expect(all(opened.at(-1)!.contentEl).some(node => node.text === "5 字节 · 可恢复至 2026-11-05 09:11")).toBe(true);
     });
   });
 });

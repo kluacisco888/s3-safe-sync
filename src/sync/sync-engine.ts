@@ -679,14 +679,16 @@ export class SyncEngine {
         remoteEntry?.kind === "live" &&
         remoteEntry.revision.revisionId === baseEntry.revision.revisionId
       ) {
+        // 当前版本没变，但 Version History 以远端当前记录为准：本机缓存里的旧 history
+        // 可能列着已被过期清理、数据块也已删掉的版本，原样发布会让 Head 引用不存在的数据块
         remoteChanges.push({
           entryId: baseEntry.entryId,
-          ...(baseEntry.history ? { history: baseEntry.history } : {}),
+          ...(remoteEntry.history ? { history: remoteEntry.history } : {}),
           kind: "delete-remote",
-          lastContentHash: baseEntry.revision.contentHash,
-          lastRevisionId: baseEntry.revision.revisionId,
+          lastContentHash: remoteEntry.revision.contentHash,
+          lastRevisionId: remoteEntry.revision.revisionId,
           path: baseEntry.path,
-          recoveryRevision: baseEntry.revision,
+          recoveryRevision: remoteEntry.revision,
         });
       } else if (
         !isPresent &&
