@@ -1212,7 +1212,8 @@ describe("opening sync status when synchronization stops", () => {
     hooks.headFailure = "network";
     await plugin.togglePause();
     await settle(plugin, 29 * 60_000);
-    expect(plugin.getStatusText()).toMatch(/^出错：/u);
+    // 重试间隔带随机抖动，29 分钟这一刻可能正处在某一轮的自动重试中，也可能这一轮已经重试完报错；两种都是网络仍在失败
+    expect(plugin.getStatusText()).toMatch(/^(出错：|检查中：网络暂时出错)/u);
     expect(host.notices.length).toBeGreaterThan(0);
     expect(host.openedModals).toHaveLength(0);
     await settle(plugin, 2 * 60_000);
@@ -1229,7 +1230,6 @@ describe("opening sync status when synchronization stops", () => {
     await settle(plugin, 31 * 60_000);
     expect(host.openedModals).toHaveLength(1);
     host.openedModals[0]!.close();
-    const headFailure = plugin.getStatusText();
     const protocol = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;
     host.requestUrl.mockImplementation((request: Parameters<ObsidianRequestExecutor>[0]) =>
       request.method === "PUT" && request.url.includes("/blobs/")
@@ -1238,8 +1238,12 @@ describe("opening sync status when synchronization stops", () => {
     hooks.headFailure = undefined;
     edit("An edit made while the network is still failing.");
     await settle(plugin, 10 * 60_000);
-    expect(plugin.getStatusText()).toMatch(/^出错：/u);
-    expect(plugin.getStatusText()).not.toBe(headFailure);
+    // 重试间隔带随机抖动，这一刻可能正在重试也可能已报错；用「上传确实失败过」来证明换了一种操作，而不是比较状态文字
+    expect(plugin.getStatusText()).toMatch(/^(出错：|检查中：网络暂时出错)/u);
+    expect(host.requestUrl.mock.calls.some(([request]) => {
+      const call = request as Parameters<ObsidianRequestExecutor>[0];
+      return call.method === "PUT" && call.url.includes("/blobs/");
+    })).toBe(true);
     expect(host.openedModals).toHaveLength(1);
     plugin.onunload();
   });
@@ -1255,7 +1259,8 @@ describe("opening sync status when synchronization stops", () => {
     hooks.headFailure = "network";
     await settle(plugin, 2 * 60_000);
     await settle(plugin, 16 * 60_000);
-    expect(plugin.getStatusText()).toMatch(/^出错：/u);
+    // 同上：这一刻可能正处在某一轮的自动重试中
+    expect(plugin.getStatusText()).toMatch(/^(出错：|检查中：网络暂时出错)/u);
     expect(host.openedModals).toHaveLength(0);
     await settle(plugin, 16 * 60_000);
     expect(host.openedModals).toHaveLength(1);
