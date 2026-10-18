@@ -67,6 +67,7 @@ describe("plugin collision recovery persistence", () => {
     let sequence = 0;
     const objects: ObjectStore = {
       get: async key => data.get(key), list: async prefix => [...data.keys()].filter(key => key.startsWith(prefix)),
+      listObjects: async prefix => [...data].filter(([key]) => key.startsWith(prefix)).map(([key, value]) => ({key, lastModified: value.lastModified, size: value.body.byteLength})),
       delete: async key => {data.delete(key);},
       put: async (key, body) => {
         const value = {body, etag: `"test-${++sequence}"`, lastModified: "Fri, 18 Sep 2026 00:00:00 GMT"};
@@ -161,6 +162,7 @@ describe("plugin collision recovery persistence", () => {
     const data = new Map<string, StoredObject>();
     const objects: ObjectStore = {
       get: async key => data.get(key), list: async prefix => [...data.keys()].filter(key => key.startsWith(prefix)),
+      listObjects: async prefix => [...data].filter(([key]) => key.startsWith(prefix)).map(([key, value]) => ({key, lastModified: value.lastModified, size: value.body.byteLength})),
       delete: async key => {data.delete(key);},
       put: async (key, body) => {
         const value = {body, etag: `"test-${data.size}"`, lastModified: "Fri, 18 Sep 2026 00:00:00 GMT"};

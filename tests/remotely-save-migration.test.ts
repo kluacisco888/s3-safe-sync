@@ -5,6 +5,7 @@ import { RemotelySaveMigration } from "../src/migration/remotely-save-migration"
 import type { LocalFileInfo, LocalVaultPort } from "../src/sync/sync-service";
 import type {
   ObjectPutOptions,
+  ListedObject,
   ObjectStore,
   StoredObject,
 } from "../src/storage/object-store";
@@ -22,6 +23,11 @@ class MemoryObjectStore implements ObjectStore {
 
   async list(prefix: string): Promise<string[]> {
     return [...this.objects.keys()].filter((key) => key.startsWith(prefix));
+  }
+
+  async listObjects(prefix: string): Promise<ListedObject[]> {
+    return [...this.objects].filter(([key]) => key.startsWith(prefix))
+      .map(([key, stored]) => ({ key, lastModified: stored.lastModified, size: stored.body.byteLength }));
   }
 
   async put(
