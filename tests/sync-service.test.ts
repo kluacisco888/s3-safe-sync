@@ -6361,6 +6361,57 @@ describe("a base Revision purged from the remote record", () => {
     expect(fixture.phoneVault.readText("note.md")).toBe("v1");
   });
 
+  it("clears a recovery recheck recorded by a failed sync once that content is purged from the record", async () => {
+    const fixture = await setup();
+    const base = await fixture.liveEntry();
+    await fixture.desktopVault.write("note.md", text("v1"));
+    await fixture.desktop.synchronize();
+    // 先由一次真实的同步记下待复查项：v0 的恢复副本还在记录里，但校验不过
+    await fixture.objects.put(`${prefix}/v1/blobs/${base.revision.blobId}`, text("damaged"));
+    const failure = await fixture.phone.synchronize().then(() => undefined, (error: unknown) => error);
+    expect(failure).toBeInstanceOf(RemoteStateError);
+    const check = (failure as RemoteStateError).integrityCheck;
+    expect(check).toMatchObject({ contentHash: base.revision.contentHash, entryId: base.entryId, kind: "recovery" });
+    expect(fixture.phoneVault.readText("note.md")).toBe("v0");
+    // 之后 v0 过期被清理出记录、数据块也被删掉
+    await purgeRevisions(fixture.observer, fixture.objects, [base.revision.revisionId], true);
+
+    await expect(fixture.phone.verifyRemoteIntegrity([check!], "vault")).resolves.toBeUndefined();
+    await expect(fixture.phone.synchronize()).resolves.toMatchObject({ downloaded: 1, status: "complete" });
+    expect(fixture.phoneVault.readText("note.md")).toBe("v1");
+  });
+
+  it("keeps a real local edit as a Conflict instead of downloading over it when its base was purged", async () => {
+    const fixture = await setup();
+    const base = await fixture.liveEntry();
+    await fixture.desktopVault.write("note.md", text("v1"));
+    await fixture.desktop.synchronize();
+    const remoteEdit = await fixture.liveEntry();
+    await purgeRevisions(fixture.observer, fixture.objects, [base.revision.revisionId], true);
+    // 本机真的改过：内容与已接受的 base 不同，不适用「旧内容已被清理就直接覆盖」的例外
+    await fixture.phoneVault.write("note.md", text("phone edit"));
+    const write = vi.spyOn(fixture.phoneVault, "write");
+    const generationBefore = (await readCurrent(fixture.observer)).head.value.generation;
+
+    const result = await fixture.phone.synchronize();
+
+    expect(result).toMatchObject({ downloaded: 0, status: "action-required" });
+    const after = await readCurrent(fixture.observer);
+    expect(after.head.value.generation).toBe(generationBefore + 1);
+    const conflicted = after.snapshot.entries[base.entryId];
+    if (conflicted?.kind !== "conflicted") throw new Error("Expected a Conflict");
+    expect(conflicted).toMatchObject({ reason: "edit-edit" });
+    const localCandidate = conflicted.candidates.find((candidate) => candidate.revisionId !== remoteEdit.revision.revisionId);
+    if (!localCandidate) throw new Error("Expected the local edit as a candidate");
+    expect(new TextDecoder().decode(await fixture.phone.readConflictCandidate(base.entryId, localCandidate.revisionId)))
+      .toBe("phone edit");
+    // 没有走下载覆盖：本机文件只在本机修改已作为冲突候选发布之后，按冲突的照旧规则显示远端版本，
+    // 且改写以本机修改的哈希为前提
+    expect(write.mock.calls.filter(([path]) => path === "note.md").map(([, , expected]) => expected))
+      .toEqual([await sha256Content(text("phone edit"))]);
+    expect(fixture.phoneVault.readText("note.md")).toBe("v1");
+  });
+
   const big = "remote content above limit";
 
   // 手机限 10 字节：电脑改成大文件后手机暂缓下载，本机留着旧的 v0；之后 v0 被清理出记录
