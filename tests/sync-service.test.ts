@@ -33,6 +33,8 @@ class MemoryObjectStore implements ObjectStore {
   corruptNextBlobPut = false;
   onGet: ((key: string) => Promise<void> | void) | undefined;
   onPut: ((key: string) => Promise<void> | void) | undefined;
+  // 新写入对象的 S3 LastModified
+  lastModifiedForPuts = "2026-09-05T00:00:00.000Z";
 
   async delete(key: string): Promise<void> {
     this.objects.delete(key);
@@ -74,7 +76,7 @@ class MemoryObjectStore implements ObjectStore {
         ? new TextEncoder().encode("corrupted ciphertext")
         : body.slice(),
       etag: `etag-${++this.sequence}`,
-      lastModified: "2026-09-05T00:00:00.000Z",
+      lastModified: this.lastModifiedForPuts,
     };
     this.objects.set(key, value);
     return value;
@@ -6991,5 +6993,425 @@ describe("cleaning expired content out of the remote record", () => {
     expect(fixture.phoneVault.readText("note.md")).toBe("v1");
     // 本机旧内容交给安全写入挪进本机回收站
     expect(write).toHaveBeenCalledWith("note.md", expect.any(Uint8Array), await sha256Content(text("v0")));
+  });
+});
+
+describe("deleting unreferenced blobs from this vault's folder", () => {
+  const prefix = "blob-gc";
+  const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+  const text = (value: string): Uint8Array => new TextEncoder().encode(value);
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const HOUR_MS = 60 * 60 * 1000;
+  const T0 = "2026-09-05T00:00:00.000Z";
+  // 以 T0 为起点的第 days 天（AWS 时间）
+  const at = (days: number): string => new Date(Date.parse(T0) + days * DAY_MS).toISOString();
+  const blobKey = (blobId: string): string => `${prefix}/v1/blobs/${blobId}`;
+
+  // 一只假的 AWS 钟：新写入对象的 LastModified 和读 Head 时的 serverDate 都取 now
+  class AwsClockStore extends MemoryObjectStore {
+    readonly deleted: string[] = [];
+    injectedListing: ListedObject[] = [];
+    onListObjects: (() => Promise<void> | void) | undefined;
+
+    get now(): string { return this.lastModifiedForPuts; }
+    set now(value: string) { this.lastModifiedForPuts = value; }
+
+    override async get(key: string): Promise<StoredObject | undefined> {
+      const stored = await super.get(key);
+      return stored && { ...stored, serverDate: this.now };
+    }
+
+    override async listObjects(listPrefix: string): Promise<ListedObject[]> {
+      await this.onListObjects?.();
+      return [...(await super.listObjects(listPrefix)), ...this.injectedListing];
+    }
+
+    override async delete(key: string): Promise<void> {
+      this.deleted.push(key);
+      await super.delete(key);
+    }
+
+    async exists(key: string): Promise<boolean> {
+      return (await super.list(key)).includes(key);
+    }
+  }
+
+  const readCurrent = async (remote: RemoteStore) => {
+    const head = await remote.readHead();
+    if (!head) throw new Error("Expected initialized Head");
+    return { head, snapshot: await remote.readSnapshot(head.value) };
+  };
+
+  const setup = async (files: Record<string, string> = { "note.md": "v0" }, storePrefix = prefix) => {
+    const objects = new AwsClockStore();
+    objects.now = at(0);
+    const open = () => RemoteStore.open({ objects, prefix: storePrefix, vaultKey });
+    const desktopVault = new MemoryVault();
+    for (const [path, body] of Object.entries(files)) await desktopVault.write(path, text(body));
+    const desktopCache = new MemorySyncCache();
+    const desktop = new SyncService({ cache: desktopCache, local: desktopVault, remote: await open(), replicaId: "desktop" });
+    await desktop.initializeNew("vault");
+    await desktop.synchronize();
+    const phoneVault = new MemoryVault();
+    const phoneCache = new MemorySyncCache();
+    const phone = new SyncService({ cache: phoneCache, local: phoneVault, remote: await open(), replicaId: "phone" });
+    await phone.synchronize();
+    const observer = await open();
+    return { desktop, desktopCache, desktopVault, objects, observer, phone, phoneCache, phoneVault };
+  };
+
+  // 在 AWS 时间 days 上传一个没有任何记录引用的数据块
+  const orphan = async (fixture: { objects: AwsClockStore; observer: RemoteStore }, days: number, body = "orphan") => {
+    fixture.objects.now = at(days);
+    const blobId = crypto.randomUUID();
+    await fixture.observer.writeBlob(blobId, text(body));
+    return blobId;
+  };
+
+  const revisionOf = async (fixture: { objects: AwsClockStore; observer: RemoteStore }, days: number, body: string,
+    expiresAt?: string): Promise<RevisionRef> => {
+    const blobId = await orphan(fixture, days, body);
+    return {
+      blobId, contentHash: await sha256Content(text(body)), createdAt: at(days), revisionId: crypto.randomUUID(),
+      size: text(body).byteLength, ...(expiresAt ? { expiresAt } : {}),
+    };
+  };
+
+  // 在 AWS 时间 days 发一个提交（改写给定的 Entry），Head 对象的 LastModified 随之变成 days
+  const publishAt = async (fixture: { objects: AwsClockStore; observer: RemoteStore }, days: number, entries: VaultEntry[] = []) => {
+    fixture.objects.now = at(days);
+    const { head, snapshot } = await readCurrent(fixture.observer);
+    const changed = entries.length > 0 ? entries : [Object.values(snapshot.entries)[0]!];
+    const commitId = crypto.randomUUID();
+    await fixture.observer.advance({
+      commit: {
+        changes: changed.map((entry) => ({ entry, kind: "set-entry" as const })), commitId, createdAt: head.serverDate,
+        parentIds: [head.value.commitId], protocolVersion: 1, replicaId: "fixture", vaultId: snapshot.vaultId,
+      },
+      expectedHeadEtag: head.etag,
+      head: { ...head.value, commitId, generation: head.value.generation + 1 },
+    });
+  };
+
+  const checkAt = async (fixture: { desktop: SyncService; objects: AwsClockStore }, time: string, marks?: Record<string, string>) => {
+    fixture.objects.now = time;
+    const result = await fixture.desktop.deleteUnreferencedBlobs("vault", marks);
+    if (result.kind !== "checked") throw new Error(`Expected a completed check, got ${result.kind}`);
+    return result;
+  };
+
+  it("deletes an old unreferenced blob only after two checks at least 24 hours apart both found it unused", async () => {
+    const fixture = await setup();
+    const blobId = await orphan(fixture, 1, "orphan bytes");
+    await publishAt(fixture, 2);
+
+    const first = await checkAt(fixture, at(40));
+    expect(first).toMatchObject({ deletedBlobs: 0, deletedBytes: 0 });
+    expect(first.marks).toEqual({ [blobId]: at(40) });
+    const early = await checkAt(fixture, new Date(Date.parse(at(41)) - HOUR_MS).toISOString(), first.marks);
+    expect(early.deletedBlobs).toBe(0);
+    // 第一次判定的时间不会被后来的检查刷新
+    expect(early.marks).toEqual({ [blobId]: at(40) });
+    expect(fixture.objects.deleted).toEqual([]);
+
+    const second = await checkAt(fixture, at(41), early.marks);
+
+    expect(fixture.objects.deleted).toEqual([blobKey(blobId)]);
+    expect(second.deletedBlobs).toBe(1);
+    expect(second.deletedBytes).toBeGreaterThan(text("orphan bytes").byteLength);
+    expect(second.marks).toEqual({});
+  });
+
+  it("keeps every blob the current record references, the same set the Head read checks", async () => {
+    const fixture = await setup();
+    const live: VaultEntry = {
+      entryId: "live", kind: "live", path: "live.md", revision: await revisionOf(fixture, 1, "live current"),
+      // 已过期但还没被清理提交去掉的旧版本也算引用
+      history: [await revisionOf(fixture, 1, "live old", at(31))],
+    };
+    const deleted: VaultEntry = {
+      deletedAt: at(1), entryId: "gone", kind: "deleted", lastContentHash: "sha256:gone", lastRevisionId: "gone-last",
+      path: "gone.md", recovery: { ...(await revisionOf(fixture, 1, "gone recovery")), expiresAt: at(31) },
+    };
+    const conflicted: VaultEntry = {
+      candidates: [await revisionOf(fixture, 1, "candidate")], entryId: "conflict", kind: "conflicted", path: "conflict.md",
+      reason: "edit-delete", recovery: { ...(await revisionOf(fixture, 1, "conflict recovery")), expiresAt: at(31) },
+      history: [await revisionOf(fixture, 1, "conflict history", at(90))],
+    };
+    const unused = await orphan(fixture, 1);
+    await publishAt(fixture, 2, [live, deleted, conflicted]);
+
+    const first = await checkAt(fixture, at(60));
+    await checkAt(fixture, at(61), first.marks);
+
+    expect(fixture.objects.deleted).toEqual([blobKey(unused)]);
+    await expect(readCurrent(fixture.observer)).resolves.toBeDefined();
+  });
+
+  it("keeps the blob of a file uploaded 60 days ago and never changed or opened since", async () => {
+    const fixture = await setup({ "untouched.md": "written once", "other.md": "x" });
+    const { snapshot } = await readCurrent(fixture.observer);
+    const untouched = Object.values(snapshot.entries).find((entry) => entry.path === "untouched.md") as LiveEntry;
+    // 之后别的文件有提交，Head 比这个数据块新
+    await fixture.desktopVault.write("other.md", text("y"));
+    fixture.objects.now = at(1);
+    await fixture.desktop.synchronize();
+
+    const first = await checkAt(fixture, at(60));
+    await checkAt(fixture, at(61), first.marks);
+
+    expect(first.marks).not.toHaveProperty(untouched.revision.blobId);
+    expect(await fixture.objects.exists(blobKey(untouched.revision.blobId))).toBe(true);
+  });
+
+  it("keeps an unreferenced blob uploaded less than 30 days ago", async () => {
+    const fixture = await setup();
+    const recent = await orphan(fixture, 15);
+    const old = await orphan(fixture, 1);
+    await publishAt(fixture, 16);
+
+    const first = await checkAt(fixture, at(40));
+    await checkAt(fixture, at(41), first.marks);
+
+    expect(fixture.objects.deleted).toEqual([blobKey(old)]);
+    expect(await fixture.objects.exists(blobKey(recent))).toBe(true);
+  });
+
+  it("keeps an unreferenced blob that is not older than the current Head object", async () => {
+    const fixture = await setup();
+    await publishAt(fixture, 1);
+    // 上传完一直没发布：设备上传后被挂起，Head 之后没再变过
+    const suspended = await orphan(fixture, 2);
+    fixture.objects.now = at(1);
+    const sameTime = await orphan(fixture, 1);
+    const before = await orphan(fixture, 0.5);
+
+    const first = await checkAt(fixture, at(40));
+    await checkAt(fixture, at(41), first.marks);
+
+    expect(fixture.objects.deleted).toEqual([blobKey(before)]);
+    expect(await fixture.objects.exists(blobKey(suspended))).toBe(true);
+    expect(await fixture.objects.exists(blobKey(sameTime))).toBe(true);
+  });
+
+  it("restarts the 24-hour wait when the local first-judgment record is lost", async () => {
+    const fixture = await setup();
+    const blobId = await orphan(fixture, 1);
+    await publishAt(fixture, 2);
+    await checkAt(fixture, at(40));
+
+    const restarted = await checkAt(fixture, at(41), undefined);
+
+    expect(restarted).toMatchObject({ deletedBlobs: 0, marks: { [blobId]: at(41) } });
+    expect(fixture.objects.deleted).toEqual([]);
+    await checkAt(fixture, at(42), restarted.marks);
+    expect(fixture.objects.deleted).toEqual([blobKey(blobId)]);
+  });
+
+  it("measures the 30 days and the 24 hours by AWS time, never by device time", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const fixture = await setup();
+      const blobId = await orphan(fixture, 20);
+      await publishAt(fixture, 21);
+      // 设备时间已经是一年以后，而且两次检查之间设备时间过了两天，AWS 时间只过了一小时
+      vi.setSystemTime(Date.parse(at(400)));
+      const first = await checkAt(fixture, at(40));
+      vi.setSystemTime(Date.parse(at(402)));
+      const second = await checkAt(fixture, new Date(Date.parse(at(40)) + HOUR_MS).toISOString(), first.marks);
+      expect(first.marks).toEqual({ [blobId]: at(40) });
+      expect(second.deletedBlobs).toBe(0);
+      // AWS 时间满 30 天、两次检查相隔满 24 小时才删
+      const third = await checkAt(fixture, at(51), second.marks);
+      expect(third.deletedBlobs).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("computes the references only from the Head it read, never from the local cache", async () => {
+    const fixture = await setup({ "note.md": "v0", "other.md": "o" });
+    const cachedNote = Object.values(fixture.desktopCache.state!.snapshot.entries).find((entry) => entry.path === "note.md") as LiveEntry;
+    // 远端：别的设备把 note.md 改成了引用一个旧数据块的版本，并且记录里不再引用 v0（比如被清理过）
+    const remoteOnly = await revisionOf(fixture, 1, "restored long ago");
+    await publishAt(fixture, 2, [{ ...cachedNote, revision: remoteOnly }]);
+    // 本机缓存停在最初：还引用 v0，不知道 remoteOnly
+    expect(fixture.desktopCache.state!.snapshot.entries[cachedNote.entryId]).toEqual(cachedNote);
+
+    const first = await checkAt(fixture, at(40));
+    await checkAt(fixture, at(41), first.marks);
+
+    expect(fixture.objects.deleted).toEqual([blobKey(cachedNote.revision.blobId)]);
+    expect(await fixture.objects.exists(blobKey(remoteOnly.blobId))).toBe(true);
+  });
+
+  it("rereads the Head before deleting and keeps a candidate that another device referenced meanwhile", async () => {
+    const fixture = await setup();
+    const picked = await orphan(fixture, 1, "picked up again");
+    const unused = await orphan(fixture, 1);
+    await publishAt(fixture, 2);
+    const first = await checkAt(fixture, at(40));
+    const reference: RevisionRef = {
+      blobId: picked, contentHash: await sha256Content(text("picked up again")), createdAt: at(1), revisionId: "picked",
+      size: text("picked up again").byteLength,
+    };
+    // 这次检查列完数据块、还没删除时，别的设备发布了引用 picked 的提交
+    fixture.objects.onListObjects = async () => {
+      fixture.objects.onListObjects = undefined;
+      await publishAt(fixture, 41, [{ entryId: "picked", kind: "live", path: "picked.md", revision: reference }]);
+    };
+
+    const second = await checkAt(fixture, at(41), first.marks);
+
+    expect(fixture.objects.deleted).toEqual([blobKey(unused)]);
+    expect(second.marks).not.toHaveProperty(picked);
+    await expect(readCurrent(fixture.observer)).resolves.toBeDefined();
+  });
+
+  it("deletes at most 200 blobs per run, oldest first, and leaves the rest for the next run", async () => {
+    const fixture = await setup();
+    const oldest = await orphan(fixture, 0.25);
+    const rest: string[] = [];
+    for (let index = 0; index < 204; index++) rest.push(await orphan(fixture, 1));
+    await publishAt(fixture, 2);
+    const first = await checkAt(fixture, at(40));
+
+    const second = await checkAt(fixture, at(41), first.marks);
+
+    expect(second.deletedBlobs).toBe(200);
+    expect(fixture.objects.deleted).toHaveLength(200);
+    expect(fixture.objects.deleted[0]).toBe(blobKey(oldest));
+    expect(Object.keys(second.marks)).toHaveLength(5);
+    const third = await checkAt(fixture, new Date(Date.parse(at(41)) + 60_000).toISOString(), second.marks);
+    expect(third.deletedBlobs).toBe(5);
+    expect(new Set(fixture.objects.deleted)).toEqual(new Set([oldest, ...rest].map(blobKey)));
+  });
+
+  it("leaves every Head read passing and lets another device sync normally after deleting", async () => {
+    const fixture = await setup({ "note.md": "v0", "keep.md": "keep" });
+    await fixture.desktopVault.write("note.md", text("v1"));
+    fixture.objects.now = at(1);
+    await fixture.desktop.synchronize();
+    const orphaned = await orphan(fixture, 1);
+    await publishAt(fixture, 2);
+    // 过期的旧版本先由清理提交从记录里去掉，之后它的数据块才会被判定没人用
+    fixture.objects.now = at(40);
+    await expect(fixture.desktop.cleanupExpiredContent("vault")).resolves.toMatchObject({ kind: "committed", removedHistory: 1 });
+    const first = await checkAt(fixture, at(40));
+    expect(Object.keys(first.marks)).toHaveLength(2);
+
+    await checkAt(fixture, at(41), first.marks);
+
+    expect(fixture.objects.deleted).toHaveLength(2);
+    expect(fixture.objects.deleted).toContain(blobKey(orphaned));
+    await expect(readCurrent(fixture.observer)).resolves.toBeDefined();
+    await expect(fixture.phone.synchronize()).resolves.toMatchObject({ status: "complete" });
+    expect(fixture.phoneVault.readText("note.md")).toBe("v1");
+    expect(fixture.phoneVault.readText("keep.md")).toBe("keep");
+    await fixture.phoneVault.write("keep.md", text("phone edit"));
+    await expect(fixture.phone.synchronize()).resolves.toMatchObject({ status: "complete", uploaded: 1 });
+    await expect(fixture.desktop.synchronize()).resolves.toMatchObject({ status: "complete", downloaded: 1 });
+    expect(fixture.desktopVault.readText("keep.md")).toBe("phone edit");
+  });
+
+  it.each([
+    ["the Head", `${prefix}/v1/head`],
+    ["a commit", `${prefix}/v1/commits/x`],
+    ["a snapshot", `${prefix}/v1/snapshots/x`],
+    ["the Key Envelope", `${prefix}/v1/key-envelope`],
+    ["another folder", "obsidian-vault-v1/v1/blobs/0b6f3a52-5d0e-4c1b-9a7e-2f0d1c3b4a59"],
+    ["a sub-path", `${prefix}/v1/blobs/0b6f3a52-5d0e-4c1b-9a7e-2f0d1c3b4a59/x`],
+    ["a name that is not a UUID", `${prefix}/v1/blobs/not-a-uuid`],
+  ])("deletes nothing at all and reports when the listing contains %s", async (_name, key) => {
+    const fixture = await setup();
+    await orphan(fixture, 1);
+    await publishAt(fixture, 2);
+    const first = await checkAt(fixture, at(40));
+    fixture.objects.injectedListing = [{ key, lastModified: at(1), size: 1 }];
+
+    await expect(fixture.desktop.deleteUnreferencedBlobs("vault", first.marks)).rejects.toThrow("这次不删除任何数据块");
+
+    expect(fixture.objects.deleted).toEqual([]);
+  });
+
+  it("deletes nothing when the listing, the record, or the second Head read fails", async () => {
+    const fixture = await setup();
+    const blobId = await orphan(fixture, 1);
+    await publishAt(fixture, 2);
+    const first = await checkAt(fixture, at(40));
+    fixture.objects.now = at(41);
+
+    fixture.objects.onListObjects = () => { throw new Error("network down"); };
+    await expect(fixture.desktop.deleteUnreferencedBlobs("vault", first.marks)).rejects.toThrow("network down");
+    // 第二次读 Head 时它不见了
+    fixture.objects.onListObjects = async () => {
+      fixture.objects.onListObjects = undefined;
+      await fixture.objects.delete(`${prefix}/v1/head`);
+    };
+    const head = await fixture.objects.get(`${prefix}/v1/head`);
+    await expect(fixture.desktop.deleteUnreferencedBlobs("vault", first.marks)).rejects.toThrow("Head");
+    await fixture.objects.put(`${prefix}/v1/head`, head!.body);
+    // 当前记录引用的数据块缺失：读记录失败
+    const { snapshot } = await readCurrent(fixture.observer);
+    const referenced = (Object.values(snapshot.entries)[0] as LiveEntry).revision.blobId;
+    await fixture.objects.delete(blobKey(referenced));
+    fixture.objects.deleted.length = 0;
+    await expect(fixture.desktop.deleteUnreferencedBlobs("vault", first.marks)).rejects.toBeInstanceOf(RemoteStateError);
+
+    expect(fixture.objects.deleted).toEqual([]);
+    expect(await fixture.objects.exists(blobKey(blobId))).toBe(true);
+  });
+
+  it("does nothing when the remote Head does not exist", async () => {
+    const objects = new AwsClockStore();
+    const service = new SyncService({
+      cache: new MemorySyncCache(), local: new MemoryVault(), remote: await RemoteStore.open({ objects, prefix, vaultKey }),
+      replicaId: "desktop",
+    });
+
+    await expect(service.deleteUnreferencedBlobs("vault", {})).resolves.toEqual({ kind: "no-head" });
+
+    expect(objects.deleted).toEqual([]);
+  });
+
+  it("refuses to clean when the prefix is empty after normalization", async () => {
+    const fixture = await setup({ "note.md": "v0" }, "/");
+    await orphan(fixture, 1);
+    await publishAt(fixture, 2);
+
+    await expect(fixture.desktop.deleteUnreferencedBlobs("vault", undefined)).rejects.toThrow("前缀为空");
+    await expect(fixture.desktop.previewExpiredContentCleanup("vault")).rejects.toThrow("前缀为空");
+
+    expect(fixture.objects.deleted).toEqual([]);
+  });
+
+  it("previews the blobs a run would delete by upload month, and those that start tomorrow, without changing anything", async () => {
+    const fixture = await setup();
+    const marked = await orphan(fixture, 1, "marked in September");
+    const fresh = await orphan(fixture, 30, "first seen today");
+    // 只被一个已过期的旧版本引用：清理提交去掉它之后才没人用
+    const expired = await revisionOf(fixture, 1, "expired old version", at(31));
+    const { snapshot } = await readCurrent(fixture.observer);
+    const note = Object.values(snapshot.entries)[0] as LiveEntry;
+    await publishAt(fixture, 31, [{ ...note, history: [expired] }]);
+    fixture.objects.now = at(70);
+    const sizeOf = async (blobId: string) => (await fixture.objects.get(blobKey(blobId)))!.body.byteLength;
+    const headBefore = await fixture.objects.get(`${prefix}/v1/head`);
+
+    const preview = await fixture.desktop.previewExpiredContentCleanup("vault", { [marked]: at(60) });
+
+    expect(preview.removedHistory).toBe(1);
+    expect(preview.blobs.deletable).toEqual({
+      bytes: await sizeOf(marked), count: 1, byMonth: [{ bytes: await sizeOf(marked), count: 1, month: "2026-09" }],
+    });
+    expect(preview.blobs.startingTomorrow).toEqual({
+      bytes: (await sizeOf(fresh)) + (await sizeOf(expired.blobId)), count: 2,
+      byMonth: [
+        { bytes: await sizeOf(expired.blobId), count: 1, month: "2026-09" },
+        { bytes: await sizeOf(fresh), count: 1, month: "2026-10" },
+      ],
+    });
+    expect(fixture.objects.deleted).toEqual([]);
+    expect(await fixture.objects.get(`${prefix}/v1/head`)).toEqual(headBefore);
   });
 });

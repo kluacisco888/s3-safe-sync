@@ -233,6 +233,13 @@ describe("S3VaultSyncSettingsTab expired content cleanup", () => {
       { deletedAt: "2026-08-20T10:00:00.000Z", path: "notes/newer.md" },
     ],
     serverDate: "2026-10-18T10:00:00.000Z",
+    blobs: {
+      deletable: { bytes: 3 * 1024 * 1024 + 512 * 1024, count: 242, byMonth: [
+        { bytes: 512 * 1024, count: 241, month: "2026-09" },
+        { bytes: 3 * 1024 * 1024, count: 1, month: "2026-10" },
+      ] },
+      startingTomorrow: { bytes: 56 * 1024 * 1024, count: 302, byMonth: [{ bytes: 56 * 1024 * 1024, count: 302, month: "2026-08" }] },
+    },
   };
 
   const controllerWith = (overrides: Partial<SettingsController> = {}) => {
@@ -283,6 +290,14 @@ describe("S3VaultSyncSettingsTab expired content cleanup", () => {
     expect(findSetting("预览过期内容").description).toContain("2 个已删除文件的恢复副本");
     expect(findSetting("预览过期内容").description).toContain("7 个过期旧版本");
     expect(findSetting("预览过期内容").description).toContain("1 项缺到期时间");
+    // 数据块：将删除的数量和大小按上传月份汇总，还没满 24 小时的单独列为「明天起删」
+    expect(findSetting("预览过期内容").description).toContain("S3 上将删除 242 个没人用的数据块（3.5 MB）");
+    expect(findSetting("预览过期内容").description).toContain("另有 302 个（56.0 MB）明天起删");
+    expect(findSetting("预览过期内容").description).toContain("每次最多删 200 个");
+    expect(listed).toContain("2026 年 9 月上传：241 个，512.0 KB");
+    expect(listed).toContain("2026 年 10 月上传：1 个，3.0 MB");
+    expect(listed.indexOf("明天起删（第一次判定没人用还不满 24 小时）：")).toBeGreaterThan(listed.indexOf("2026 年 10 月上传：1 个，3.0 MB"));
+    expect(listed).toContain("2026 年 8 月上传：302 个，56.0 MB");
 
     await enable.trigger(true);
     expect(controller.setExpiredContentCleanupEnabled).toHaveBeenCalledWith(true, true);

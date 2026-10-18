@@ -19,6 +19,7 @@ import {
   type RemoteIntegrityCheck,
   RemoteStateError,
   RemoteStore,
+  snapshotBlobReferences,
 } from "../storage/remote-store";
 import { LocalStateChangedError } from "./errors";
 import type { PersistedPathRename } from "./path-rename-tracker";
@@ -31,13 +32,32 @@ import {
   type ExpiredRecoveryRemoval,
   type MissingExpiryItem,
 } from "./expired-content-cleanup";
+import {
+  MAX_BLOB_DELETIONS_PER_RUN,
+  planUnreferencedBlobDeletion,
+  summarizeBlobs,
+  type BlobUsageSummary,
+  type UnreferencedBlobMarks,
+} from "./unreferenced-blob-cleanup";
 
 export interface ExpiredContentPreview {
+  // 将删除的数据块（四条判据都满足）和「明天起删」的（第一次判定还不满 24 小时），按上传月份汇总
+  blobs: { deletable: BlobUsageSummary; startingTomorrow: BlobUsageSummary };
   missingExpiry: MissingExpiryItem[];
   removedHistory: number;
   removedRecoveries: ExpiredRecoveryRemoval[];
   serverDate: string;
 }
+
+export type UnreferencedBlobCleanupResult =
+  | { kind: "no-head" }
+  | {
+      deletedBlobs: number;
+      deletedBytes: number;
+      kind: "checked";
+      marks: UnreferencedBlobMarks;
+      serverDate: string;
+    };
 
 export type ExpiredContentCleanupResult =
   | { kind: "no-head" }
@@ -1059,20 +1079,82 @@ export class SyncService {
     await this.acceptReviewedEntries({...snapshot, commitId}, [restoredEntry]);
   }
 
-  // 预览只读：只读远端 Head 和它的快照，不写 S3、不改本机缓存
-  async previewExpiredContentCleanup(vaultId: string): Promise<ExpiredContentPreview> {
+  // 预览只读：只读远端 Head、它的快照和数据块列表，不写 S3、不改本机缓存，也不更新第一次判定记录
+  async previewExpiredContentCleanup(
+    vaultId: string,
+    blobMarks?: Readonly<UnreferencedBlobMarks>,
+  ): Promise<ExpiredContentPreview> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead || versionedHead.value.vaultId !== vaultId) {
       throw new Error("远端 Head 指针缺失，或属于另一个仓库");
     }
     const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
     const plan = planExpiredContentCleanup(snapshot, versionedHead.serverDate);
+    // 数据块按清理提交之后的记录判定：只被过期内容引用的，清理后就没人用了
+    const cleaned: VaultSnapshot = {
+      ...snapshot,
+      entries: { ...snapshot.entries, ...Object.fromEntries(plan.changedEntries.map((entry) => [entry.entryId, entry])) },
+    };
+    const blobPlan = planUnreferencedBlobDeletion({
+      headLastModified: versionedHead.lastModified,
+      marks: blobMarks,
+      objects: await this.options.remote.listBlobObjects(),
+      referenced: new Set(snapshotBlobReferences(cleaned).keys()),
+      serverDate: versionedHead.serverDate,
+    });
     return {
+      blobs: { deletable: summarizeBlobs(blobPlan.deletable), startingTomorrow: summarizeBlobs(blobPlan.waiting) },
       missingExpiry: plan.missingExpiry,
       removedHistory: plan.removedHistory,
       removedRecoveries: plan.removedRecoveries,
       serverDate: versionedHead.serverDate,
     };
+  }
+
+  /**
+   * 删除本仓库文件夹里没人用的数据块（见 unreferenced-blob-cleanup.ts 的四条判据）。
+   * 引用集只用同一次 readHead 读到的 Head 和它的快照计算，绝不读本机缓存；删除前重读 Head、重算引用，
+   * 这期间被新提交引用的候选不删。每次最多 200 个。任何一步出错都直接抛出：宁可少删。
+   * marks 是上一次检查留下的第一次判定记录（调用方保存在本地，绑定目标和 vaultId）。
+   */
+  async deleteUnreferencedBlobs(
+    vaultId: string,
+    marks?: Readonly<UnreferencedBlobMarks>,
+  ): Promise<UnreferencedBlobCleanupResult> {
+    const remote = this.options.remote;
+    const versionedHead = await remote.readHead();
+    if (!versionedHead || versionedHead.value.vaultId !== vaultId) {
+      return { kind: "no-head" };
+    }
+    const snapshot = await remote.readSnapshot(versionedHead.value);
+    const plan = planUnreferencedBlobDeletion({
+      headLastModified: versionedHead.lastModified,
+      marks,
+      objects: await remote.listBlobObjects(),
+      referenced: new Set(snapshotBlobReferences(snapshot).keys()),
+      serverDate: versionedHead.serverDate,
+    });
+    const nextMarks = { ...plan.marks };
+    let deletedBlobs = 0;
+    let deletedBytes = 0;
+    if (plan.deletable.length > 0) {
+      const current = await remote.readHead();
+      if (!current || current.value.vaultId !== vaultId) {
+        throw new Error("删除数据块前重读 Head 指针失败，这次不删除数据块。");
+      }
+      const stillReferenced = snapshotBlobReferences(await remote.readSnapshot(current.value));
+      for (const blobId of stillReferenced.keys()) delete nextMarks[blobId];
+      const batch = plan.deletable
+        .filter((object) => !stillReferenced.has(object.blobId))
+        .slice(0, MAX_BLOB_DELETIONS_PER_RUN);
+      for (const object of batch) {
+        await remote.deleteBlob(object.blobId);
+        delete nextMarks[object.blobId];
+        deletedBlobs += 1;
+        deletedBytes += object.size;
+      }
+    }
+    return { deletedBlobs, deletedBytes, kind: "checked", marks: nextMarks, serverDate: versionedHead.serverDate };
   }
 
   // 清理提交：只用同一次 readHead 读到的 Head 和它的快照计算，CAS 也对这个 Head，绝不拿本机缓存构造

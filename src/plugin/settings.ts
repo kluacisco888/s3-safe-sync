@@ -10,6 +10,7 @@ import {
 
 import type { AwsCredentials } from "./credential-store";
 import type { ExpiredContentPreview } from "../sync/sync-service";
+import { MAX_BLOB_DELETIONS_PER_RUN, type BlobUsageSummary } from "../sync/unreferenced-blob-cleanup";
 import {
   DEFAULT_FULL_HASH_VERIFICATION_INTERVAL_DAYS,
   SUPPORTED_FULL_HASH_VERIFICATION_INTERVAL_DAYS,
@@ -88,11 +89,32 @@ const formatLocalDate = (value: string): string => {
   return `${date.getFullYear()}-${twoDigits(date.getMonth() + 1)}-${twoDigits(date.getDate())}`;
 };
 
+// 数据块大小只用于显示，按 1024 进位
+const formatBytes = (bytes: number): string =>
+  bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(1)} GB`
+    : bytes >= 1024 ** 2 ? `${(bytes / 1024 ** 2).toFixed(1)} MB`
+      : `${(bytes / 1024).toFixed(1)} KB`;
+
+// 上传月份 2026-09 → 2026 年 9 月
+const formatMonth = (month: string): string => {
+  const [year, value] = month.split("-");
+  return `${year} 年 ${Number(value)} 月`;
+};
+
+const blobSummary = (preview: ExpiredContentPreview): string => {
+  const { deletable, startingTomorrow } = preview.blobs;
+  if (deletable.count === 0 && startingTomorrow.count === 0) return "S3 上没有要删除的数据块。";
+  const waiting = startingTomorrow.count > 0
+    ? `另有 ${startingTomorrow.count} 个（${formatBytes(startingTomorrow.bytes)}）明天起删。` : "";
+  return `S3 上将删除 ${deletable.count} 个没人用的数据块（${formatBytes(deletable.bytes)}）。${waiting}` +
+    `每次最多删 ${MAX_BLOB_DELETIONS_PER_RUN} 个，剩下的之后再删；删掉的在 S3 版本控制里还能恢复 30 天。`;
+};
+
 const previewSummary = (preview: ExpiredContentPreview): string => {
   const missing = preview.missingExpiry.length > 0
     ? `另有 ${preview.missingExpiry.length} 项缺到期时间，不会清理。` : "";
   return `将去掉 ${preview.removedRecoveries.length} 个已删除文件的恢复副本、${preview.removedHistory} 个过期旧版本。${missing}` +
-    "删除记录本身保留，冲突不动。这一步只改同步记录，S3 上的数据块暂不删除。";
+    `删除记录本身保留，冲突不动。${blobSummary(preview)}`;
 };
 
 const addVisibilityButton = (
@@ -440,7 +462,8 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
     const enableSetting = new Setting(containerEl)
       .setName("启用清理过期内容")
       .setDesc(
-        "只在本电脑上运行：每天最多一次，在一次完全成功的同步之后，把已过恢复期的已删除文件恢复副本和过期旧版本从同步记录里去掉。删除记录本身保留，冲突不动。默认关闭。",
+        "只在本电脑上运行：每天最多一次，在一次完全成功的同步之后，先把已过恢复期的已删除文件恢复副本和过期旧版本从同步记录里去掉，" +
+        "再删除本仓库文件夹里没有任何记录引用、上传满 30 天、相隔至少 24 小时的两次检查都判定没人用的数据块，每次最多 200 个。删除记录本身保留，冲突不动。默认关闭。",
       )
       .addToggle((toggle) => {
         enableToggle = toggle;
@@ -458,7 +481,9 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
 
   private renderExpiredContentPreview(listEl: HTMLElement, preview: ExpiredContentPreview): void {
     listEl.empty();
-    if (preview.removedRecoveries.length === 0 && preview.removedHistory === 0 && preview.missingExpiry.length === 0) {
+    const { deletable, startingTomorrow } = preview.blobs;
+    if (preview.removedRecoveries.length === 0 && preview.removedHistory === 0 && preview.missingExpiry.length === 0 &&
+      deletable.count === 0 && startingTomorrow.count === 0) {
       listEl.createEl("p", { text: "没有已过期的内容。" });
       return;
     }
@@ -476,6 +501,16 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
         list.createEl("li", { text: `${item.path}（${item.kind === "recovery" ? "恢复副本" : "旧版本"}）` });
       }
     }
+    const months = (title: string, summary: BlobUsageSummary): void => {
+      if (summary.count === 0) return;
+      listEl.createEl("p", { text: title });
+      const list = listEl.createEl("ul");
+      for (const month of summary.byMonth) {
+        list.createEl("li", { text: `${formatMonth(month.month)}上传：${month.count} 个，${formatBytes(month.bytes)}` });
+      }
+    };
+    months("将删除的数据块（按上传月份）：", deletable);
+    months("明天起删（第一次判定没人用还不满 24 小时）：", startingTomorrow);
   }
 
   private textSetting(
