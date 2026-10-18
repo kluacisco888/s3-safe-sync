@@ -5,9 +5,11 @@ import {
   Setting,
   type ButtonComponent,
   type TextComponent,
+  type ToggleComponent,
 } from "obsidian";
 
 import type { AwsCredentials } from "./credential-store";
+import type { ExpiredContentPreview } from "../sync/sync-service";
 import {
   DEFAULT_FULL_HASH_VERIFICATION_INTERVAL_DAYS,
   SUPPORTED_FULL_HASH_VERIFICATION_INTERVAL_DAYS,
@@ -46,6 +48,12 @@ export interface SyncStatusDisplay {
 }
 
 export interface SettingsController {
+  getPluginVersion(): string;
+  // 清理过期内容只在电脑上可用；手机上这一节不显示
+  isExpiredContentCleanupAvailable(): boolean;
+  isExpiredContentCleanupEnabled(): boolean;
+  previewExpiredContentCleanup(): Promise<ExpiredContentPreview>;
+  setExpiredContentCleanupEnabled(enabled: boolean, allDevicesUpdated: boolean): Promise<void>;
   openStatus(): void;
   getProgressLabel(): string | undefined;
   getSettings(): S3VaultSyncSettings;
@@ -69,6 +77,22 @@ const asPasswordInput = (component: TextComponent): TextComponent => {
   component.inputEl.autocapitalize = "none";
   component.inputEl.spellcheck = false;
   return component;
+};
+
+const twoDigits = (value: number): string => String(value).padStart(2, "0");
+
+/** 按本机时区显示日期 YYYY-MM-DD；无法解析时原样显示 */
+const formatLocalDate = (value: string): string => {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return value;
+  return `${date.getFullYear()}-${twoDigits(date.getMonth() + 1)}-${twoDigits(date.getDate())}`;
+};
+
+const previewSummary = (preview: ExpiredContentPreview): string => {
+  const missing = preview.missingExpiry.length > 0
+    ? `另有 ${preview.missingExpiry.length} 项缺到期时间，不会清理。` : "";
+  return `将去掉 ${preview.removedRecoveries.length} 个已删除文件的恢复副本、${preview.removedHistory} 个过期旧版本。${missing}` +
+    "删除记录本身保留，冲突不动。这一步只改同步记录，S3 上的数据块暂不删除。";
 };
 
 const addVisibilityButton = (
@@ -335,6 +359,10 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
         });
       });
 
+    if (this.controller.isExpiredContentCleanupAvailable()) {
+      this.expiredContentCleanupSection();
+    }
+
     renderStatus = (): void => {
       const status = this.controller.getStatusText();
       const progressLabel = this.controller.getProgressLabel();
@@ -368,6 +396,86 @@ export class S3VaultSyncSettingsTab extends PluginSettingTab {
     this.stopStatusUpdates?.();
     this.stopStatusUpdates = undefined;
     super.hide();
+  }
+
+  private expiredContentCleanupSection(): void {
+    const { containerEl } = this;
+    const enabled = this.controller.isExpiredContentCleanupEnabled();
+    let previewed = false;
+    let confirmed = false;
+    let enableToggle: ToggleComponent | undefined;
+    // 已打开时随时可以关；没打开时必须先看过预览、并确认所有设备都已更新
+    const updateEnableToggle = (): void => {
+      enableToggle?.setDisabled(!enabled && !(previewed && confirmed));
+    };
+    const previewSetting = new Setting(containerEl)
+      .setName("预览过期内容")
+      .setDesc("只读取远端记录，列出清理过期内容时会去掉什么，不做任何修改。")
+      .addButton((button) =>
+        button.setButtonText("预览").onClick(async () => {
+          button.setDisabled(true);
+          try {
+            const preview = await this.controller.previewExpiredContentCleanup();
+            previewSetting.setDesc(previewSummary(preview));
+            this.renderExpiredContentPreview(previewList, preview);
+            previewed = true;
+            updateEnableToggle();
+          } catch (error) {
+            previewSetting.setDesc(error instanceof Error ? error.message : "预览失败。请重试，或打开同步状态查看。");
+          } finally {
+            button.setDisabled(false);
+          }
+        }),
+      );
+    const previewList = containerEl.createDiv();
+    new Setting(containerEl)
+      .setName(`所有设备都已更新到 ${this.controller.getPluginVersion()} 或更高`)
+      .setDesc("没升级的设备在清理后可能卡在修复模式。请先在每台设备上把本插件更新到这个版本或更高，再打开清理。")
+      .addToggle((toggle) =>
+        toggle.setValue(false).onChange((value) => {
+          confirmed = value;
+          updateEnableToggle();
+        }),
+      );
+    const enableSetting = new Setting(containerEl)
+      .setName("启用清理过期内容")
+      .setDesc(
+        "只在本电脑上运行：每天最多一次，在一次完全成功的同步之后，把已过恢复期的已删除文件恢复副本和过期旧版本从同步记录里去掉。删除记录本身保留，冲突不动。默认关闭。",
+      )
+      .addToggle((toggle) => {
+        enableToggle = toggle;
+        toggle.setValue(enabled).onChange(async (value) => {
+          try {
+            await this.controller.setExpiredContentCleanupEnabled(value, confirmed);
+            this.display();
+          } catch (error) {
+            enableSetting.setDesc(error instanceof Error ? error.message : "保存失败。请重试。");
+          }
+        });
+        updateEnableToggle();
+      });
+  }
+
+  private renderExpiredContentPreview(listEl: HTMLElement, preview: ExpiredContentPreview): void {
+    listEl.empty();
+    if (preview.removedRecoveries.length === 0 && preview.removedHistory === 0 && preview.missingExpiry.length === 0) {
+      listEl.createEl("p", { text: "没有已过期的内容。" });
+      return;
+    }
+    if (preview.removedRecoveries.length > 0) {
+      listEl.createEl("p", { text: "将去掉恢复副本的已删除文件（按删除日期排序）：" });
+      const list = listEl.createEl("ul");
+      for (const removal of preview.removedRecoveries) {
+        list.createEl("li", { text: `${removal.path}（删除于 ${formatLocalDate(removal.deletedAt)}）` });
+      }
+    }
+    if (preview.missingExpiry.length > 0) {
+      listEl.createEl("p", { text: "缺到期时间、不会清理的项：" });
+      const list = listEl.createEl("ul");
+      for (const item of preview.missingExpiry) {
+        list.createEl("li", { text: `${item.path}（${item.kind === "recovery" ? "恢复副本" : "旧版本"}）` });
+      }
+    }
   }
 
   private textSetting(

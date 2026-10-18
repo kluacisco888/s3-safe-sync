@@ -7,6 +7,8 @@ export type SyncPhase = typeof PHASES[number];
 const ERROR_CATEGORIES = ["network", "timeout", "service", "authentication", "remote-integrity", "local-change", "head-race", "cancelled", "unknown"] as const;
 export type SyncErrorCategory = typeof ERROR_CATEGORIES[number];
 export interface SyncRunCounts {uploaded: number; downloaded: number; deleted: number; deferred: number; unsynced: number;}
+// 这次同步之后的过期内容清理：只记时间和数量，不记路径
+export interface ExpiredContentCleanupRecord {at: number; removedRecoveries: number; removedHistory: number;}
 
 export interface SyncRunRecord {
   id: string;
@@ -32,6 +34,7 @@ export interface SyncRunRecord {
   httpStatus?: number;
   writeResultUncertain?: boolean;
   nextRetryAt?: number;
+  expiredContentCleanup?: ExpiredContentCleanupRecord;
 }
 
 export interface SyncDiagnosticsSnapshot {
@@ -85,6 +88,12 @@ const parseRecord = (value: unknown): SyncRunRecord | undefined => {
       deleted: nonnegative((record.counts as Record<string, unknown>).deleted) ?? 0,
       deferred: nonnegative((record.counts as Record<string, unknown>).deferred) ?? 0,
       unsynced: nonnegative((record.counts as Record<string, unknown>).unsynced) ?? 0,
+    }} : {}),
+    ...(record.expiredContentCleanup && typeof record.expiredContentCleanup === "object" &&
+      nonnegative((record.expiredContentCleanup as Record<string, unknown>).at) !== undefined ? {expiredContentCleanup: {
+      at: nonnegative((record.expiredContentCleanup as Record<string, unknown>).at) ?? 0,
+      removedRecoveries: nonnegative((record.expiredContentCleanup as Record<string, unknown>).removedRecoveries) ?? 0,
+      removedHistory: nonnegative((record.expiredContentCleanup as Record<string, unknown>).removedHistory) ?? 0,
     }} : {}),
   };
 };

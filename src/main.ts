@@ -29,12 +29,15 @@ import {
   SyncService,
   type CachedSyncState,
   type DeferredDownloadEntry,
+  type ExpiredContentCleanupResult,
+  type ExpiredContentPreview,
   type LocalSyncIssue,
   type LocalContentReview,
   type LocalContentChoice,
   type PossibleRenameResolution,
   type SyncCachePort,
   type SyncProgress,
+  type SyncResult,
   type VerifiedLocalFile,
 } from "./sync/sync-service";
 import { DirtyPathTracker } from "./sync/dirty-path-tracker";
@@ -123,12 +126,16 @@ interface PersistedPluginData {
     phase: "uploading" | "publishing";
   };
   pendingProbes?: Array<{ bucket: string; region: string; prefix: string; key: string }>;
+  // 清理过期内容的开关：只对打开时的仓库目标（桶、区域、前缀、vaultId）有效；
+  // lastRunServerDate 是上一次清理读到的 AWS 时间，用来做到每天最多一次
+  expiredContentCleanup?: { target: string; lastRunServerDate?: string };
   settings: S3VaultSyncSettings;
 }
 
 const normalizePrefix = (prefix: string): string =>
   prefix.replace(/^\/+|\/+$/gu, "");
 
+const DAY_MS = 24 * 60 * 60 * 1_000;
 const ANDROID_DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const ANDROID_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 // 网络类可重试错误从这一轮第一次失败起连续满这么久仍未成功，才自动弹出同步状态窗口
@@ -165,6 +172,8 @@ export default class S3VaultSyncPlugin
   private pendingLocalIssues: LocalSyncIssue[] = [];
   private approvedRenameResolution: PossibleRenameResolution | undefined;
   private pendingDeferredDownloads: DeferredDownloadEntry[] = [];
+  // 本次运行里看过预览的仓库目标；没看过预览不能打开清理
+  private expiredContentPreviewTarget: string | undefined;
   private readonly pluginDataWriter = new SerializedDataWriter(
     () => this.data,
     (snapshot) => {
@@ -396,6 +405,44 @@ export default class S3VaultSyncPlugin
         entry.kind === "deleted" &&
         (entry.recovery !== undefined || (entry.history?.length ?? 0) > 0),
     );
+  }
+
+  getPluginVersion(): string {
+    return this.manifest.version ?? "";
+  }
+
+  isExpiredContentCleanupAvailable(): boolean {
+    return Platform.isDesktopApp;
+  }
+
+  isExpiredContentCleanupEnabled(): boolean {
+    return this.data.expiredContentCleanup?.target === this.integrityTarget();
+  }
+
+  // 预览只读：只读远端 Head 和快照，不写 S3、不改缓存
+  async previewExpiredContentCleanup(): Promise<ExpiredContentPreview> {
+    if (!Platform.isDesktopApp) throw new Error("清理过期内容只能在电脑上使用。");
+    const vaultId = this.data.settings.vaultId;
+    if (!vaultId || !this.credentials.loadVaultKey()) throw new Error("请先初始化或解锁加密仓库。");
+    const target = this.integrityTarget();
+    const preview = await this.runExclusiveSyncService(service => service.previewExpiredContentCleanup(vaultId));
+    if (this.integrityTarget() === target) this.expiredContentPreviewTarget = target;
+    return preview;
+  }
+
+  async setExpiredContentCleanupEnabled(enabled: boolean, allDevicesUpdated: boolean): Promise<void> {
+    if (!enabled) {
+      this.data.expiredContentCleanup = undefined;
+      await this.savePluginData();
+      return;
+    }
+    if (!Platform.isDesktopApp) throw new Error("清理过期内容只能在电脑上打开。");
+    const target = this.integrityTarget();
+    if (this.expiredContentPreviewTarget !== target) throw new Error("请先预览这次会清理的内容，再打开清理。");
+    if (!allDevicesUpdated) throw new Error("请先确认所有设备都已更新到这个版本或更高，再打开清理。");
+    if (this.data.expiredContentCleanup?.target === target) return;
+    this.data.expiredContentCleanup = {target};
+    await this.savePluginData();
   }
 
   async confirmBulkDeletion(): Promise<void> {
@@ -942,6 +989,7 @@ export default class S3VaultSyncPlugin
       pendingIntegrityChecks: stored?.pendingIntegrityChecks ?? [],
       pendingInitialization: stored?.pendingInitialization,
       pendingProbes: stored?.pendingProbes ?? [],
+      expiredContentCleanup: stored?.expiredContentCleanup,
       settings,
     };
     this.acceptedCommit = this.data.cache?.snapshot.commitId;
@@ -1187,6 +1235,7 @@ export default class S3VaultSyncPlugin
           "Idle",
           `下载 ${result.downloaded}，上传 ${result.uploaded}，删除 ${result.deleted}，暂缓下载 ${result.deferredDownloads}，未同步 ${result.unsyncedLocalEntries}。`,
         );
+        await this.runExpiredContentCleanup(remote, boundHead.serverDate, result, diagnostic, assertIntegrityTarget);
       }
     } catch (error) {
       const retryableNetwork = error instanceof S3TransportError ||
@@ -1242,6 +1291,42 @@ export default class S3VaultSyncPlugin
         this.setStatus("Paused", "本设备已暂停自动同步。");
       }
     }
+  }
+
+  // 清理过期内容：只在电脑上、已打开、紧跟一次完全成功的同步运行，按 AWS 时间每天最多一次。
+  // 有待处理的审查、冲突、Bulk Deletion 确认或待复查的完整性检查时不运行：清理提交会改 Head，
+  // 让还没处理的审查失效
+  private async runExpiredContentCleanup(
+    remote: RemoteStore,
+    observedServerDate: string,
+    result: SyncResult,
+    diagnostic: SyncRunRecord,
+    assertTarget: () => void,
+  ): Promise<void> {
+    if (!Platform.isDesktopApp || !this.isExpiredContentCleanupEnabled()) return;
+    const vaultId = this.data.settings.vaultId;
+    if (!vaultId || result.status !== "complete" || !result.cacheUpdated || result.bulkDeletion ||
+      result.localIssues.length > 0 || this.pendingBulkDeletion || this.pendingLocalIssues.length > 0 ||
+      this.getConflicts().length > 0 || this.currentIntegrityChecks().length > 0 ||
+      this.data.pendingCollisionRename) return;
+    const target = this.integrityTarget();
+    const lastRun = Date.parse(this.data.expiredContentCleanup?.lastRunServerDate ?? "");
+    if (Number.isFinite(lastRun) && Date.parse(observedServerDate) - lastRun < DAY_MS) return;
+    let cleanup: ExpiredContentCleanupResult;
+    try {
+      cleanup = await retryHeadChanges(() => this.createSyncService(remote).cleanupExpiredContent(vaultId));
+    } catch (error) {
+      // 几次都被别的设备抢先：留到下一次同步之后再试
+      if (error instanceof HeadChangedError) return;
+      throw error;
+    }
+    this.session.assertActive();
+    assertTarget();
+    if (cleanup.kind === "no-head" || this.integrityTarget() !== target) return;
+    diagnostic.expiredContentCleanup = {at: Date.now(), removedHistory: cleanup.removedHistory,
+      removedRecoveries: cleanup.removedRecoveries};
+    this.data.expiredContentCleanup = {target, lastRunServerDate: cleanup.serverDate};
+    await this.savePluginData();
   }
 
   private clearHeadRetryTimer(): void {

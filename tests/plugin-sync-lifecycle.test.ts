@@ -18,6 +18,7 @@ const host = vi.hoisted((): {
   domEvents: Map<string, Array<() => void>>;
   mobile: boolean;
   android: boolean;
+  desktop: boolean;
   openedModals: Array<{close(): void}>;
 } => ({
   data: undefined,
@@ -28,6 +29,7 @@ const host = vi.hoisted((): {
   domEvents: new Map(),
   mobile: false,
   android: false,
+  desktop: false,
   openedModals: [],
 }));
 
@@ -48,7 +50,7 @@ vi.mock("obsidian", () => ({
       },
     })};
   },
-  Platform: { isDesktop: false, isDesktopApp: false, get isMobile() {return host.mobile;}, get isAndroidApp() {return host.android;} },
+  Platform: { isDesktop: false, get isDesktopApp() {return host.desktop;}, get isMobile() {return host.mobile;}, get isAndroidApp() {return host.android;} },
   Plugin: class {
     constructor(public app: unknown, public manifest: unknown) {}
     async loadData() { await host.beforeLoad?.(); return structuredClone(host.data); }
@@ -308,6 +310,7 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   host.mobile = false;
   host.android = false;
+  host.desktop = false;
   host.requestUrl.mockClear();
   vi.clearAllTimers();
   vi.useRealTimers();
@@ -1301,6 +1304,162 @@ describe("opening sync status when synchronization stops", () => {
     expect(host.openedModals).toHaveLength(2);
     await plugin.syncNow();
     expect(host.openedModals).toHaveLength(2);
+    plugin.onunload();
+  });
+});
+
+describe("expired content cleanup on the desktop", () => {
+  // 远端多一条已删除记录，它的恢复副本早已过期
+  const addExpiredRecovery = async (remote: RemoteStore) => {
+    const body = new TextEncoder().encode("long gone");
+    const blobId = crypto.randomUUID();
+    await remote.writeBlob(blobId, body);
+    const { sha256Content } = await import("../src/sync/content-hash");
+    const head = (await remote.readHead())!;
+    const commitId = crypto.randomUUID();
+    await remote.advance({
+      commit: { changes: [{ kind: "set-entry", entry: {
+        deletedAt: "2020-01-01T00:00:00.000Z", entryId: "gone", kind: "deleted", lastContentHash: await sha256Content(body),
+        lastRevisionId: "gone-revision", path: "old/gone.md",
+        recovery: { blobId, contentHash: await sha256Content(body), createdAt: "2020-01-01T00:00:00.000Z",
+          expiresAt: "2020-01-31T00:00:00.000Z", revisionId: "gone-revision", size: body.byteLength },
+      } }], commitId, createdAt: head.serverDate, parentIds: [head.value.commitId], protocolVersion: 1,
+      replicaId: "phone", vaultId: "vault-1" },
+      expectedHeadEtag: head.etag,
+      head: { ...head.value, commitId, generation: head.value.generation + 1 },
+    });
+  };
+
+  const goneRecovery = async (remote: RemoteStore) => {
+    const head = (await remote.readHead())!;
+    const entry = (await remote.readSnapshot(head.value)).entries.gone;
+    return { generation: head.value.generation, recovery: entry?.kind === "deleted" ? entry.recovery : undefined };
+  };
+
+  const enabledDesktop = async () => {
+    host.desktop = true;
+    const fixture = await setup();
+    await addExpiredRecovery(fixture.remote);
+    await fixture.plugin.previewExpiredContentCleanup();
+    await fixture.plugin.setExpiredContentCleanupEnabled(true, true);
+    return fixture;
+  };
+
+  it("cannot be turned on before a preview or without confirming every device is updated", async () => {
+    host.desktop = true;
+    const { plugin, remote } = await setup();
+    await addExpiredRecovery(remote);
+    await expect(plugin.setExpiredContentCleanupEnabled(true, true)).rejects.toThrow("请先预览");
+    const preview = await plugin.previewExpiredContentCleanup();
+    expect(preview.removedRecoveries).toEqual([{ deletedAt: "2020-01-01T00:00:00.000Z", path: "old/gone.md" }]);
+    await expect(plugin.setExpiredContentCleanupEnabled(true, false)).rejects.toThrow("所有设备");
+    expect(plugin.isExpiredContentCleanupEnabled()).toBe(false);
+    await plugin.setExpiredContentCleanupEnabled(true, true);
+    expect(plugin.isExpiredContentCleanupEnabled()).toBe(true);
+    plugin.onunload();
+  });
+
+  it("cleans once after a complete sync, records counts without paths, and waits a day before the next run", async () => {
+    const { plugin, remote } = await enabledDesktop();
+    expect(plugin.isExpiredContentCleanupAvailable()).toBe(true);
+
+    await plugin.togglePause();
+
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+    const after = await goneRecovery(remote);
+    expect(after.recovery).toBeUndefined();
+    // 已删除列表不再有它
+    expect(plugin.getDeletedRecoveries()).toEqual([]);
+    const record = plugin.getDiagnostics().records.at(-1)!;
+    expect(record.expiredContentCleanup).toEqual({ at: expect.any(Number), removedHistory: 0, removedRecoveries: 1 });
+    expect(plugin.exportDiagnostics()).not.toContain("old/gone.md");
+    // 同一天再同步：不再清理
+    await addExpiredRecovery(remote);
+    const generation = (await goneRecovery(remote)).generation;
+    await plugin.syncNow();
+    expect(await goneRecovery(remote)).toMatchObject({ generation, recovery: expect.anything() });
+    expect(plugin.getDiagnostics().records.at(-1)!.expiredContentCleanup).toBeUndefined();
+    // 过了 24 小时（AWS 时间）再同步：再清理一次
+    vi.setSystemTime(Date.now() + 25 * 60 * 60 * 1000);
+    await plugin.syncNow();
+    expect((await goneRecovery(remote)).recovery).toBeUndefined();
+    plugin.onunload();
+  });
+
+  it("neither shows nor runs on a phone even when the stored switch is on", async () => {
+    const { plugin, remote } = await enabledDesktop();
+    host.desktop = false;
+    expect(plugin.isExpiredContentCleanupAvailable()).toBe(false);
+    await expect(plugin.previewExpiredContentCleanup()).rejects.toThrow("电脑");
+    await expect(plugin.setExpiredContentCleanupEnabled(true, true)).rejects.toThrow("电脑");
+
+    await plugin.togglePause();
+
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+    expect((await goneRecovery(remote)).recovery).toBeDefined();
+    plugin.onunload();
+  });
+
+  it("does not run when the sync needs a Bulk Deletion decision", async () => {
+    const { plugin, remote, setLocalPresent } = await enabledDesktop();
+    setLocalPresent(false);
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
+    expect((await goneRecovery(remote)).recovery).toBeDefined();
+    plugin.onunload();
+  });
+
+  it("does not run while a Conflict waits for the user, since the sync is not complete", async () => {
+    const { plugin, remote } = await enabledDesktop();
+    const head = (await remote.readHead())!;
+    const commitId = crypto.randomUUID();
+    const body = new TextEncoder().encode("candidate");
+    await remote.writeBlob("candidate-blob", body);
+    const { sha256Content } = await import("../src/sync/content-hash");
+    await remote.advance({
+      commit: { changes: [{ kind: "set-entry", entry: { candidates: [{ blobId: "candidate-blob",
+        contentHash: await sha256Content(body), createdAt: head.serverDate, revisionId: "candidate", size: body.byteLength }],
+        entryId: "conflict", kind: "conflicted", path: "other/conflict.md", reason: "edit-edit" } }],
+      commitId, createdAt: head.serverDate, parentIds: [head.value.commitId], protocolVersion: 1, replicaId: "phone", vaultId: "vault-1" },
+      expectedHeadEtag: head.etag, head: { ...head.value, commitId, generation: head.value.generation + 1 },
+    });
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
+    expect((await goneRecovery(remote)).recovery).toBeDefined();
+    plugin.onunload();
+  });
+
+  it("does not run after a sync that failed on the network", async () => {
+    const { plugin, remote, hooks } = await enabledDesktop();
+    hooks.headFailure = "network";
+    await plugin.togglePause();
+    hooks.headFailure = undefined;
+    expect(plugin.getStatusText()).not.toMatch(/^空闲：/u);
+    expect((await goneRecovery(remote)).recovery).toBeDefined();
+    plugin.onunload();
+  });
+
+  it("does not run in Repair Mode with an integrity check left to recheck", async () => {
+    const { plugin, remote, hooks } = await enabledDesktop();
+    hooks.headFailure = "corrupt";
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：修复模式/u);
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：修复模式/u);
+    hooks.headFailure = undefined;
+    expect((await goneRecovery(remote)).recovery).toBeDefined();
+    plugin.onunload();
+  });
+
+  it("does not run when the remote Head does not exist", async () => {
+    const { plugin, objects } = await enabledDesktop();
+    const puts = () => host.requestUrl.mock.calls.filter(([request]) => (request as {method: string}).method === "PUT").length;
+    objects.delete("test-prefix/v1/head");
+    const before = puts();
+    await plugin.togglePause();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：修复模式/u);
+    expect(objects.has("test-prefix/v1/head")).toBe(false);
+    expect(puts()).toBe(before);
     plugin.onunload();
   });
 });
