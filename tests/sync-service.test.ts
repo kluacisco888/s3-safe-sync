@@ -19,6 +19,7 @@ import {
   RemoteStore,
 } from "../src/storage/remote-store";
 import { SyncRequestQueue } from "../src/sync/sync-request-queue";
+import { SyncEngine, type LiveEntry, type VaultEntry } from "../src/sync/sync-engine";
 import { sha256Content } from "../src/sync/content-hash";
 import { LocalStateChangedError } from "../src/sync/errors";
 import { PathRenameTracker } from "../src/sync/path-rename-tracker";
@@ -6248,5 +6249,109 @@ describe("SyncService", () => {
       path: "notes/renamed.md",
       revision: { size: 19 },
     });
+  });
+});
+
+describe("a base Revision purged from the remote record", () => {
+  const prefix = "purged";
+  const vaultKey = Uint8Array.from({ length: 32 }, (_, index) => index);
+  const text = (value: string): Uint8Array => new TextEncoder().encode(value);
+
+  const readCurrent = async (remote: RemoteStore) => {
+    const head = await remote.readHead();
+    if (!head) throw new Error("Expected initialized Head");
+    return { head, snapshot: await remote.readSnapshot(head.value) };
+  };
+
+  // 模拟票 03 的清理提交：把指定 Revision 从远端记录的 Version History 里去掉；
+  // deleteBlobs 再模拟票 04 删掉它们的数据块
+  const purgeRevisions = async (
+    remote: RemoteStore,
+    objects: MemoryObjectStore,
+    revisionIds: readonly string[],
+    deleteBlobs: boolean,
+  ): Promise<void> => {
+    const { head, snapshot } = await readCurrent(remote);
+    const purged = new Set(revisionIds);
+    const blobIds: string[] = [];
+    const changes: Array<{ entry: VaultEntry; kind: "set-entry" }> = [];
+    for (const entry of Object.values(snapshot.entries)) {
+      const removed = (entry.history ?? []).filter((revision) => purged.has(revision.revisionId));
+      if (removed.length === 0) continue;
+      blobIds.push(...removed.map((revision) => revision.blobId));
+      changes.push({
+        entry: { ...entry, history: (entry.history ?? []).filter((revision) => !purged.has(revision.revisionId)) },
+        kind: "set-entry",
+      });
+    }
+    if (changes.length !== revisionIds.length) throw new Error("Expected every purged Revision in history");
+    const commitId = crypto.randomUUID();
+    await remote.advance({
+      commit: {
+        changes, commitId, createdAt: head.serverDate, parentIds: [head.value.commitId],
+        protocolVersion: 1, replicaId: "cleanup", vaultId: snapshot.vaultId,
+      },
+      expectedHeadEtag: head.etag,
+      head: { ...head.value, commitId, generation: head.value.generation + 1 },
+    });
+    if (deleteBlobs) {
+      for (const blobId of blobIds) await objects.delete(`${prefix}/v1/blobs/${blobId}`);
+    }
+  };
+
+  const setup = async (path = "note.md", initial = "v0") => {
+    const objects = new MemoryObjectStore();
+    const open = () => RemoteStore.open({ objects, prefix, vaultKey });
+    const desktopVault = new MemoryVault();
+    await desktopVault.write(path, text(initial));
+    const desktop = new SyncService({
+      cache: new MemorySyncCache(), local: desktopVault, remote: await open(), replicaId: "desktop",
+    });
+    await desktop.initializeNew("vault");
+    const phoneVault = new MemoryVault();
+    const phoneCache = new MemorySyncCache();
+    const phone = new SyncService({ cache: phoneCache, local: phoneVault, remote: await open(), replicaId: "phone" });
+    await phone.synchronize();
+    const observer = await open();
+    const liveEntry = async (): Promise<LiveEntry> => {
+      const entry = Object.values((await readCurrent(observer)).snapshot.entries).find((value) => value.path === path);
+      if (entry?.kind !== "live") throw new Error("Expected a live Entry");
+      return entry;
+    };
+    return { desktop, desktopVault, liveEntry, objects, observer, open, phone, phoneCache, phoneVault };
+  };
+
+  it.each([
+    ["purged from the record", false],
+    ["purged and its blob deleted", true],
+  ])("downloads a newer Revision over an unchanged copy whose base was %s", async (_label, deleteBlobs) => {
+    const fixture = await setup();
+    const base = await fixture.liveEntry();
+    await fixture.desktopVault.write("note.md", text("v1"));
+    await fixture.desktop.synchronize();
+    await purgeRevisions(fixture.observer, fixture.objects, [base.revision.revisionId], deleteBlobs);
+    const write = vi.spyOn(fixture.phoneVault, "write");
+
+    const result = await fixture.phone.synchronize();
+
+    expect(result).toMatchObject({ downloaded: 1, status: "complete", uploaded: 0 });
+    expect(fixture.phoneVault.readText("note.md")).toBe("v1");
+    // 被替换的旧字节交给安全写入：写入时带上被替换内容的哈希，由它把旧字节挪进本机回收站
+    expect(write).toHaveBeenCalledWith("note.md", expect.any(Uint8Array), base.revision.contentHash);
+    expect(fixture.phoneCache.state?.files["note.md"]?.contentHash).toBe(await sha256Content(text("v1")));
+  });
+
+  it("clears a recovery recheck left for content the remote record no longer references", async () => {
+    const fixture = await setup();
+    const base = await fixture.liveEntry();
+    await fixture.desktopVault.write("note.md", text("v1"));
+    await fixture.desktop.synchronize();
+    await purgeRevisions(fixture.observer, fixture.objects, [base.revision.revisionId], true);
+    // 旧版本插件在下载覆盖前找不到恢复副本时记下的就是这一项
+    const check = { contentHash: base.revision.contentHash, entryId: base.entryId, kind: "recovery" as const };
+
+    await expect(fixture.phone.verifyRemoteIntegrity([check], "vault")).resolves.toBeUndefined();
+    await expect(fixture.phone.synchronize()).resolves.toMatchObject({ downloaded: 1, status: "complete" });
+    expect(fixture.phoneVault.readText("note.md")).toBe("v1");
   });
 });

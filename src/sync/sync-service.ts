@@ -37,6 +37,13 @@ const retainedRevisions = (entry: VaultEntry): RevisionRef[] => [
   ...(entry.history ?? []),
 ];
 
+// 本机缓存里这个 Entry 已接受的本机内容：当前版本，或冲突时已落地的那个候选
+const acceptedContentHash = (base: VaultSnapshot | undefined, entryId: string): string | undefined => {
+  const entry = base?.entries[entryId];
+  return entry?.kind === "live" ? entry.revision.contentHash
+    : entry?.kind === "conflicted" ? entry.materializedContentHash : undefined;
+};
+
 export interface LocalFileInfo {
   modifiedAt: number;
   path: string;
@@ -458,12 +465,15 @@ export class SyncService {
       throw new Error(`本设备不支持这个路径：${entry.path}`);
     }
     const cached = await this.options.cache.load();
-    const expectedContentHash = cached?.files[entry.path]?.contentHash ?? null;
+    const cachedFile = cached?.files[entry.path];
+    const expectedContentHash = cachedFile?.contentHash ?? null;
     await this.assertLocalContent(entry.path, expectedContentHash);
     await this.assertRemoteRecoveryForLocalContent(
       snapshot,
       entry.entryId,
       expectedContentHash,
+      // 缓存里这个路径记的是本 Entry 时，记下的内容就是它已接受的本机 base
+      cachedFile?.entryId === entry.entryId ? cachedFile.contentHash : undefined,
     );
     const plaintext = await this.options.remote.readBlob(entry.revision.blobId);
     if (
@@ -1627,7 +1637,8 @@ export class SyncService {
             expectedLocalContentByPath.get(action.fromPath) ?? null;
           const expectedTargetHash = expectedLocalContentByPath.get(action.toPath) ?? null;
           if (expectedTargetHash !== null) {
-            await this.assertRemoteRecoveryForLocalContent(remote, action.entryId, expectedContentHash);
+            await this.assertRemoteRecoveryForLocalContent(remote, action.entryId, expectedContentHash,
+              acceptedContentHash(reconciliationBase, action.entryId));
             await this.assertLocalContent(action.toPath, expectedTargetHash);
           }
           await this.assertLocalContent(action.fromPath, expectedContentHash);
@@ -1671,6 +1682,7 @@ export class SyncService {
             remote,
             action.entryId,
             expectedContentHash,
+            acceptedContentHash(reconciliationBase, action.entryId),
           );
           await this.assertLocalContent(action.path, expectedContentHash);
           await this.options.local.write(
@@ -2348,7 +2360,10 @@ export class SyncService {
           this.exceedsAutomaticFileLimit(entry.path, revision.size))) {
           throw new Error(`完整校验超过了本设备的传输限制：${entry.path}。请连接 Wi-Fi 或在桌面端重试。`);
         }
-        await this.assertRemoteRecoveryForLocalContent(snapshot, check.entryId, check.contentHash);
+        // 与同步用同一判据：这份内容是本机已接受的 base，而远端当前记录里已没有同内容的 Revision
+        // （已被过期清理），这项恢复要求随之失效。之后的同步仍只在本机内容等于 base 时才覆盖
+        await this.assertRemoteRecoveryForLocalContent(snapshot, check.entryId, check.contentHash,
+          acceptedContentHash(this.buildReconciliationBase(await this.options.cache.load()), check.entryId));
       } else if (check.kind === "blob") {
         for (const entry of Object.values(snapshot.entries)) {
           for (const revision of retainedRevisions(entry).filter(revision => revision.blobId === check.blobId)) {
@@ -2389,10 +2404,15 @@ export class SyncService {
       : plan;
   }
 
+  // acceptedBaseContentHash 是这个 Entry 已接受的本机 base 内容。本机内容等于它、
+  // 而远端当前记录里已没有任何同内容的 Revision（旧版本已过期并被清理出记录）时，
+  // 不再要求远端恢复副本：被替换的本机旧字节由安全写入挪进本机回收站。
+  // 远端记录仍引用同内容的 Revision 时照旧逐个核实，读不到或校验失败仍是完整性错误。
   private async assertRemoteRecoveryForLocalContent(
     snapshot: VaultSnapshot,
     entryId: string,
     expectedContentHash: string | null,
+    acceptedBaseContentHash?: string,
   ): Promise<void> {
     if (expectedContentHash === null) {
       return;
@@ -2402,6 +2422,9 @@ export class SyncService {
       throw new Error(`文件 ${entryId} 的本地内容在远端没有可用的恢复副本`);
     }
     const revisions = retainedRevisions(entry).filter((revision) => revision.contentHash === expectedContentHash);
+    if (revisions.length === 0 && acceptedBaseContentHash === expectedContentHash) {
+      return;
+    }
     for (const revision of revisions) {
       try {
         await this.assertRemoteRevision(revision);
