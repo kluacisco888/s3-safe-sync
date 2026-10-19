@@ -9,21 +9,27 @@ const { Element, opened, dropdowns } = vi.hoisted(() => {
     open = false;
     disabled = false;
     value = "";
+    type = "";
+    checked = false;
+    indeterminate = false;
+    classes = new Set<string>();
     events = new Map<string, () => void>();
     constructor(readonly tag: string) {}
     empty() { this.children = []; }
-    addClass() {}
+    addClass(value: string) { this.classes.add(value); }
     setAttr() {}
     addEventListener(name: string, handler: () => void) { this.events.set(name, handler); }
     setText(text: string) { this.text = text; }
-    createEl(tag: string, options: { text?: string } = {}) {
+    createEl(tag: string, options: { text?: string; cls?: string; type?: string } = {}) {
       const element = new Element(tag);
       element.text = options.text ?? "";
+      element.type = options.type ?? "";
+      for (const value of options.cls?.split(" ") ?? []) if (value) element.classes.add(value);
       this.children.push(element);
       return element;
     }
-    createDiv(options: {text?: string} = {}) { return this.createEl("div", options); }
-    createSpan(options: {text?: string} = {}) { return this.createEl("span", options); }
+    createDiv(options: {text?: string; cls?: string} = {}) { return this.createEl("div", options); }
+    createSpan(options: {text?: string; cls?: string} = {}) { return this.createEl("span", options); }
   }
   return { Element, opened: [] as Array<{contentEl: Element}>,
     dropdowns: [] as Array<{options: Array<[string, string]>; value: string; change?: (value: string) => void}> };
@@ -56,7 +62,8 @@ vi.mock("obsidian", () => ({
 }));
 
 import { StatusModal, VersionHistoryModal, type StatusModalController } from "../src/plugin/modals";
-import type { LocalSyncIssue } from "../src/sync/sync-service";
+import type { CleanupController, CleanupView } from "../src/plugin/cleanup-modal";
+import type { CleanupCandidate, LocalSyncIssue } from "../src/sync/sync-service";
 
 const reviewActions = {
   reviewPathCollision: async (paths: string[]) => ({paths, reviewToken: "collision-review", localFiles: [], remoteFiles: [], relatedPaths: [], pendingMoves: []}),
@@ -660,5 +667,233 @@ describe("StatusModal", () => {
         {key: "Enter", preventDefault() {}});
       expect(all(opened.at(-1)!.contentEl).some(node => node.text === "5 字节 · 可恢复至 2026-11-05 09:11")).toBe(true);
     });
+  });
+});
+
+describe("cleanup from the status window", () => {
+  const originalTimeZone = process.env.TZ;
+  beforeAll(() => {process.env.TZ = "Asia/Shanghai";});
+  afterAll(() => {
+    if (originalTimeZone === undefined) delete process.env.TZ;
+    else process.env.TZ = originalTimeZone;
+  });
+  type FakeElement = InstanceType<typeof Element>;
+  const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
+  const nodesOf = (modal: {contentEl: unknown}) => all(modal.contentEl as FakeElement);
+  const textsOf = (modal: {contentEl: unknown}) => nodesOf(modal).map(node => node.text);
+  const button = (modal: {contentEl: unknown}, text: string) => {
+    const found = nodesOf(modal).find(node => node.tag === "button" && node.text === text);
+    if (!found) throw new Error(`Missing button ${text}`);
+    return found;
+  };
+  const DAY = 24 * 60 * 60 * 1000;
+  const HOUR = 60 * 60 * 1000;
+  const SERVER = "2026-10-19T00:00:00.000Z";
+
+  const recovery = (index: number, extra: Partial<CleanupCandidate> = {}): CleanupCandidate => ({
+    blobId: `blob-r${index}`, deletedAt: "2026-09-05T02:20:00.000Z", entryId: `r${index}`, expiresAt: "2026-10-05T02:20:00.000Z",
+    key: `recovery:r${index}:rev`, kind: "recovery", path: `notes/deleted-${index}.md`, revisionId: "rev", size: 2048, ...extra,
+  } as CleanupCandidate);
+  const history: CleanupCandidate = {
+    blobId: "blob-h", entryId: "h", expiresAt: "2026-10-03T10:02:00.000Z", key: "history:h:rev", kind: "history",
+    path: "notes/log.md", revisionId: "rev", size: 22528,
+  };
+  const orphan: CleanupCandidate = {blobId: "a91c0e2f-1111-4222-8333-444455556666", key: "orphan:a91c0e2f-1111-4222-8333-444455556666",
+    kind: "orphan", size: 65536, uploadedAt: "2026-09-05T06:02:00.000Z"};
+
+  const cleanupWith = (view: CleanupView, overrides: Partial<CleanupController> = {}) => {
+    let current = view;
+    const load = vi.fn(async () => current);
+    const undo = vi.fn(async (_key: string) => {});
+    const move = async (keys: string[], _allDevicesUpdated: boolean): Promise<void> => {
+        const moved = current.candidates.filter(candidate => keys.includes(candidate.key));
+        current = {...current, candidates: current.candidates.filter(candidate => !keys.includes(candidate.key)),
+          pending: [...current.pending, ...moved.map(candidate => ({blobId: candidate.blobId, confirmedAt: new Date().toISOString(),
+            key: candidate.key, kind: candidate.kind, size: candidate.size, ...(candidate.kind === "orphan" ? {} : {path: candidate.path})}))]};
+    };
+    const controller: CleanupController = {
+      getCleanupCount: () => current.candidates.length,
+      loadCleanup: load,
+      getCleanupView: () => current,
+      needsCleanupDeviceConfirmation: () => true,
+      confirmCleanup: move,
+      undoCleanup: undo,
+      ...overrides,
+    };
+    return Object.assign(controller, {load, move, undo});
+  };
+  const statusController = (cleanup: CleanupController | undefined): StatusModalController => ({
+    ...reviewActions,
+    getStatusText: () => "空闲：", isPaused: () => false,
+    getConflicts: () => [], getDeferredDownloads: () => [], getDeletedRecoveries: () => [],
+    getLocalIssues: () => [], getPendingBulkDeletion: () => undefined,
+    confirmBulkDeletion: async () => {}, downloadDeferred: async () => {}, importCandidate: async () => {},
+    resolvePossibleRename: async () => {}, keepConflictDeleted: async () => {},
+    resolveConflict: async () => {}, restoreDeleted: async () => {},
+    readDeletedRecovery: async () => new Uint8Array(), syncNow: async () => {}, togglePause: async () => {},
+    onStatusChange: () => () => {}, exportDiagnostics: () => "{}",
+    cleanupController: () => cleanup,
+  });
+  const openCleanup = async (cleanup: CleanupController) => {
+    const status = new StatusModal({} as App, statusController(cleanup));
+    status.onOpen();
+    button(status, cleanup.getCleanupCount() ? `待清理（${cleanup.getCleanupCount()}）` : "待清理").events.get("click")!();
+    const page = opened.at(-1)!;
+    await vi.waitFor(() => expect(textsOf(page)).toContain("待清理的内容"));
+    await vi.waitFor(() => expect(nodesOf(page).some(node => node.text.startsWith("已选"))).toBe(true));
+    return page;
+  };
+  const checkbox = (page: {contentEl: unknown}, label: string) => {
+    // 勾选框和它的文字在同一个 label 里
+    const owner = nodesOf(page).find(node => node.tag === "label" && all(node).some(child => child.text === label));
+    const box = owner && all(owner).find(child => child.tag === "input" && child.type === "checkbox");
+    if (!box) throw new Error(`Missing checkbox for ${label}`);
+    return box;
+  };
+  const toggle = (box: FakeElement, checked: boolean) => { box.checked = checked; box.events.get("change")!(); };
+
+  it("puts 待清理 last after 复制诊断数据 on the desktop, highlighted with the count, and does not read S3 to show it", () => {
+    const cleanup = cleanupWith({candidates: [recovery(1), history, orphan], pending: [], serverDate: SERVER});
+    const status = new StatusModal({} as App, statusController(cleanup));
+    status.onOpen();
+    const toolbar = nodesOf(status).find(node => node.children.some(child => child.text === "复制诊断数据"))!;
+    const labels = toolbar.children.filter(node => node.tag === "button").map(node => node.text);
+    expect(labels.at(-1)).toBe("待清理（3）");
+    expect(labels.indexOf("待清理（3）")).toBe(labels.indexOf("复制诊断数据") + 1);
+    expect(button(status, "待清理（3）").classes.has("s3-vault-sync-cleanup-pending")).toBe(true);
+    expect(cleanup.load).not.toHaveBeenCalled();
+  });
+
+  it("shows a plain 待清理 when nothing can be cleaned, and no button at all on a phone", () => {
+    const empty = new StatusModal({} as App, statusController(cleanupWith({candidates: [], pending: [], serverDate: SERVER})));
+    empty.onOpen();
+    expect(button(empty, "待清理").classes.has("s3-vault-sync-cleanup-pending")).toBe(false);
+    const phone = new StatusModal({} as App, statusController(undefined));
+    phone.onOpen();
+    expect(textsOf(phone).some(text => text.startsWith("待清理"))).toBe(false);
+  });
+
+  it("lists the three groups with their details, the shared-content note and the explanation", async () => {
+    const page = await openCleanup(cleanupWith({serverDate: SERVER, pending: [], candidates: [
+      recovery(1, {sharedWith: {path: "报价-最终.xlsx"}}),
+      recovery(2, {sharedWith: {}}), history, orphan,
+    ]}));
+    const texts = textsOf(page);
+    expect(texts.some(text => text.includes("这些已经过了 30 天恢复期，不能再恢复") && text.includes("你在用的文件不会出现在这里"))).toBe(true);
+    expect(texts.some(text => text.startsWith("一个文件的经过："))).toBe(true);
+    expect(texts).toContain("删掉的文件留下的备份（已过 30 天，不能恢复了）");
+    expect(texts).toContain("文件改动前的旧版本（已过 30 天）");
+    expect(texts).toContain("找不到对应文件的数据（同步中断时留下的）");
+    expect(texts).toContain("多数是同步中断时留下的，也包括记录已经清理过、S3 上还没删的内容。");
+    expect(texts).toContain("2 项 · 4 KB");
+    // 删除时间按本地时间（UTC+8），恢复期已过的天数按这次读到的 AWS 时间
+    expect(texts).toContain("notes/deleted-1.md");
+    expect(texts).toContain("删除于 2026-09-05 10:20 · 恢复期已过 13 天");
+    expect(texts).toContain("notes/log.md 的旧版本");
+    expect(texts).toContain("2026-09-03 18:02 被新版本替换 · 恢复期已过 15 天");
+    expect(texts).toContain("找不到对应文件的数据（编号 a91c0e2f）");
+    expect(texts).toContain("上传于 2026-09-05 14:02");
+    expect(texts).toContain("64 KB");
+    expect(texts).toContain("内容和现有文件「报价-最终.xlsx」相同：S3 上的数据会保留");
+    expect(texts).toContain("内容还被别的记录用着：S3 上的数据会保留");
+  });
+
+  it("tracks single, group, all and partial selections and only enables 删除所选 with something selected", async () => {
+    const page = await openCleanup(cleanupWith({serverDate: SERVER, pending: [], candidates: [recovery(1), recovery(2), history, orphan]}));
+    expect(button(page, "删除所选（0）").disabled).toBe(true);
+    toggle(checkbox(page, "notes/deleted-1.md"), true);
+    expect(textsOf(page)).toContain("已选 1 项 · 2 KB");
+    expect(button(page, "删除所选（1）").disabled).toBe(false);
+    const group = checkbox(page, "删掉的文件留下的备份（已过 30 天，不能恢复了）");
+    expect(group.indeterminate).toBe(true);
+    expect(group.checked).toBe(false);
+    toggle(group, true);
+    expect(checkbox(page, "删掉的文件留下的备份（已过 30 天，不能恢复了）")).toMatchObject({checked: true, indeterminate: false});
+    expect(checkbox(page, "全选")).toMatchObject({checked: false, indeterminate: true});
+    toggle(checkbox(page, "全选"), true);
+    expect(textsOf(page)).toContain("已选 4 项 · 90 KB");
+    expect(checkbox(page, "全选")).toMatchObject({checked: true, indeterminate: false});
+    toggle(checkbox(page, "全选"), false);
+    expect(button(page, "删除所选（0）").disabled).toBe(true);
+  });
+
+  it("collapses a group of more than 50 items until it is opened", async () => {
+    const many = Array.from({length: 51}, (_, index) => recovery(index));
+    const page = await openCleanup(cleanupWith({serverDate: SERVER, pending: [], candidates: [...many, history]}));
+    expect(textsOf(page)).toContain("51 项 · 102 KB");
+    expect(textsOf(page)).not.toContain("notes/deleted-0.md");
+    expect(textsOf(page)).toContain("notes/log.md 的旧版本");
+    button(page, "展开").events.get("click")!();
+    expect(textsOf(page)).toContain("notes/deleted-0.md");
+  });
+
+  it("asks once for the 0.1.10 confirmation, then moves the selection to the waiting list with an undo", async () => {
+    let confirmed = false;
+    const cleanup = cleanupWith({serverDate: SERVER, pending: [], candidates: [recovery(1), orphan]},
+      {needsCleanupDeviceConfirmation: () => !confirmed});
+    const {move} = cleanup;
+    const confirm = vi.fn(async (keys: string[], allDevicesUpdated: boolean) => {
+      confirmed ||= allDevicesUpdated;
+      await move(keys, allDevicesUpdated);
+    });
+    cleanup.confirmCleanup = confirm;
+    const page = await openCleanup(cleanup);
+    toggle(checkbox(page, "notes/deleted-1.md"), true);
+    button(page, "删除所选（1）").events.get("click")!();
+    const dialog = await vi.waitFor(() => {
+      const last = opened.at(-1)!;
+      expect(last).not.toBe(page);
+      return last;
+    });
+    expect(textsOf(dialog).some(text => text.includes("没升级的设备在记录被清理后可能卡在修复模式"))).toBe(true);
+    const go = button(dialog, "继续删除");
+    expect(go.disabled).toBe(true);
+    expect(confirm).not.toHaveBeenCalled();
+    toggle(checkbox(dialog, "所有设备都已更新到 0.1.10 或更高"), true);
+    expect(button(dialog, "继续删除").disabled).toBe(false);
+    button(dialog, "继续删除").events.get("click")!();
+    await vi.waitFor(() => expect(confirm).toHaveBeenCalledWith([recovery(1).key], true));
+    // 选中的项目马上离开分组，出现在「已删除，等着从 S3 清掉」里，可以撤销
+    await vi.waitFor(() => expect(textsOf(page)).toContain("已删除，等着从 S3 清掉"));
+    expect(textsOf(page)).toContain("还剩 24 小时可撤销");
+    expect(textsOf(page)).not.toContain("删掉的文件留下的备份（已过 30 天，不能恢复了）");
+    // 同一目标之后不再弹
+    toggle(checkbox(page, "找不到对应文件的数据（编号 a91c0e2f）"), true);
+    const dialogs = opened.length;
+    button(page, "删除所选（1）").events.get("click")!();
+    await vi.waitFor(() => expect(confirm).toHaveBeenCalledWith([orphan.key], false));
+    expect(opened.length).toBe(dialogs);
+  });
+
+  it("shows waiting items with the hours left to undo, and no undo once the 24 hours have passed", async () => {
+    vi.useFakeTimers({toFake: ["Date"]});
+    try {
+      vi.setSystemTime(Date.parse(SERVER) + 3 * HOUR);
+      const cleanup = cleanupWith({serverDate: SERVER, candidates: [], pending: [
+        {blobId: "blob-r1", confirmedAt: SERVER, key: "recovery:r1:rev", kind: "recovery", path: "notes/deleted-1.md", size: 2048},
+        {blobId: "blob-h", confirmedAt: new Date(Date.parse(SERVER) - DAY).toISOString(), key: "history:h:rev", kind: "history",
+          path: "notes/log.md", recordRemovedAt: SERVER, size: 10},
+      ]});
+      const page = await openCleanup(cleanup);
+      const texts = textsOf(page);
+      expect(texts).toContain("已删除，等着从 S3 清掉");
+      expect(texts).toContain("还剩 21 小时可撤销");
+      expect(texts).toContain("撤销期已过，正在从 S3 清掉");
+      expect(texts).toContain("现在没有符合删除标准的内容。文件删除满 30 天后会自动出现在这里，等你确认。");
+      expect(nodesOf(page).filter(node => node.tag === "button" && node.text === "撤销")).toHaveLength(1);
+      button(page, "撤销").events.get("click")!();
+      await vi.waitFor(() => expect(cleanup.undo).toHaveBeenCalledWith("recovery:r1:rev"));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("says above the list why cleaning waits", async () => {
+    const page = await openCleanup(cleanupWith({blockedReason: "有冲突还没处理，清理会等你处理完再继续。", serverDate: SERVER,
+      pending: [], candidates: [recovery(1)]}));
+    expect(textsOf(page)).toContain("有冲突还没处理，清理会等你处理完再继续。");
+    // 仍然可以勾选和确认
+    toggle(checkbox(page, "notes/deleted-1.md"), true);
+    expect(button(page, "删除所选（1）").disabled).toBe(false);
   });
 });

@@ -12,7 +12,7 @@ import { RemotelySaveMigration } from "./migration/remotely-save-migration";
 import { CredentialStore, type AwsCredentials } from "./plugin/credential-store";
 import { createCooperativeYield } from "./plugin/cooperative-yield";
 import { StatusModal, VersionHistoryModal } from "./plugin/modals";
-import type { CleanupView, PendingCleanupItem } from "./plugin/cleanup-modal";
+import type { CleanupController, CleanupView, PendingCleanupItem } from "./plugin/cleanup-modal";
 import { ObsidianVaultPort, isInSyncScope } from "./plugin/obsidian-vault-port";
 import { SerializedDataWriter } from "./plugin/serialized-data-writer";
 import { SyncSession, SyncStoppedError } from "./plugin/sync-session";
@@ -445,6 +445,11 @@ export default class S3VaultSyncPlugin
         entry.kind === "deleted" &&
         (entry.recovery !== undefined || (entry.history?.length ?? 0) > 0),
     );
+  }
+
+  // 同步状态窗口里的「待清理」只在电脑上有；手机上没有按钮，也不运行任何处理
+  cleanupController(): CleanupController | undefined {
+    return Platform.isDesktopApp ? this : undefined;
   }
 
   // 「待清理」的数字：电脑上用本机保存的上一次计算结果，减去已经确认删除的项目，不读 S3；手机上没有这个入口

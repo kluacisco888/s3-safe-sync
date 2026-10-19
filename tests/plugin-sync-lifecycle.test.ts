@@ -1412,7 +1412,9 @@ describe("manual cleanup from the status window", () => {
     expect(plugin.getCleanupCount()).toBe(0);
     plugin.getSettings().bucket = "test-bucket";
     // 手机上没有这个入口，也不能打开列表
+    expect(plugin.cleanupController()).toBe(plugin);
     host.desktop = false;
+    expect(plugin.cleanupController()).toBeUndefined();
     expect(plugin.getCleanupCount()).toBeUndefined();
     await expect(plugin.loadCleanup()).rejects.toThrow("电脑");
     plugin.onunload();

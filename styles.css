@@ -230,3 +230,78 @@
   min-height: 16rem;
   user-select: text;
 }
+
+/* 「待清理」：有可清理内容时入口用琥珀色，不用表示危险的红色 */
+.s3-vault-sync-cleanup-pending {
+  background: rgba(var(--color-orange-rgb), 0.15);
+  color: var(--color-orange);
+  font-weight: var(--font-semibold);
+  box-shadow: 0 0 0 1px rgba(var(--color-orange-rgb), 0.45);
+}
+
+.s3-vault-sync-cleanup-flow {
+  padding: var(--size-4-2);
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
+.s3-vault-sync-cleanup-group {
+  margin-block: var(--size-4-3);
+}
+
+.s3-vault-sync-cleanup-group-head {
+  display: flex;
+  align-items: center;
+  gap: var(--size-4-3);
+  padding-block: var(--size-4-1);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.s3-vault-sync-cleanup-group-head > .s3-vault-sync-muted {
+  margin-left: auto;
+}
+
+.s3-vault-sync-cleanup-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: start;
+  gap: var(--size-4-3);
+  padding: var(--size-4-2) var(--size-4-1);
+}
+
+.s3-vault-sync-cleanup-check {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--size-4-1) var(--size-4-2);
+  min-width: 0;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.s3-vault-sync-cleanup-check > div {
+  flex-basis: 100%;
+  padding-left: var(--size-4-6);
+  font-size: var(--font-ui-small);
+}
+
+.s3-vault-sync-cleanup-shared {
+  color: var(--color-green);
+}
+
+.s3-vault-sync-cleanup-bar {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--size-4-3);
+  padding-block: var(--size-4-3);
+  border-top: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+}
+
+.s3-vault-sync-cleanup-bar > .s3-vault-sync-muted {
+  flex: 1;
+}

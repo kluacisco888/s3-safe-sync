@@ -22,12 +22,16 @@ import {
 } from "./deleted-preview";
 import { copyText } from "./clipboard";
 import { actionButton } from "./modal-actions";
+import { CleanupModal, type CleanupController } from "./cleanup-modal";
+import { formatLocalTime } from "./local-time";
 import { LocalContentReviewModal } from "./content-review-modal";
 import { PathCollisionModal } from "./path-collision-modal";
 import type { PathCollisionReview, PathCollisionResolution } from "../sync/path-collision-review";
 import type { SyncDiagnosticsView } from "./sync-diagnostics";
 
 export interface StatusModalController {
+  // 电脑上返回「待清理」的控制器；手机上返回 undefined，按钮栏里没有这个按钮
+  cleanupController?(): CleanupController | undefined;
   getDiagnostics?(limit?: number): SyncDiagnosticsView;
   exportDiagnostics?(): string;
   reviewPathCollision(paths: string[]): Promise<PathCollisionReview>;
@@ -107,15 +111,6 @@ const isUnexpired = (revision: RevisionRef, now: number): boolean =>
 const unexpiredRecoveries = (entry: DeletedEntry, now: number): RevisionRef[] =>
   [...(entry.recovery ? [entry.recovery] : []), ...(entry.history ?? [])]
     .filter(revision => isUnexpired(revision, now));
-
-const twoDigits = (value: number): string => String(value).padStart(2, "0");
-
-/** 按本机时区显示为 YYYY-MM-DD HH:mm；无法解析时原样显示 */
-const formatLocalTime = (value: string): string => {
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) return value;
-  return `${date.getFullYear()}-${twoDigits(date.getMonth() + 1)}-${twoDigits(date.getDate())} ${twoDigits(date.getHours())}:${twoDigits(date.getMinutes())}`;
-};
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -413,6 +408,14 @@ export class StatusModal extends Modal {
       output.readOnly = true;
       dialog.open();
     });
+    // 「待清理」放在「复制诊断数据」后面；数字用本机保存的上一次计算结果，打开状态窗口时不读 S3
+    const cleanup = this.controller.cleanupController?.();
+    if (cleanup) {
+      const count = cleanup.getCleanupCount() ?? 0;
+      const entry = actions.createEl("button", {text: count > 0 ? `待清理（${count}）` : "待清理"});
+      if (count > 0) entry.addClass("s3-vault-sync-cleanup-pending");
+      entry.addEventListener("click", () => new CleanupModal(this.app, cleanup, () => this.onOpen()).open());
+    }
     if (this.controller.getStatusText().includes("修复模式")) {
       actions.createEl("button", {text: "恢复指引"}).addEventListener("click", () => {
         showGuidance(this.app, "需要修复远端",
