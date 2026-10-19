@@ -30,25 +30,12 @@ import type { CollisionRenameJournal } from "./collision-rename-journal";
 import {
   expiredContentKey,
   planExpiredContentCleanup,
-  type ExpiredRecoveryRemoval,
-  type MissingExpiryItem,
 } from "./expired-content-cleanup";
 import {
   MAX_BLOB_DELETIONS_PER_RUN,
   planUnreferencedBlobDeletion,
-  summarizeBlobs,
-  type BlobUsageSummary,
   type UnreferencedBlobMarks,
 } from "./unreferenced-blob-cleanup";
-
-export interface ExpiredContentPreview {
-  // 将删除的数据块（四条判据都满足）和「明天起删」的（第一次判定还不满 24 小时），按上传月份汇总
-  blobs: { deletable: BlobUsageSummary; startingTomorrow: BlobUsageSummary };
-  missingExpiry: MissingExpiryItem[];
-  removedHistory: number;
-  removedRecoveries: ExpiredRecoveryRemoval[];
-  serverDate: string;
-}
 
 export type UnreferencedBlobCleanupResult =
   | { kind: "no-head" }
@@ -1140,38 +1127,6 @@ export class SyncService {
       entry.revision.contentHash,
     );
     await this.acceptReviewedEntries({...snapshot, commitId}, [restoredEntry]);
-  }
-
-  // 预览只读：只读远端 Head、它的快照和数据块列表，不写 S3、不改本机缓存，也不更新第一次判定记录
-  async previewExpiredContentCleanup(
-    vaultId: string,
-    blobMarks?: Readonly<UnreferencedBlobMarks>,
-  ): Promise<ExpiredContentPreview> {
-    const versionedHead = await this.options.remote.readHead();
-    if (!versionedHead || versionedHead.value.vaultId !== vaultId) {
-      throw new Error("远端 Head 指针缺失，或属于另一个仓库");
-    }
-    const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
-    const plan = planExpiredContentCleanup(snapshot, versionedHead.serverDate);
-    // 数据块按清理提交之后的记录判定：只被过期内容引用的，清理后就没人用了
-    const cleaned: VaultSnapshot = {
-      ...snapshot,
-      entries: { ...snapshot.entries, ...Object.fromEntries(plan.changedEntries.map((entry) => [entry.entryId, entry])) },
-    };
-    const blobPlan = planUnreferencedBlobDeletion({
-      headLastModified: versionedHead.lastModified,
-      marks: blobMarks,
-      objects: await this.options.remote.listBlobObjects(),
-      referenced: new Set(snapshotBlobReferences(cleaned).keys()),
-      serverDate: versionedHead.serverDate,
-    });
-    return {
-      blobs: { deletable: summarizeBlobs(blobPlan.deletable), startingTomorrow: summarizeBlobs(blobPlan.waiting) },
-      missingExpiry: plan.missingExpiry,
-      removedHistory: plan.removedHistory,
-      removedRecoveries: plan.removedRecoveries,
-      serverDate: versionedHead.serverDate,
-    };
   }
 
   /**

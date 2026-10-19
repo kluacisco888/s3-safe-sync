@@ -12,6 +12,7 @@ import { RemotelySaveMigration } from "./migration/remotely-save-migration";
 import { CredentialStore, type AwsCredentials } from "./plugin/credential-store";
 import { createCooperativeYield } from "./plugin/cooperative-yield";
 import { StatusModal, VersionHistoryModal } from "./plugin/modals";
+import type { CleanupView, PendingCleanupItem } from "./plugin/cleanup-modal";
 import { ObsidianVaultPort, isInSyncScope } from "./plugin/obsidian-vault-port";
 import { SerializedDataWriter } from "./plugin/serialized-data-writer";
 import { SyncSession, SyncStoppedError } from "./plugin/sync-session";
@@ -28,9 +29,10 @@ import {
 import {
   SyncService,
   type CachedSyncState,
+  orphanBlobKey,
+  type CleanupCandidates,
   type DeferredDownloadEntry,
   type ExpiredContentCleanupResult,
-  type ExpiredContentPreview,
   type LocalSyncIssue,
   type LocalContentReview,
   type LocalContentChoice,
@@ -126,30 +128,54 @@ interface PersistedPluginData {
     phase: "uploading" | "publishing";
   };
   pendingProbes?: Array<{ bucket: string; region: string; prefix: string; key: string }>;
-  // 清理过期内容的开关：只对打开时的仓库目标（桶、区域、前缀、vaultId）有效；
-  // lastRunServerDate 是上一次清理读到的 AWS 时间，用来做到每天最多一次
-  expiredContentCleanup?: { target: string; lastRunServerDate?: string };
-  // 数据块删除的第一次判定记录（blobId → 判定没人用时的 AWS 时间），绑定仓库目标（桶、区域、前缀、vaultId）；
-  // 丢了或目标不同就从下一次检查重新计时
-  unreferencedBlobMarks?: { target: string; firstSeen: Record<string, string> };
+  // 「待清理」：用户确认过的项目队列和上一次算出的可清理数量，只存在电脑本地，绑定仓库目标（桶、区域、前缀、vaultId）
+  manualCleanup?: ManualCleanupState;
   settings: S3VaultSyncSettings;
 }
 
 const normalizePrefix = (prefix: string): string =>
   prefix.replace(/^\/+|\/+$/gu, "");
 
-// 读回本地保存的第一次判定记录；形状不对就当没有（只会让删除更晚，不会更早）
-const parseUnreferencedBlobMarks = (value: unknown): PersistedPluginData["unreferencedBlobMarks"] => {
+interface ManualCleanupState {
+  target: string;
+  // 用户已确认所有设备都更新到 0.1.10 或更高；同一目标之后不再问
+  devicesConfirmed?: boolean;
+  queue: PendingCleanupItem[];
+  // 上一次算出的可清理项目（key）和那次读到的 AWS 时间；状态窗口的数字只用它，不读 S3
+  candidates?: { keys: string[]; serverDate: string };
+  // 处理出错后，这个 AWS 时间之前不再处理
+  pausedUntil?: string;
+}
+
+const isAwsTime = (value: unknown): value is string => typeof value === "string" && Number.isFinite(Date.parse(value));
+
+const isPendingCleanupItem = (value: unknown): value is PendingCleanupItem => {
+  if (typeof value !== "object" || value === null) return false;
+  const item = value as Record<string, unknown>;
+  return typeof item.key === "string" && typeof item.blobId === "string" && typeof item.size === "number" &&
+    (item.kind === "recovery" || item.kind === "history" || item.kind === "orphan") && isAwsTime(item.confirmedAt) &&
+    (item.path === undefined || typeof item.path === "string") && (item.recordRemovedAt === undefined || isAwsTime(item.recordRemovedAt));
+};
+
+// 读回本地保存的「待清理」状态；读不懂的项目丢掉（只会让删除更晚或不删，不会更早）
+const parseManualCleanup = (value: unknown): ManualCleanupState | undefined => {
   if (typeof value !== "object" || value === null) return undefined;
-  const { target, firstSeen } = value as Record<string, unknown>;
-  if (typeof target !== "string" || typeof firstSeen !== "object" || firstSeen === null || Array.isArray(firstSeen)) return undefined;
+  const stored = value as Record<string, unknown>;
+  if (typeof stored.target !== "string") return undefined;
+  const candidates = stored.candidates as Record<string, unknown> | undefined;
   return {
-    firstSeen: Object.fromEntries(Object.entries(firstSeen).filter((pair): pair is [string, string] => typeof pair[1] === "string")),
-    target,
+    target: stored.target,
+    ...(stored.devicesConfirmed === true ? { devicesConfirmed: true } : {}),
+    queue: Array.isArray(stored.queue) ? stored.queue.filter(isPendingCleanupItem) : [],
+    ...(candidates && Array.isArray(candidates.keys) && isAwsTime(candidates.serverDate) ? { candidates: {
+      keys: candidates.keys.filter((key): key is string => typeof key === "string"), serverDate: candidates.serverDate,
+    } } : {}),
+    ...(isAwsTime(stored.pausedUntil) ? { pausedUntil: stored.pausedUntil } : {}),
   };
 };
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
+const HOUR_MS = 60 * 60 * 1_000;
 const ANDROID_DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const ANDROID_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 // 网络类可重试错误从这一轮第一次失败起连续满这么久仍未成功，才自动弹出同步状态窗口
@@ -186,8 +212,8 @@ export default class S3VaultSyncPlugin
   private pendingLocalIssues: LocalSyncIssue[] = [];
   private approvedRenameResolution: PossibleRenameResolution | undefined;
   private pendingDeferredDownloads: DeferredDownloadEntry[] = [];
-  // 本次运行里看过预览的仓库目标；没看过预览不能打开清理
-  private expiredContentPreviewTarget: string | undefined;
+  // 这次打开「待清理」时读到的列表（只在内存里），确认删除只能从它里面选
+  private loadedCleanup: { target: string; listed: CleanupCandidates } | undefined;
   private readonly pluginDataWriter = new SerializedDataWriter(
     () => this.data,
     (snapshot) => {
@@ -421,48 +447,117 @@ export default class S3VaultSyncPlugin
     );
   }
 
-  getPluginVersion(): string {
-    return this.manifest.version ?? "";
+  // 「待清理」的数字：电脑上用本机保存的上一次计算结果，减去已经确认删除的项目，不读 S3；手机上没有这个入口
+  getCleanupCount(): number | undefined {
+    if (!Platform.isDesktopApp) return undefined;
+    const state = this.cleanupState();
+    const queued = this.queuedCleanup(state);
+    return (state.candidates?.keys ?? []).filter(key => !queued(key)).length;
   }
 
-  isExpiredContentCleanupAvailable(): boolean {
-    return Platform.isDesktopApp;
-  }
-
-  isExpiredContentCleanupEnabled(): boolean {
-    return this.data.expiredContentCleanup?.target === this.integrityTarget();
-  }
-
-  // 预览只读：只读远端 Head 和快照，不写 S3、不改缓存
-  async previewExpiredContentCleanup(): Promise<ExpiredContentPreview> {
-    if (!Platform.isDesktopApp) throw new Error("清理过期内容只能在电脑上使用。");
+  // 打开「待清理」：只读，重读 Head、它的快照和数据块列表，只用这一次读到的内容计算；顺便刷新状态窗口的数字
+  async loadCleanup(): Promise<CleanupView> {
+    if (!Platform.isDesktopApp) throw new Error("清理只能在电脑上使用。");
     const vaultId = this.data.settings.vaultId;
     if (!vaultId || !this.credentials.loadVaultKey()) throw new Error("请先初始化或解锁加密仓库。");
     const target = this.integrityTarget();
-    const preview = await this.runExclusiveSyncService(service =>
-      service.previewExpiredContentCleanup(vaultId, this.currentUnreferencedBlobMarks(target)));
-    if (this.integrityTarget() === target) this.expiredContentPreviewTarget = target;
-    return preview;
-  }
-
-  private currentUnreferencedBlobMarks(target: string): Record<string, string> | undefined {
-    const marks = this.data.unreferencedBlobMarks;
-    return marks?.target === target ? marks.firstSeen : undefined;
-  }
-
-  async setExpiredContentCleanupEnabled(enabled: boolean, allDevicesUpdated: boolean): Promise<void> {
-    if (!enabled) {
-      this.data.expiredContentCleanup = undefined;
+    await this.runExclusiveSyncService(async service => {
+      const listed = await service.listCleanupCandidates(vaultId);
+      this.session.assertActive();
+      if (this.integrityTarget() !== target) throw new Error("读取期间 S3 目标被改了。请重新打开「待清理」。");
+      this.loadedCleanup = {target, listed};
+      this.data.manualCleanup = {...this.cleanupState(), candidates: {keys: listed.items.map(item => item.key), serverDate: listed.serverDate}};
       await this.savePluginData();
-      return;
-    }
-    if (!Platform.isDesktopApp) throw new Error("清理过期内容只能在电脑上打开。");
+    });
+    const view = this.getCleanupView();
+    if (!view) throw new Error("读取期间 S3 目标被改了。请重新打开「待清理」。");
+    return view;
+  }
+
+  // 用这次打开时读到的列表和本机队列重新组合，不读 S3
+  getCleanupView(): CleanupView | undefined {
+    const loaded = this.loadedCleanup;
+    if (!Platform.isDesktopApp || !loaded || loaded.target !== this.integrityTarget()) return undefined;
+    const state = this.cleanupState();
+    const queued = this.queuedCleanup(state);
+    const blockedReason = this.cleanupBlockedReason(state);
+    return {
+      ...(blockedReason ? {blockedReason} : {}),
+      candidates: loaded.listed.items.filter(item => !queued(item.key)),
+      pending: state.queue,
+      serverDate: loaded.listed.serverDate,
+    };
+  }
+
+  needsCleanupDeviceConfirmation(): boolean {
+    return this.cleanupState().devicesConfirmed !== true;
+  }
+
+  // 点「删除所选」：不写 S3，只把选中的项目记进本机队列，确认时间用这次页面读到的 Head serverDate（AWS 时间）
+  async confirmCleanup(keys: string[], allDevicesUpdated: boolean): Promise<void> {
+    await this.syncRequests.runExclusive(() => this.session.run(async () => {
+      if (!Platform.isDesktopApp) throw new Error("清理只能在电脑上使用。");
+      const loaded = this.loadedCleanup;
+      if (!loaded || loaded.target !== this.integrityTarget()) throw new Error("请重新打开「待清理」再删除。");
+      const state = this.cleanupState();
+      if (!state.devicesConfirmed && !allDevicesUpdated) throw new Error("请先确认所有设备都已更新到 0.1.10 或更高。");
+      const queued = this.queuedCleanup(state);
+      const wanted = new Set(keys);
+      const added = loaded.listed.items.filter(item => wanted.has(item.key) && !queued(item.key)).map((item): PendingCleanupItem => ({
+        blobId: item.blobId, confirmedAt: loaded.listed.serverDate, key: item.key, kind: item.kind,
+        ...(item.kind === "orphan" ? {} : {path: item.path}), size: item.size,
+      }));
+      this.data.manualCleanup = {...state, devicesConfirmed: true, queue: [...state.queue, ...added]};
+      await this.savePluginData();
+    }));
+  }
+
+  // 撤销只是把它从本机队列里拿掉，不写 S3；记录已经改过的不能再撤销
+  async undoCleanup(key: string): Promise<void> {
+    await this.syncRequests.runExclusive(() => this.session.run(async () => {
+      const state = this.cleanupState();
+      const item = state.queue.find(queued => queued.key === key);
+      if (!item) return;
+      if (item.recordRemovedAt !== undefined) throw new Error("它已经从同步记录里去掉了，不能再撤销。");
+      this.data.manualCleanup = {...state, queue: state.queue.filter(queued => queued.key !== key)};
+      await this.savePluginData();
+    }));
+  }
+
+  // 当前目标的「待清理」状态；目标变了就当作没有
+  private cleanupState(): ManualCleanupState {
     const target = this.integrityTarget();
-    if (this.expiredContentPreviewTarget !== target) throw new Error("请先预览这次会清理的内容，再打开清理。");
-    if (!allDevicesUpdated) throw new Error("请先确认所有设备都已更新到这个版本或更高，再打开清理。");
-    if (this.data.expiredContentCleanup?.target === target) return;
-    this.data.expiredContentCleanup = {target};
-    await this.savePluginData();
+    const stored = this.data.manualCleanup;
+    return stored?.target === target ? stored : {target, queue: []};
+  }
+
+  // 已确认的项目盖住的候选：同一个 key，或同一个数据块（备份改完记录后，它的数据块会以「无对应文件的数据」出现）
+  private queuedCleanup(state: ManualCleanupState): (key: string) => boolean {
+    const keys = new Set(state.queue.map(item => item.key));
+    const blobKeys = new Set(state.queue.map(item => orphanBlobKey(item.blobId)));
+    return key => keys.has(key) || blobKeys.has(key);
+  }
+
+  // 处理的前提暂时不满足时，列表上方说明原因（仍然可以勾选和确认）
+  private cleanupBlockedReason(state: ManualCleanupState): string | undefined {
+    if (this.data.settings.paused) return "本设备已暂停同步，恢复同步后清理才会继续。";
+    if (this.currentIntegrityChecks().length > 0 || this.getStatusText().includes("修复模式")) {
+      return "同步处于修复模式，修复完成后清理才会继续。";
+    }
+    if (this.getConflicts().length > 0) return "有冲突还没处理，清理会等你处理完再继续。";
+    if (this.pendingBulkDeletion) return "有批量删除等你确认，清理会等你确认后再继续。";
+    if (this.pendingLocalIssues.length > 0 || this.data.pendingCollisionRename) return "有需要处理的项目，清理会等你处理完再继续。";
+    // 只用于显示，按设备时间估算
+    if (state.pausedUntil !== undefined && Date.now() < Date.parse(state.pausedUntil)) return "上次清理出错，1 小时内不再重试，之后同步时会再试。";
+    return undefined;
+  }
+
+  // 处理完或不再处理的项目，也从这次打开时读到的列表里拿掉，免得窗口里又出现
+  private forgetLoadedCleanup(items: readonly PendingCleanupItem[]): void {
+    const loaded = this.loadedCleanup;
+    if (!loaded || items.length === 0) return;
+    const keys = new Set(items.flatMap(item => [item.key, orphanBlobKey(item.blobId)]));
+    this.loadedCleanup = {...loaded, listed: {...loaded.listed, items: loaded.listed.items.filter(item => !keys.has(item.key))}};
   }
 
   async confirmBulkDeletion(): Promise<void> {
@@ -1009,8 +1104,7 @@ export default class S3VaultSyncPlugin
       pendingIntegrityChecks: stored?.pendingIntegrityChecks ?? [],
       pendingInitialization: stored?.pendingInitialization,
       pendingProbes: stored?.pendingProbes ?? [],
-      expiredContentCleanup: stored?.expiredContentCleanup,
-      unreferencedBlobMarks: parseUnreferencedBlobMarks(stored?.unreferencedBlobMarks),
+      manualCleanup: parseManualCleanup(stored?.manualCleanup),
       settings,
     };
     this.acceptedCommit = this.data.cache?.snapshot.commitId;
@@ -1021,7 +1115,10 @@ export default class S3VaultSyncPlugin
     );
     this.data.pendingPathRenames = Object.fromEntries(userRenames);
     this.pathRenames = new PathRenameTracker(this.data.pendingPathRenames);
-    if (!this.data.settings.replicaId || userRenames.length !== pendingRenames.length) {
+    // 0.1.10 自动清理留下的开关和第一次判定记录：不再使用，加载时丢弃
+    const droppedAutomaticCleanup = stored !== null && stored !== undefined &&
+      ("expiredContentCleanup" in stored || "unreferencedBlobMarks" in stored);
+    if (!this.data.settings.replicaId || userRenames.length !== pendingRenames.length || droppedAutomaticCleanup) {
       this.data.settings.replicaId ||= crypto.randomUUID();
       await this.savePluginData();
     }
@@ -1256,7 +1353,7 @@ export default class S3VaultSyncPlugin
           "Idle",
           `下载 ${result.downloaded}，上传 ${result.uploaded}，删除 ${result.deleted}，暂缓下载 ${result.deferredDownloads}，未同步 ${result.unsyncedLocalEntries}。`,
         );
-        await this.runExpiredContentCleanup(remote, boundHead.serverDate, result, diagnostic, assertIntegrityTarget);
+        await this.runManualCleanup(remote, boundHead.serverDate, result, diagnostic, assertIntegrityTarget);
       }
     } catch (error) {
       const retryableNetwork = error instanceof S3TransportError ||
@@ -1314,49 +1411,118 @@ export default class S3VaultSyncPlugin
     }
   }
 
-  // 清理过期内容：只在电脑上、已打开、紧跟一次完全成功的同步运行，按 AWS 时间每天最多一次。
+  // 「待清理」的处理：只在电脑上、紧跟一次完全成功的同步运行，只处理用户确认过的项目。
   // 有待处理的审查、冲突、Bulk Deletion 确认或待复查的完整性检查时不运行：清理提交会改 Head，
-  // 让还没处理的审查失效
-  private async runExpiredContentCleanup(
+  // 让还没处理的审查失效。之后刷新状态窗口的数字（按 AWS 时间每 24 小时最多一次）。
+  // 出错照旧在同步状态里报告，之后 1 小时内（AWS 时间）不再处理
+  private async runManualCleanup(
     remote: RemoteStore,
     observedServerDate: string,
     result: SyncResult,
     diagnostic: SyncRunRecord,
     assertTarget: () => void,
   ): Promise<void> {
-    if (!Platform.isDesktopApp || !this.isExpiredContentCleanupEnabled()) return;
+    if (!Platform.isDesktopApp) return;
     const vaultId = this.data.settings.vaultId;
     if (!vaultId || result.status !== "complete" || !result.cacheUpdated || result.bulkDeletion ||
       result.localIssues.length > 0 || this.pendingBulkDeletion || this.pendingLocalIssues.length > 0 ||
       this.getConflicts().length > 0 || this.currentIntegrityChecks().length > 0 ||
       this.data.pendingCollisionRename) return;
     const target = this.integrityTarget();
-    const lastRun = Date.parse(this.data.expiredContentCleanup?.lastRunServerDate ?? "");
-    if (Number.isFinite(lastRun) && Date.parse(observedServerDate) - lastRun < DAY_MS) return;
-    let cleanup: ExpiredContentCleanupResult;
+    const observed = Date.parse(observedServerDate);
+    const pausedUntil = this.cleanupState().pausedUntil;
+    if (!Number.isFinite(observed) || (pausedUntil !== undefined && observed < Date.parse(pausedUntil))) return;
     try {
-      cleanup = await retryHeadChanges(() => this.createSyncService(remote).cleanupExpiredContent(vaultId));
+      await this.processConfirmedCleanup(remote, vaultId, observed, diagnostic, assertTarget);
+      await this.refreshCleanupCount(remote, vaultId, observed, assertTarget);
     } catch (error) {
-      // 几次都被别的设备抢先：留到下一次同步之后再试
-      if (error instanceof HeadChangedError) return;
+      if (!(error instanceof SyncStoppedError) && this.integrityTarget() === target) {
+        this.data.manualCleanup = {...this.cleanupState(), pausedUntil: new Date(observed + HOUR_MS).toISOString()};
+        // 记不下暂停时间也要把原来的错误报出去
+        await this.savePluginData().catch(() => undefined);
+      }
       throw error;
     }
-    this.session.assertActive();
-    assertTarget();
-    if (cleanup.kind === "no-head" || this.integrityTarget() !== target) return;
-    diagnostic.expiredContentCleanup = {at: Date.now(), removedHistory: cleanup.removedHistory,
-      removedRecoveries: cleanup.removedRecoveries};
-    this.data.expiredContentCleanup = {target, lastRunServerDate: cleanup.serverDate};
-    await this.savePluginData();
-    // 清理提交之后删除没人用的数据块：同一个 remote（同一个独占队列、同一个目标守卫），
-    // 目标一变 createObjectStore 的守卫就拦下之后的每个请求，不再发出 DELETE。
-    // 出错直接抛出、在同步状态里报告；上面已记下今天跑过，不会每次同步都重试
-    const blobs = await this.createSyncService(remote).deleteUnreferencedBlobs(vaultId, this.currentUnreferencedBlobMarks(target));
+  }
+
+  private async processConfirmedCleanup(
+    remote: RemoteStore,
+    vaultId: string,
+    observed: number,
+    diagnostic: SyncRunRecord,
+    assertTarget: () => void,
+  ): Promise<void> {
+    const target = this.integrityTarget();
+    const elapsed = (time: string | undefined): number => time === undefined ? Number.NEGATIVE_INFINITY : observed - Date.parse(time);
+    const queue = this.cleanupState().queue;
+    // 第一步：确认满 24 小时、还没改记录的备份和旧版本
+    const dueRecord = queue.filter(item => item.kind !== "orphan" && item.recordRemovedAt === undefined && elapsed(item.confirmedAt) >= DAY_MS);
+    // 第二步：无对应文件的数据确认满 24 小时；备份和旧版本改记录后又满 24 小时
+    const dueBlob = queue.filter(item => elapsed(item.kind === "orphan" ? item.confirmedAt : item.recordRemovedAt) >= DAY_MS);
+    // 没有到时间的项目时什么都不做，不发任何请求
+    if (dueRecord.length === 0 && dueBlob.length === 0) return;
+    if (dueRecord.length > 0) {
+      let cleanup: ExpiredContentCleanupResult;
+      try {
+        cleanup = await retryHeadChanges(() =>
+          this.createSyncService(remote).cleanupExpiredContent(vaultId, new Set(dueRecord.map(item => item.key))));
+      } catch (error) {
+        // 几次都被别的设备抢先：留到下一次同步之后再试
+        if (error instanceof HeadChangedError) return;
+        throw error;
+      }
+      this.session.assertActive();
+      assertTarget();
+      if (cleanup.kind === "no-head" || this.integrityTarget() !== target) return;
+      const outcomes = cleanup.outcomes ?? {};
+      const state = this.cleanupState();
+      // 已去掉、或记录里已经没有了：记下改记录的时间；成了冲突或不再算过期：从队列移除，等以后重新出现在列表里
+      const skipped = state.queue.filter(item => outcomes[item.key] === "skipped");
+      const queueAfterRecord = state.queue.flatMap((item): PendingCleanupItem[] =>
+        outcomes[item.key] === "skipped" ? []
+          : outcomes[item.key] === "removed" || outcomes[item.key] === "gone" ? [{...item, recordRemovedAt: cleanup.serverDate}] : [item]);
+      diagnostic.expiredContentCleanup = {at: Date.now(), removedHistory: cleanup.removedHistory, removedRecoveries: cleanup.removedRecoveries};
+      this.data.manualCleanup = {...state, queue: queueAfterRecord};
+      this.forgetLoadedCleanup(skipped);
+      await this.savePluginData();
+    }
+    if (dueBlob.length === 0) return;
+    // 同一个数据块可能对应队列里几项：每一项都到时间才删，按最晚的那个时间算
+    const marks: Record<string, string> = {};
+    const current = this.cleanupState().queue;
+    for (const blobId of new Set(dueBlob.map(item => item.blobId))) {
+      const times = current.filter(item => item.blobId === blobId)
+        .map(item => item.kind === "orphan" ? item.confirmedAt : item.recordRemovedAt);
+      if (times.every((time): time is string => time !== undefined && elapsed(time) >= DAY_MS)) {
+        marks[blobId] = times.reduce((latest, time) => Date.parse(time) > Date.parse(latest) ? time : latest);
+      }
+    }
+    if (Object.keys(marks).length === 0) return;
+    // 和同步同一个 remote（同一个独占队列、同一个目标守卫），目标一变 createObjectStore 的守卫就拦下之后的每个请求，
+    // 不再发出 DELETE。删前重读 Head、重算引用；key 对不上整批不删；每次最多 200 个
+    const blobs = await this.createSyncService(remote).deleteUnreferencedBlobs(vaultId, marks, new Set(Object.keys(marks)));
     this.session.assertActive();
     assertTarget();
     if (blobs.kind === "no-head" || this.integrityTarget() !== target) return;
+    const state = this.cleanupState();
+    // 删掉的、仍被引用的（内容和别的文件相同）、S3 上已经没有的：从队列移除；还没轮到的留着
+    const finished = state.queue.filter(item => marks[item.blobId] !== undefined && blobs.marks[item.blobId] === undefined);
     diagnostic.blobCleanup = {deletedBlobs: blobs.deletedBlobs, deletedBytes: blobs.deletedBytes};
-    this.data.unreferencedBlobMarks = {target, firstSeen: blobs.marks};
+    this.data.manualCleanup = {...state, queue: state.queue.filter(item => !finished.includes(item))};
+    this.forgetLoadedCleanup(finished);
+    await this.savePluginData();
+  }
+
+  // 刷新状态窗口「待清理（N）」用的结果：按 AWS 时间每 24 小时最多一次
+  private async refreshCleanupCount(remote: RemoteStore, vaultId: string, observed: number, assertTarget: () => void): Promise<void> {
+    const target = this.integrityTarget();
+    const computed = Date.parse(this.cleanupState().candidates?.serverDate ?? "");
+    if (Number.isFinite(computed) && observed - computed < DAY_MS) return;
+    const listed = await this.createSyncService(remote).listCleanupCandidates(vaultId);
+    this.session.assertActive();
+    assertTarget();
+    if (this.integrityTarget() !== target) return;
+    this.data.manualCleanup = {...this.cleanupState(), candidates: {keys: listed.items.map(item => item.key), serverDate: listed.serverDate}};
     await this.savePluginData();
   }
 

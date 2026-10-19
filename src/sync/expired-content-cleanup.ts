@@ -5,11 +5,6 @@ export interface ExpiredRecoveryRemoval {
   path: string;
 }
 
-export interface MissingExpiryItem {
-  kind: "history" | "recovery";
-  path: string;
-}
-
 // 一项过期内容：已删除文件的恢复副本，或 Live / Deleted Entry 的一个过期旧版本
 export interface ExpiredContentRemoval {
   // 能唯一认出这一项：类型、Entry ID 和 Revision ID
@@ -34,8 +29,6 @@ export interface ExpiredContentPlan {
   removedRecoveries: ExpiredRecoveryRemoval[];
   // 将去掉的过期旧版本数
   removedHistory: number;
-  // 缺到期时间（或无法解析）的项：不算过期、不去掉，只在预览里列出
-  missingExpiry: MissingExpiryItem[];
 }
 
 type ExpiryState = "expired" | "kept" | "missing";
@@ -67,7 +60,6 @@ export const planExpiredContentCleanup = (
   const changedEntries: VaultEntry[] = [];
   const removals: ExpiredContentRemoval[] = [];
   const removedRecoveries: ExpiredRecoveryRemoval[] = [];
-  const missingExpiry: MissingExpiryItem[] = [];
   let removedHistory = 0;
   const isSelected = (key: string): boolean => selected === undefined || selected.has(key);
   const entries = Object.values(snapshot.entries).sort((left, right) =>
@@ -84,8 +76,6 @@ export const planExpiredContentCleanup = (
         delete next.recovery;
         removedRecoveries.push({ deletedAt: next.deletedAt, path: next.path });
         changed = true;
-      } else if (state === "missing") {
-        missingExpiry.push({ kind: "recovery", path: entry.path });
       }
     }
     if (entry.history?.length) {
@@ -99,7 +89,6 @@ export const planExpiredContentCleanup = (
           changed = true;
           continue;
         }
-        if (state === "missing") missingExpiry.push({ kind: "history", path: entry.path });
         kept.push(revision);
       }
       if (kept.length > 0) next.history = kept;
@@ -109,5 +98,5 @@ export const planExpiredContentCleanup = (
   }
   removedRecoveries.sort((left, right) =>
     Date.parse(left.deletedAt) - Date.parse(right.deletedAt) || (left.path < right.path ? -1 : 1));
-  return { changedEntries, missingExpiry, removals, removedHistory, removedRecoveries };
+  return { changedEntries, removals, removedHistory, removedRecoveries };
 };

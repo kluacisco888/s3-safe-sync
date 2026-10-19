@@ -6782,30 +6782,6 @@ describe("cleaning expired content out of the remote record", () => {
     ]);
   });
 
-  it("previews the cleanup without writing to S3 or the local cache", async () => {
-    const fixture = await setup({});
-    await judgedRecord(fixture.observer);
-    fixture.objects.serverDate = at(40);
-    const cacheBefore = structuredClone(fixture.desktopCache.state);
-    const putsBefore = fixture.objects.puts.length;
-    const generationBefore = (await readCurrent(fixture.observer)).head.value.generation;
-
-    const preview = await fixture.desktop.previewExpiredContentCleanup("vault");
-
-    expect(preview).toEqual({
-      // 数据块部分由「deleting unreferenced blobs」一组测试覆盖
-      blobs: expect.any(Object),
-      missingExpiry: [{ kind: "recovery", path: "missing-recovery.md" }, { kind: "history", path: "missing.md" }],
-      removedHistory: 2,
-      // 按删除时间排序
-      removedRecoveries: [{ deletedAt: at(-5), path: "kept-deleted.md" }, { deletedAt: at(0), path: "gone.md" }],
-      serverDate: at(40),
-    });
-    expect(fixture.objects.puts.length).toBe(putsBefore);
-    expect(fixture.desktopCache.state).toEqual(cacheBefore);
-    expect((await readCurrent(fixture.observer)).head.value.generation).toBe(generationBefore);
-  });
-
   it("leaves a file uploaded 60 days ago and never changed untouched", async () => {
     const fixture = await setup({ "old.md": "written once" });
     const before = await entryAt(fixture.observer, "old.md");
@@ -7632,39 +7608,9 @@ describe("deleting unreferenced blobs from this vault's folder", () => {
     await publishAt(fixture, 2);
 
     await expect(fixture.desktop.deleteUnreferencedBlobs("vault", undefined)).rejects.toThrow("前缀为空");
-    await expect(fixture.desktop.previewExpiredContentCleanup("vault")).rejects.toThrow("前缀为空");
+    await expect(fixture.desktop.listCleanupCandidates("vault")).rejects.toThrow("前缀为空");
 
     expect(fixture.objects.deleted).toEqual([]);
-  });
-
-  it("previews the blobs a run would delete by upload month, and those that start tomorrow, without changing anything", async () => {
-    const fixture = await setup();
-    const marked = await orphan(fixture, 1, "marked in September");
-    const fresh = await orphan(fixture, 30, "first seen today");
-    // 只被一个已过期的旧版本引用：清理提交去掉它之后才没人用
-    const expired = await revisionOf(fixture, 1, "expired old version", at(31));
-    const { snapshot } = await readCurrent(fixture.observer);
-    const note = Object.values(snapshot.entries)[0] as LiveEntry;
-    await publishAt(fixture, 31, [{ ...note, history: [expired] }]);
-    fixture.objects.now = at(70);
-    const sizeOf = async (blobId: string) => (await fixture.objects.get(blobKey(blobId)))!.body.byteLength;
-    const headBefore = await fixture.objects.get(`${prefix}/v1/head`);
-
-    const preview = await fixture.desktop.previewExpiredContentCleanup("vault", { [marked]: at(60) });
-
-    expect(preview.removedHistory).toBe(1);
-    expect(preview.blobs.deletable).toEqual({
-      bytes: await sizeOf(marked), count: 1, byMonth: [{ bytes: await sizeOf(marked), count: 1, month: "2026-09" }],
-    });
-    expect(preview.blobs.startingTomorrow).toEqual({
-      bytes: (await sizeOf(fresh)) + (await sizeOf(expired.blobId)), count: 2,
-      byMonth: [
-        { bytes: await sizeOf(expired.blobId), count: 1, month: "2026-09" },
-        { bytes: await sizeOf(fresh), count: 1, month: "2026-10" },
-      ],
-    });
-    expect(fixture.objects.deleted).toEqual([]);
-    expect(await fixture.objects.get(`${prefix}/v1/head`)).toEqual(headBefore);
   });
 
   it("lists as unused only blobs the record does not reference, uploaded 30 days before AWS time and before the Head", async () => {

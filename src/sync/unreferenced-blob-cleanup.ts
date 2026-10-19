@@ -20,19 +20,6 @@ export interface UnreferencedBlobPlan {
   marks: UnreferencedBlobMarks;
 }
 
-export interface BlobMonthSummary {
-  bytes: number;
-  count: number;
-  // 上传月份（UTC），形如 2026-09
-  month: string;
-}
-
-export interface BlobUsageSummary {
-  byMonth: BlobMonthSummary[];
-  bytes: number;
-  count: number;
-}
-
 const byUploadTime = (left: RemoteBlobObject, right: RemoteBlobObject): number =>
   Date.parse(left.lastModified) - Date.parse(right.lastModified) || (left.key < right.key ? -1 : left.key > right.key ? 1 : 0);
 
@@ -73,23 +60,4 @@ export const planUnreferencedBlobDeletion = (input: {
   deletable.sort(byUploadTime);
   waiting.sort(byUploadTime);
   return { deletable, marks, waiting };
-};
-
-// 预览用：数量和大小，按上传月份汇总
-export const summarizeBlobs = (objects: readonly RemoteBlobObject[]): BlobUsageSummary => {
-  const months = new Map<string, BlobMonthSummary>();
-  let bytes = 0;
-  for (const object of objects) {
-    const month = new Date(Date.parse(object.lastModified)).toISOString().slice(0, 7);
-    const summary = months.get(month) ?? { bytes: 0, count: 0, month };
-    summary.bytes += object.size;
-    summary.count += 1;
-    months.set(month, summary);
-    bytes += object.size;
-  }
-  return {
-    byMonth: [...months.values()].sort((left, right) => left.month < right.month ? -1 : 1),
-    bytes,
-    count: objects.length,
-  };
 };

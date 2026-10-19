@@ -111,6 +111,8 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
     afterProbePut?: () => void;
     afterHeadPut?: () => void;
     wireFault?: "reset-read" | "hang-read" | "drop-head-put";
+    // 假 S3 的 AWS 时间 = 设备时间 + 这个偏移：用来造「设备时间和 AWS 时间不一致」
+    awsOffsetMs?: number;
   } = {};
   const wire = {requests: 0, headPublications: 0, faults: 0, signedRequests: 0};
   host.requestUrl.mockImplementation(async (request: {
@@ -149,7 +151,7 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
         status = 412;
       } else {
         etag = `"etag-${++sequence}"`;
-        objects.set(key, { body: new Uint8Array(request.body ?? new ArrayBuffer(0)), etag, lastModified: Date.now() });
+        objects.set(key, { body: new Uint8Array(request.body ?? new ArrayBuffer(0)), etag, lastModified: Date.now() + (hooks.awsOffsetMs ?? 0) });
       }
     } else if (request.method === "DELETE") {
       objects.delete(key);
@@ -159,9 +161,10 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
     }
     if (request.method === "PUT" && key.includes(".s3-vault-sync-probe-")) hooks.afterProbePut?.();
     if (request.method === "PUT" && key.endsWith("/head") && status === 200) hooks.afterHeadPut?.();
+    const awsNow = Date.now() + (hooks.awsOffsetMs ?? 0);
     return {
       arrayBuffer: body.slice().buffer,
-      headers: { date: new Date().toUTCString(), "last-modified": new Date(lastModified ?? Date.now()).toUTCString(), ...(etag ? { etag } : {}) },
+      headers: { date: new Date(awsNow).toUTCString(), "last-modified": new Date(lastModified ?? awsNow).toUTCString(), ...(etag ? { etag } : {}) },
       status,
     };
   });
@@ -1314,116 +1317,299 @@ describe("opening sync status when synchronization stops", () => {
   });
 });
 
-describe("expired content cleanup on the desktop", () => {
-  // 远端多一条已删除记录，它的恢复副本早已过期
-  const addExpiredRecovery = async (remote: RemoteStore) => {
-    const body = new TextEncoder().encode("long gone");
-    const blobId = crypto.randomUUID();
-    await remote.writeBlob(blobId, body);
+describe("manual cleanup from the status window", () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const HOUR_MS = 60 * 60 * 1000;
+  const ORPHANS = ["3c9a7e10-2b4d-4f6a-8c1e-5d7f9a0b2c4e", "7e1d2c3b-4a5f-4b6c-8d7e-9f0a1b2c3d4e", "a0b1c2d3-e4f5-4a6b-9c7d-8e9f0a1b2c3d"];
+  const blobKeyOf = (blobId: string) => `test-prefix/v1/blobs/${blobId}`;
+  type Objects = Map<string, { body: Uint8Array; etag: string; lastModified?: number }>;
+  type Request = { method: string; url: string };
+  const requests = () => host.requestUrl.mock.calls.map(([request]) => request as Request);
+  const deletes = () => requests().filter((request) => request.method === "DELETE");
+  const writes = () => requests().filter((request) => request.method === "PUT" || request.method === "DELETE");
+  // AWS 时间（假 S3 的 date 头）和设备时间一起往前拨
+  const advance = (ms: number) => vi.setSystemTime(Date.now() + ms);
+
+  // 远端多一条已删除记录，它的恢复副本早已过期；blobId 可以指定（比如和现有文件同一份内容）
+  const addExpiredRecovery = async (remote: RemoteStore, entryId: string, path: string, blobId?: string) => {
+    const body = new TextEncoder().encode(blobId ? "Original article." : `long gone ${entryId}`);
+    const id = blobId ?? crypto.randomUUID();
+    if (!blobId) await remote.writeBlob(id, body);
     const { sha256Content } = await import("../src/sync/content-hash");
     const head = (await remote.readHead())!;
     const commitId = crypto.randomUUID();
     await remote.advance({
       commit: { changes: [{ kind: "set-entry", entry: {
-        deletedAt: "2020-01-01T00:00:00.000Z", entryId: "gone", kind: "deleted", lastContentHash: await sha256Content(body),
-        lastRevisionId: "gone-revision", path: "old/gone.md",
-        recovery: { blobId, contentHash: await sha256Content(body), createdAt: "2020-01-01T00:00:00.000Z",
-          expiresAt: "2020-01-31T00:00:00.000Z", revisionId: "gone-revision", size: body.byteLength },
+        deletedAt: "2020-01-01T00:00:00.000Z", entryId, kind: "deleted", lastContentHash: await sha256Content(body),
+        lastRevisionId: `${entryId}-revision`, path,
+        recovery: { blobId: id, contentHash: await sha256Content(body), createdAt: "2020-01-01T00:00:00.000Z",
+          expiresAt: "2020-01-31T00:00:00.000Z", revisionId: `${entryId}-revision`, size: body.byteLength },
       } }], commitId, createdAt: head.serverDate, parentIds: [head.value.commitId], protocolVersion: 1,
       replicaId: "phone", vaultId: "vault-1" },
       expectedHeadEtag: head.etag,
       head: { ...head.value, commitId, generation: head.value.generation + 1 },
     });
+    return id;
   };
-
-  // 数据块删除接在清理提交之后，不运行的条件相同：连一次检查都没做过
-  const blobsUnchecked = () => (host.data as {unreferencedBlobMarks?: unknown}).unreferencedBlobMarks === undefined;
-
-  const goneRecovery = async (remote: RemoteStore) => {
+  // 40 天前上传、没有任何记录引用的数据块（早于 Head 对象的 LastModified）
+  const plant = (objects: Objects, blobIds = [ORPHANS[0]!]) => {
+    for (const blobId of blobIds) {
+      objects.set(blobKeyOf(blobId), { body: new Uint8Array(1234), etag: `"orphan-${blobId}"`, lastModified: Date.now() - 40 * DAY_MS });
+    }
+  };
+  const recordOf = async (remote: RemoteStore, entryId: string) => {
     const head = (await remote.readHead())!;
-    const entry = (await remote.readSnapshot(head.value)).entries.gone;
-    return { generation: head.value.generation, recovery: entry?.kind === "deleted" ? entry.recovery : undefined };
+    return (await remote.readSnapshot(head.value)).entries[entryId];
+  };
+  const recoveryOf = async (remote: RemoteStore, entryId: string) => {
+    const entry = await recordOf(remote, entryId);
+    return entry?.kind === "deleted" ? entry.recovery : undefined;
   };
 
-  const enabledDesktop = async () => {
+  // 电脑上：远端有两份过期的备份（gone、other）和一个 40 天前的无对应文件的数据块
+  const desktop = async (orphans = [ORPHANS[0]!]) => {
     host.desktop = true;
     const fixture = await setup();
-    await addExpiredRecovery(fixture.remote);
-    fixture.objects.set("test-prefix/v1/blobs/3c9a7e10-2b4d-4f6a-8c1e-5d7f9a0b2c4e",
-      { body: new Uint8Array(8), etag: "\"orphan\"", lastModified: Date.now() - 40 * 24 * 60 * 60 * 1000 });
-    await fixture.plugin.previewExpiredContentCleanup();
-    await fixture.plugin.setExpiredContentCleanupEnabled(true, true);
-    return fixture;
+    const goneBlob = await addExpiredRecovery(fixture.remote, "gone", "old/gone.md");
+    const otherBlob = await addExpiredRecovery(fixture.remote, "other", "old/other.md");
+    // 过期备份的数据块上传于删除之前，早已满 30 天
+    for (const blobId of [goneBlob, otherBlob]) fixture.objects.get(blobKeyOf(blobId))!.lastModified = Date.now() - 40 * DAY_MS;
+    plant(fixture.objects, orphans);
+    // 第一次同步只为让本机接受现在的记录
+    await fixture.plugin.togglePause();
+    expect(fixture.plugin.getStatusText()).toMatch(/^空闲：/u);
+    return { ...fixture, goneBlob };
+  };
+  const keyOf = (plugin: S3VaultSyncPlugin, match: (candidate: { kind: string; path?: string; blobId: string }) => boolean) => {
+    const found = plugin.getCleanupView()!.candidates.find(match);
+    if (!found) throw new Error("Expected the candidate in the cleanup list");
+    return found.key;
+  };
+  const confirmed = async (plugin: S3VaultSyncPlugin, paths: string[], orphans: string[] = []) => {
+    await plugin.loadCleanup();
+    const keys = [
+      ...paths.map((path) => keyOf(plugin, (candidate) => candidate.path === path)),
+      ...orphans.map((blobId) => keyOf(plugin, (candidate) => candidate.kind === "orphan" && candidate.blobId === blobId)),
+    ];
+    await plugin.confirmCleanup(keys, true);
+    return keys;
   };
 
-  it("cannot be turned on before a preview or without confirming every device is updated", async () => {
-    host.desktop = true;
-    const { plugin, remote } = await setup();
-    await addExpiredRecovery(remote);
-    await expect(plugin.setExpiredContentCleanupEnabled(true, true)).rejects.toThrow("请先预览");
-    const preview = await plugin.previewExpiredContentCleanup();
-    expect(preview.removedRecoveries).toEqual([{ deletedAt: "2020-01-01T00:00:00.000Z", path: "old/gone.md" }]);
-    await expect(plugin.setExpiredContentCleanupEnabled(true, false)).rejects.toThrow("所有设备");
-    expect(plugin.isExpiredContentCleanupEnabled()).toBe(false);
-    await plugin.setExpiredContentCleanupEnabled(true, true);
-    expect(plugin.isExpiredContentCleanupEnabled()).toBe(true);
-    plugin.onunload();
-  });
-
-  it("cleans once after a complete sync, records counts without paths, and waits a day before the next run", async () => {
-    const { plugin, remote } = await enabledDesktop();
-    expect(plugin.isExpiredContentCleanupAvailable()).toBe(true);
-
-    await plugin.togglePause();
-
-    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
-    const after = await goneRecovery(remote);
-    expect(after.recovery).toBeUndefined();
-    // 已删除列表不再有它
-    expect(plugin.getDeletedRecoveries()).toEqual([]);
-    const record = plugin.getDiagnostics().records.at(-1)!;
-    expect(record.expiredContentCleanup).toEqual({ at: expect.any(Number), removedHistory: 0, removedRecoveries: 1 });
-    expect(plugin.exportDiagnostics()).not.toContain("old/gone.md");
-    // 同一天再同步：不再清理
-    await addExpiredRecovery(remote);
-    const generation = (await goneRecovery(remote)).generation;
-    await plugin.syncNow();
-    expect(await goneRecovery(remote)).toMatchObject({ generation, recovery: expect.anything() });
-    expect(plugin.getDiagnostics().records.at(-1)!.expiredContentCleanup).toBeUndefined();
-    // 过了 24 小时（AWS 时间）再同步：再清理一次
-    vi.setSystemTime(Date.now() + 25 * 60 * 60 * 1000);
-    await plugin.syncNow();
-    expect((await goneRecovery(remote)).recovery).toBeUndefined();
-    plugin.onunload();
-  });
-
-  it("neither shows nor runs on a phone even when the stored switch is on", async () => {
-    const { plugin, remote } = await enabledDesktop();
+  it("counts what can be cleaned without reading S3, only on the desktop, and only for the current target", async () => {
+    const { plugin } = await desktop();
+    // 一次完全成功的同步之后算过一次：两份备份 + 一个数据块
+    expect(plugin.getCleanupCount()).toBe(3);
+    const before = requests().length;
+    expect(plugin.getCleanupCount()).toBe(3);
+    expect(requests().length).toBe(before);
+    // 确认删除的项目从数字里减掉，不读 S3
+    await confirmed(plugin, ["old/gone.md"]);
+    const afterConfirm = requests().length;
+    expect(plugin.getCleanupCount()).toBe(2);
+    expect(requests().length).toBe(afterConfirm);
+    // 目标变了：结果作废
+    plugin.getSettings().bucket = "another-bucket";
+    expect(plugin.getCleanupCount()).toBe(0);
+    plugin.getSettings().bucket = "test-bucket";
+    // 手机上没有这个入口，也不能打开列表
     host.desktop = false;
-    expect(plugin.isExpiredContentCleanupAvailable()).toBe(false);
-    await expect(plugin.previewExpiredContentCleanup()).rejects.toThrow("电脑");
-    await expect(plugin.setExpiredContentCleanupEnabled(true, true)).rejects.toThrow("电脑");
+    expect(plugin.getCleanupCount()).toBeUndefined();
+    await expect(plugin.loadCleanup()).rejects.toThrow("电脑");
+    plugin.onunload();
+  });
 
-    await plugin.togglePause();
+  it("refreshes the count at most once per 24 hours of AWS time after a complete sync", async () => {
+    const { plugin, remote } = await desktop();
+    expect(plugin.getCleanupCount()).toBe(3);
+    await addExpiredRecovery(remote, "later", "old/later.md");
+    await plugin.syncNow();
+    expect(plugin.getCleanupCount()).toBe(3);
+    advance(25 * HOUR_MS);
+    await plugin.syncNow();
+    expect(plugin.getCleanupCount()).toBe(4);
+    plugin.onunload();
+  });
+
+  it("lists the three groups, records a confirmation without writing to S3, and lets an undo put it back", async () => {
+    const { plugin, remote } = await desktop();
+    const view = await plugin.loadCleanup();
+    expect(view.candidates.map((candidate) => [candidate.kind, candidate.kind === "orphan" ? candidate.blobId : candidate.path]))
+      .toEqual([["recovery", "old/gone.md"], ["recovery", "old/other.md"], ["orphan", ORPHANS[0]]]);
+    // 当前在用的文件不在列表里
+    expect(view.candidates.some((candidate) => candidate.kind !== "orphan" && candidate.path === "notes/example.md")).toBe(false);
+    const key = keyOf(plugin, (candidate) => candidate.path === "old/gone.md");
+    const writesBefore = writes().length;
+
+    // 第一次删除要先确认所有设备都已更新
+    expect(plugin.needsCleanupDeviceConfirmation()).toBe(true);
+    await expect(plugin.confirmCleanup([key], false)).rejects.toThrow("0.1.10");
+    const requestsBefore = requests().length;
+    await plugin.confirmCleanup([key], true);
+    expect(plugin.needsCleanupDeviceConfirmation()).toBe(false);
+
+    expect(requests().length).toBe(requestsBefore);
+    const pending = plugin.getCleanupView()!;
+    expect(pending.candidates.map((candidate) => candidate.key)).not.toContain(key);
+    expect(pending.pending).toEqual([expect.objectContaining({ key, kind: "recovery", path: "old/gone.md", confirmedAt: view.serverDate })]);
+
+    await plugin.undoCleanup(key);
+
+    expect(requests().length).toBe(requestsBefore);
+    expect(plugin.getCleanupView()!.pending).toEqual([]);
+    expect(plugin.getCleanupView()!.candidates.map((candidate) => candidate.key)).toContain(key);
+    expect(writes().length).toBe(writesBefore);
+    expect(await recoveryOf(remote, "gone")).toBeDefined();
+    // 撤销后过多久同步都不处理它
+    advance(3 * DAY_MS);
+    await plugin.syncNow();
+    expect(await recoveryOf(remote, "gone")).toBeDefined();
+    expect(deletes()).toEqual([]);
+    plugin.onunload();
+  });
+
+  it("changes nothing before 24 hours of AWS time even when the device clock is 60 days ahead", async () => {
+    const { plugin, remote, objects, hooks } = await desktop();
+    await confirmed(plugin, ["old/gone.md"], [ORPHANS[0]!]);
+    advance(60 * DAY_MS);
+    hooks.awsOffsetMs = -60 * DAY_MS + 23 * HOUR_MS;
+
+    await plugin.syncNow();
 
     expect(plugin.getStatusText()).toMatch(/^空闲：/u);
-    expect((await goneRecovery(remote)).recovery).toBeDefined();
-    expect(blobsUnchecked()).toBe(true);
+    expect(await recoveryOf(remote, "gone")).toBeDefined();
+    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(true);
+    expect(deletes()).toEqual([]);
     plugin.onunload();
   });
 
-  it("does not run when the sync needs a Bulk Deletion decision", async () => {
-    const { plugin, remote, setLocalPresent } = await enabledDesktop();
-    setLocalPresent(false);
+  it("removes only the confirmed backup from the record after 24 hours, and deletes its data 24 hours after that", async () => {
+    const { plugin, remote, objects, goneBlob } = await desktop();
+    await confirmed(plugin, ["old/gone.md"], [ORPHANS[0]!]);
+    advance(25 * HOUR_MS);
+
+    await plugin.syncNow();
+
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+    // 只去掉确认过的那份；删除记录本身保留；没确认的过期备份仍在记录里
+    expect(await recordOf(remote, "gone")).toMatchObject({ kind: "deleted", path: "old/gone.md", deletedAt: "2020-01-01T00:00:00.000Z" });
+    expect(await recoveryOf(remote, "gone")).toBeUndefined();
+    expect(await recoveryOf(remote, "other")).toBeDefined();
+    // 这一次不删备份的数据；确认满 24 小时的无对应文件的数据删掉了，DELETE 不带 versionId
+    expect(objects.has(blobKeyOf(goneBlob))).toBe(true);
+    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(false);
+    expect(deletes().map((request) => { const url = new URL(request.url); return [url.pathname, url.search]; }))
+      .toEqual([[`/${blobKeyOf(ORPHANS[0]!)}`, ""]]);
+    expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({
+      expiredContentCleanup: { removedHistory: 0, removedRecoveries: 1 }, blobCleanup: { deletedBlobs: 1, deletedBytes: 1234 },
+    });
+    expect(plugin.getCleanupView()!.pending.map((item) => item.path)).toEqual(["old/gone.md"]);
+    expect(plugin.exportDiagnostics()).not.toContain("old/gone.md");
+
+    advance(25 * HOUR_MS);
+    await plugin.syncNow();
+
+    expect(objects.has(blobKeyOf(goneBlob))).toBe(false);
+    expect(plugin.getCleanupView()!.pending).toEqual([]);
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+    plugin.onunload();
+  });
+
+  it("keeps the data of a backup whose content an existing file still uses, and drops it from the queue", async () => {
+    host.desktop = true;
+    const { plugin, remote, objects } = await setup();
+    await addExpiredRecovery(remote, "same", "old/same.md", ORIGINAL_BLOB_ID);
     await plugin.togglePause();
-    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
-    expect((await goneRecovery(remote)).recovery).toBeDefined();
-    expect(blobsUnchecked()).toBe(true);
+    const view = await plugin.loadCleanup();
+    expect(view.candidates).toEqual([expect.objectContaining({ path: "old/same.md", sharedWith: { path: "notes/example.md" } })]);
+    await plugin.confirmCleanup([view.candidates[0]!.key], true);
+    advance(25 * HOUR_MS);
+    await plugin.syncNow();
+    advance(25 * HOUR_MS);
+    await plugin.syncNow();
+
+    expect(objects.has(blobKeyOf(ORIGINAL_BLOB_ID))).toBe(true);
+    expect(deletes()).toEqual([]);
+    expect(plugin.getCleanupView()!.pending).toEqual([]);
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
     plugin.onunload();
   });
 
-  it("does not run while a Conflict waits for the user, since the sync is not complete", async () => {
-    const { plugin, remote } = await enabledDesktop();
+  it("does not delete a confirmed blob that the record references again", async () => {
+    const { plugin, remote, objects } = await desktop();
+    await confirmed(plugin, [], [ORPHANS[0]!]);
+    // 确认之后，别的设备发布了引用这个数据块的提交（一条带旧版本的删除记录，不需要下载）
+    const { sha256Content } = await import("../src/sync/content-hash");
+    const body = new TextEncoder().encode("picked up again");
+    objects.delete(blobKeyOf(ORPHANS[0]!));
+    await remote.writeBlob(ORPHANS[0]!, body);
+    objects.get(blobKeyOf(ORPHANS[0]!))!.lastModified = Date.now() - 40 * DAY_MS;
+    const head = (await remote.readHead())!;
+    const commitId = crypto.randomUUID();
+    const contentHash = await sha256Content(body);
+    await remote.advance({
+      commit: { changes: [{ kind: "set-entry", entry: { deletedAt: head.serverDate, entryId: "picked", kind: "deleted",
+        lastContentHash: contentHash, lastRevisionId: "picked", path: "picked.md", history: [{
+          blobId: ORPHANS[0]!, contentHash, createdAt: head.serverDate, expiresAt: new Date(Date.now() + 30 * DAY_MS).toISOString(),
+          revisionId: "picked", size: body.byteLength,
+        }] } }], commitId, createdAt: head.serverDate, parentIds: [head.value.commitId], protocolVersion: 1, replicaId: "phone", vaultId: "vault-1" },
+      expectedHeadEtag: head.etag, head: { ...head.value, commitId, generation: head.value.generation + 1 },
+    });
+    advance(25 * HOUR_MS);
+
+    await plugin.syncNow();
+
+    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(true);
+    expect(deletes()).toEqual([]);
+    expect(plugin.getCleanupView()!.pending).toEqual([]);
+    plugin.onunload();
+  });
+
+  it("deletes nothing and reports it when the blob folder holds an unexpected name, then waits an hour before trying again", async () => {
+    const { plugin, objects } = await desktop();
+    await confirmed(plugin, [], [ORPHANS[0]!]);
+    advance(25 * HOUR_MS);
+    objects.set("test-prefix/v1/blobs/not-a-uuid", { body: new Uint8Array(1), etag: "\"stray\"", lastModified: Date.now() - 40 * DAY_MS });
+
+    await plugin.syncNow();
+
+    expect(deletes()).toEqual([]);
+    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(true);
+    expect(plugin.getStatusText()).toContain("这次不删除任何数据块");
+    // 原因排除了，1 小时内也不再重试
+    objects.delete("test-prefix/v1/blobs/not-a-uuid");
+    advance(30 * 60 * 1000);
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(true);
+    advance(31 * 60 * 1000);
+    await plugin.syncNow();
+    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(false);
+    plugin.onunload();
+  });
+
+  it.each(["bucket", "region", "prefix"] as const)("sends no further DELETE once the %s changes during the run", async (field) => {
+    const { plugin, objects } = await desktop(ORPHANS);
+    await confirmed(plugin, [], ORPHANS);
+    advance(25 * HOUR_MS);
+    const execute = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;
+    host.requestUrl.mockImplementation(async (request: Parameters<ObsidianRequestExecutor>[0]) => {
+      const response = await execute(request);
+      if (request.method === "DELETE") plugin.getSettings()[field] = field === "region" ? "eu-west-1" : `other-${field}`;
+      return response;
+    });
+
+    await plugin.syncNow();
+
+    expect(deletes()).toHaveLength(1);
+    expect(ORPHANS.filter((blobId) => objects.has(blobKeyOf(blobId)))).toHaveLength(2);
+    expect(plugin.getStatusText()).toContain("S3 目标被改了");
+    plugin.onunload();
+  });
+
+  it("waits while a Conflict is unresolved and says why on the list", async () => {
+    const { plugin, remote } = await desktop();
+    await confirmed(plugin, ["old/gone.md"]);
+    advance(25 * HOUR_MS);
     const head = (await remote.readHead())!;
     const commitId = crypto.randomUUID();
     const body = new TextEncoder().encode("candidate");
@@ -1436,57 +1622,101 @@ describe("expired content cleanup on the desktop", () => {
       commitId, createdAt: head.serverDate, parentIds: [head.value.commitId], protocolVersion: 1, replicaId: "phone", vaultId: "vault-1" },
       expectedHeadEtag: head.etag, head: { ...head.value, commitId, generation: head.value.generation + 1 },
     });
-    await plugin.togglePause();
-    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
-    expect((await goneRecovery(remote)).recovery).toBeDefined();
-    expect(blobsUnchecked()).toBe(true);
-    plugin.onunload();
-  });
 
-  it("does not run after a sync that failed on the network", async () => {
-    const { plugin, remote, hooks } = await enabledDesktop();
-    hooks.headFailure = "network";
-    await plugin.togglePause();
-    hooks.headFailure = undefined;
-    expect(plugin.getStatusText()).not.toMatch(/^空闲：/u);
-    expect((await goneRecovery(remote)).recovery).toBeDefined();
-    expect(blobsUnchecked()).toBe(true);
-    plugin.onunload();
-  });
-
-  it("does not run in Repair Mode with an integrity check left to recheck", async () => {
-    const { plugin, remote, hooks } = await enabledDesktop();
-    hooks.headFailure = "corrupt";
-    await plugin.togglePause();
-    expect(plugin.getStatusText()).toMatch(/^需要处理：修复模式/u);
     await plugin.syncNow();
-    expect(plugin.getStatusText()).toMatch(/^需要处理：修复模式/u);
-    hooks.headFailure = undefined;
-    expect((await goneRecovery(remote)).recovery).toBeDefined();
-    expect(blobsUnchecked()).toBe(true);
+
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
+    expect(await recoveryOf(remote, "gone")).toBeDefined();
+    expect(plugin.getCleanupView()!.blockedReason).toBe("有冲突还没处理，清理会等你处理完再继续。");
     plugin.onunload();
   });
 
-  it("does not run when the remote Head does not exist", async () => {
-    const { plugin, objects } = await enabledDesktop();
-    const puts = () => host.requestUrl.mock.calls.filter(([request]) => (request as {method: string}).method === "PUT").length;
-    objects.delete("test-prefix/v1/head");
-    const before = puts();
-    await plugin.togglePause();
-    expect(plugin.getStatusText()).toMatch(/^需要处理：修复模式/u);
-    expect(objects.has("test-prefix/v1/head")).toBe(false);
-    expect(puts()).toBe(before);
-    expect(blobsUnchecked()).toBe(true);
+  it("processes on the next complete sync once a Bulk Deletion decision no longer blocks it", async () => {
+    const { plugin, remote, setLocalPresent } = await desktop();
+    await confirmed(plugin, ["old/gone.md"]);
+    advance(25 * HOUR_MS);
+    setLocalPresent(false);
+    await plugin.syncNow();
+    expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
+    expect(await recoveryOf(remote, "gone")).toBeDefined();
+    expect(plugin.getCleanupView()!.blockedReason).toBe("有批量删除等你确认，清理会等你确认后再继续。");
+
+    setLocalPresent(true);
+    await plugin.syncNow();
+
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+    expect(await recoveryOf(remote, "gone")).toBeUndefined();
+    expect(plugin.getCleanupView()!.blockedReason).toBeUndefined();
     plugin.onunload();
+  });
+
+  it("neither shows nor processes anything on a phone", async () => {
+    const { plugin, remote, objects } = await desktop();
+    await confirmed(plugin, ["old/gone.md"], [ORPHANS[0]!]);
+    host.desktop = false;
+    advance(3 * DAY_MS);
+
+    await plugin.syncNow();
+
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+    expect(await recoveryOf(remote, "gone")).toBeDefined();
+    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(true);
+    expect(deletes()).toEqual([]);
+    plugin.onunload();
+  });
+
+  it("drops the old automatic-cleanup data on load and never cleans automatically", async () => {
+    host.desktop = true;
+    const { plugin, remote, objects, app } = await setup();
+    await addExpiredRecovery(remote, "gone", "old/gone.md");
+    plant(objects);
+    plugin.onunload();
+    const target = JSON.stringify(["test-bucket", "us-east-1", "test-prefix", "vault-1"]);
+    Object.assign(host.data as object, {
+      expiredContentCleanup: { target, lastRunServerDate: new Date(Date.now() - 3 * DAY_MS).toISOString() },
+      unreferencedBlobMarks: { target, firstSeen: { [ORPHANS[0]!]: new Date(Date.now() - 3 * DAY_MS).toISOString() } },
+    });
+    const replacement = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
+    await replacement.onload();
+    expect(host.data).not.toHaveProperty("expiredContentCleanup");
+    expect(host.data).not.toHaveProperty("unreferencedBlobMarks");
+
+    await replacement.togglePause();
+    advance(3 * DAY_MS);
+    await replacement.syncNow();
+
+    expect(replacement.getStatusText()).toMatch(/^空闲：/u);
+    expect(await recoveryOf(remote, "gone")).toBeDefined();
+    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(true);
+    expect(deletes()).toEqual([]);
+    // 那些数据块出现在「找不到对应文件的数据」里，等用户确认
+    expect((await replacement.loadCleanup()).candidates.some((candidate) => candidate.kind === "orphan" && candidate.blobId === ORPHANS[0])).toBe(true);
+    replacement.onunload();
   });
 });
 
-describe("expired content cleanup that keeps losing the Head race", () => {
+describe("manual cleanup that keeps losing the Head race", () => {
   it("gives up quietly after the retries and tries again after the next sync", async () => {
     host.desktop = true;
-    const { plugin } = await setup();
-    await plugin.previewExpiredContentCleanup();
-    await plugin.setExpiredContentCleanupEnabled(true, true);
+    const { plugin, remote } = await setup();
+    const body = new TextEncoder().encode("long gone");
+    const blobId = crypto.randomUUID();
+    await remote.writeBlob(blobId, body);
+    const { sha256Content } = await import("../src/sync/content-hash");
+    const head = (await remote.readHead())!;
+    const commitId = crypto.randomUUID();
+    await remote.advance({
+      commit: { changes: [{ kind: "set-entry", entry: {
+        deletedAt: "2020-01-01T00:00:00.000Z", entryId: "gone", kind: "deleted", lastContentHash: await sha256Content(body),
+        lastRevisionId: "gone-revision", path: "old/gone.md",
+        recovery: { blobId, contentHash: await sha256Content(body), createdAt: "2020-01-01T00:00:00.000Z",
+          expiresAt: "2020-01-31T00:00:00.000Z", revisionId: "gone-revision", size: body.byteLength },
+      } }], commitId, createdAt: head.serverDate, parentIds: [head.value.commitId], protocolVersion: 1, replicaId: "phone", vaultId: "vault-1" },
+      expectedHeadEtag: head.etag, head: { ...head.value, commitId, generation: head.value.generation + 1 },
+    });
+    const view = await plugin.loadCleanup();
+    await plugin.confirmCleanup(view.candidates.map((candidate) => candidate.key), true);
+    vi.setSystemTime(Date.now() + 25 * 60 * 60 * 1000);
     const { HeadChangedError } = await import("../src/storage/remote-store");
     const cleanup = vi.spyOn(SyncService.prototype, "cleanupExpiredContent").mockRejectedValue(new HeadChangedError());
 
@@ -1503,7 +1733,7 @@ describe("expired content cleanup that keeps losing the Head race", () => {
       }
       await run;
     };
-    // 无论成败都撤掉模拟失败，免得后面启用清理的测试也一直抢不到记录
+    // 无论成败都撤掉模拟失败
     try {
       await settle(plugin.togglePause());
 
@@ -1511,143 +1741,12 @@ describe("expired content cleanup that keeps losing the Head race", () => {
       expect(plugin.getStatusText()).toMatch(/^空闲：/u);
       expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({ outcome: "complete" });
       expect(plugin.getDiagnostics().records.at(-1)!.expiredContentCleanup).toBeUndefined();
+      expect(plugin.getCleanupView()!.pending).toHaveLength(1);
       await settle(plugin.syncNow());
       expect(cleanup).toHaveBeenCalledTimes(10);
     } finally {
       cleanup.mockRestore();
     }
-    plugin.onunload();
-  });
-});
-
-describe("unreferenced blob deletion on the desktop", () => {
-  const DAY_MS = 24 * 60 * 60 * 1000;
-  const ORPHANS = ["3c9a7e10-2b4d-4f6a-8c1e-5d7f9a0b2c4e", "7e1d2c3b-4a5f-4b6c-8d7e-9f0a1b2c3d4e", "a0b1c2d3-e4f5-4a6b-9c7d-8e9f0a1b2c3d"];
-  const blobKeyOf = (blobId: string) => `test-prefix/v1/blobs/${blobId}`;
-  type Objects = Map<string, { body: Uint8Array; etag: string; lastModified?: number }>;
-  type StoredMarks = { unreferencedBlobMarks?: { target: string; firstSeen: Record<string, string> } };
-  // 40 天前上传、没有任何记录引用的数据块（早于 Head 对象的 LastModified）
-  const plant = (objects: Objects, blobIds = [ORPHANS[0]!]) => {
-    for (const blobId of blobIds) {
-      objects.set(blobKeyOf(blobId), { body: new Uint8Array(1234), etag: `"orphan-${blobId}"`, lastModified: Date.now() - 40 * DAY_MS });
-    }
-  };
-  const deletes = () => host.requestUrl.mock.calls.map(([request]) => request as { method: string; url: string })
-    .filter((request) => request.method === "DELETE");
-  // AWS 时间（假 S3 的 date 头）和设备时间一起往前拨，满 24 小时
-  const nextDay = () => vi.setSystemTime(Date.now() + 25 * 60 * 60 * 1000);
-  const enabled = async (blobIds?: string[]) => {
-    host.desktop = true;
-    const fixture = await setup();
-    plant(fixture.objects, blobIds);
-    await fixture.plugin.previewExpiredContentCleanup();
-    await fixture.plugin.setExpiredContentCleanupEnabled(true, true);
-    return fixture;
-  };
-
-  it("deletes an old unreferenced blob on a later daily run, without a versionId, and records only counts", async () => {
-    const { plugin, objects } = await enabled();
-
-    // 第一次：只记下第一次判定，不删
-    await plugin.togglePause();
-    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
-    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(true);
-    expect(deletes()).toEqual([]);
-    expect(plugin.getDiagnostics().records.at(-1)!.blobCleanup).toEqual({ deletedBlobs: 0, deletedBytes: 0 });
-    expect((host.data as StoredMarks).unreferencedBlobMarks?.firstSeen).toHaveProperty(ORPHANS[0]!);
-
-    nextDay();
-    await plugin.syncNow();
-
-    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(false);
-    expect(deletes()).toHaveLength(1);
-    const url = new URL(deletes()[0]!.url);
-    expect(url.pathname).toBe(`/${blobKeyOf(ORPHANS[0]!)}`);
-    expect([...url.searchParams.keys()]).toEqual([]);
-    expect(plugin.getDiagnostics().records.at(-1)!.blobCleanup).toEqual({ deletedBlobs: 1, deletedBytes: 1234 });
-    expect(plugin.exportDiagnostics()).not.toContain(ORPHANS[0]!);
-    // 删除后再同步：读 Head 的存在性检查照常通过
-    await plugin.syncNow();
-    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
-    plugin.onunload();
-  });
-
-  it("never checks or deletes blobs on a phone, even with a first judgment already recorded", async () => {
-    const { plugin, objects } = await enabled();
-    await plugin.togglePause();
-    host.desktop = false;
-    nextDay();
-
-    await plugin.syncNow();
-
-    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
-    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(true);
-    expect(deletes()).toEqual([]);
-    plugin.onunload();
-  });
-
-  it.each(["bucket", "region", "prefix"] as const)("sends no further DELETE once the %s changes during the run", async (field) => {
-    const { plugin, objects } = await enabled(ORPHANS);
-    await plugin.togglePause();
-    nextDay();
-    const execute = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;
-    host.requestUrl.mockImplementation(async (request: Parameters<ObsidianRequestExecutor>[0]) => {
-      const response = await execute(request);
-      if (request.method === "DELETE") plugin.getSettings()[field] = field === "region" ? "eu-west-1" : `other-${field}`;
-      return response;
-    });
-
-    await plugin.syncNow();
-
-    expect(deletes()).toHaveLength(1);
-    expect(ORPHANS.filter((blobId) => objects.has(blobKeyOf(blobId)))).toHaveLength(2);
-    expect(plugin.getStatusText()).toContain("S3 目标被改了");
-    plugin.onunload();
-  });
-
-  const markChanges: Array<[string, (data: StoredMarks) => void]> = [
-    ["is lost", (data: StoredMarks) => { delete data.unreferencedBlobMarks; }],
-    ...(["bucket", "region", "prefix", "vaultId"] as const).map((field, index): [string, (data: StoredMarks) => void] => [
-      `belongs to another ${field}`,
-      (data: StoredMarks) => {
-        // 记录绑定 [桶, 区域, 前缀, vaultId]
-        const target = JSON.parse(data.unreferencedBlobMarks!.target) as string[];
-        target[index] = `other-${field}`;
-        data.unreferencedBlobMarks!.target = JSON.stringify(target);
-      },
-    ]),
-  ];
-  it.each(markChanges)("restarts the 24-hour wait when the local first-judgment record %s", async (_name, change) => {
-    const { plugin, app, objects } = await enabled();
-    await plugin.togglePause();
-    plugin.onunload();
-    change(host.data as StoredMarks);
-    const replacement = new S3VaultSyncPlugin(app, { id: "s3-vault-sync" } as PluginManifest);
-    await replacement.onload();
-    await replacement.previewExpiredContentCleanup();
-    await replacement.setExpiredContentCleanupEnabled(true, true);
-
-    nextDay();
-    await replacement.syncNow();
-    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(true);
-    expect(deletes()).toEqual([]);
-    nextDay();
-    await replacement.syncNow();
-    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(false);
-    replacement.onunload();
-  });
-
-  it("deletes nothing and reports it when the blob folder holds an unexpected name", async () => {
-    const { plugin, objects } = await enabled();
-    await plugin.togglePause();
-    nextDay();
-    objects.set("test-prefix/v1/blobs/not-a-uuid", { body: new Uint8Array(1), etag: "\"stray\"", lastModified: Date.now() - 40 * DAY_MS });
-
-    await plugin.syncNow();
-
-    expect(deletes()).toEqual([]);
-    expect(objects.has(blobKeyOf(ORPHANS[0]!))).toBe(true);
-    expect(plugin.getStatusText()).toContain("这次不删除任何数据块");
     plugin.onunload();
   });
 });
