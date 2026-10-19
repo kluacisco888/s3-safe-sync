@@ -764,6 +764,32 @@ describe("cleanup from the status window", () => {
     expect(cleanup.load).not.toHaveBeenCalled();
   });
 
+  it("leaves a closed list alone when its reading finishes after it was closed", async () => {
+    let finish!: (view: CleanupView) => void;
+    let fail!: (error: Error) => void;
+    const cleanup = cleanupWith({candidates: [recovery(1)], pending: [], serverDate: SERVER}, {
+      loadCleanup: () => new Promise<CleanupView>((resolve, reject) => { finish = resolve; fail = reject; }),
+    });
+    const status = new StatusModal({} as App, statusController(cleanup));
+    status.onOpen();
+    button(status, "待清理（1）").events.get("click")!();
+    const page = opened.at(-1)! as unknown as {contentEl: unknown; onClose(): void; onOpen(): void};
+    expect(textsOf(page)).toContain("正在读取远端记录…");
+    page.onClose();
+    // 让读取的 then/catch 回调都跑完
+    const flush = async () => { for (let i = 0; i < 5; i += 1) await Promise.resolve(); };
+    finish({candidates: [recovery(1)], pending: [], serverDate: SERVER});
+    await flush();
+    expect(textsOf(page).filter(Boolean)).toEqual([]);
+
+    // 读取失败的结果也一样不写进已关闭的窗口
+    page.onOpen();
+    page.onClose();
+    fail(new Error("网络出错"));
+    await flush();
+    expect(textsOf(page).filter(Boolean)).toEqual([]);
+  });
+
   it("shows a plain 待清理 when nothing can be cleaned, and no button at all on a phone", () => {
     const empty = new StatusModal({} as App, statusController(cleanupWith({candidates: [], pending: [], serverDate: SERVER})));
     empty.onOpen();

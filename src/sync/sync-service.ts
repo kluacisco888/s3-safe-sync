@@ -1179,11 +1179,12 @@ export class SyncService {
     expired.sort((left, right) =>
       Date.parse(left.deletedAt ?? left.expiresAt) - Date.parse(right.deletedAt ?? right.expiresAt) ||
       (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
-    // 没有任何第一次判定记录时，满足前三条的数据块都落在 waiting 里
+    // 没有任何第一次判定记录时，满足前三条的数据块都落在 waiting 里。
+    // 引用集和读 Head 时的存在性检查、数据块删除用同一个函数，免得规则以后改了这里对不上
     const unreferenced = planUnreferencedBlobDeletion({
       headLastModified: versionedHead.lastModified,
       objects: await remote.listBlobObjects(),
-      referenced: new Set(referrers.keys()),
+      referenced: new Set(snapshotBlobReferences(snapshot).keys()),
       serverDate: versionedHead.serverDate,
     });
     const orphans: CleanupCandidate[] = [...unreferenced.deletable, ...unreferenced.waiting].map((object) => ({

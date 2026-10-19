@@ -131,6 +131,8 @@ export class CleanupModal extends Modal {
   private view: CleanupView | undefined;
   private readonly selected = new Set<string>();
   private readonly expanded = new Set<CleanupCandidate["kind"]>();
+  // 每次打开、关闭都加一；读取回来时对不上就丢掉结果
+  private loadGeneration = 0;
 
   constructor(
     app: App,
@@ -147,10 +149,14 @@ export class CleanupModal extends Modal {
     this.contentEl.empty();
     this.contentEl.createEl("h2", {text: "待清理的内容"});
     this.contentEl.createEl("p", {cls: "s3-vault-sync-muted", text: "正在读取远端记录…"});
+    // 读取结束时窗口已关或已重新打开：这次的结果不再写进窗口
+    const load = ++this.loadGeneration;
     void this.controller.loadCleanup().then(view => {
+      if (load !== this.loadGeneration) return;
       this.view = view;
       this.render();
     }).catch((error: unknown) => {
+      if (load !== this.loadGeneration) return;
       this.contentEl.empty();
       this.contentEl.createEl("h2", {text: "待清理的内容"});
       this.contentEl.createEl("p", {cls: "s3-vault-sync-error", text: error instanceof Error ? error.message : "读取失败。"});
@@ -159,6 +165,7 @@ export class CleanupModal extends Modal {
   }
 
   onClose(): void {
+    this.loadGeneration += 1;
     this.contentEl.empty();
     this.onClosed?.();
   }
