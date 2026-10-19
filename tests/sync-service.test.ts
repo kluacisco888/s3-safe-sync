@@ -7660,4 +7660,26 @@ describe("deleting unreferenced blobs from this vault's folder", () => {
     expect(Object.keys(result.kind === "checked" ? result.marks : {})).toEqual([recentlyConfirmed]);
     expect(await fixture.objects.exists(blobKey(notConfirmed))).toBe(true);
   });
+
+  it("rereads the Head before deleting the given blobs and keeps one that another device referenced meanwhile", async () => {
+    const fixture = await setup();
+    const picked = await orphan(fixture, 1, "picked up again");
+    const other = await orphan(fixture, 1);
+    await publishAt(fixture, 2);
+    const reference: RevisionRef = {
+      blobId: picked, contentHash: await sha256Content(text("picked up again")), createdAt: at(1), revisionId: "picked",
+      size: text("picked up again").byteLength,
+    };
+    fixture.objects.onListObjects = async () => {
+      fixture.objects.onListObjects = undefined;
+      await publishAt(fixture, 41, [{ entryId: "picked", kind: "live", path: "picked.md", revision: reference }]);
+    };
+    fixture.objects.now = at(41);
+    const marks = { [picked]: at(40), [other]: at(40) };
+
+    const result = await fixture.desktop.deleteUnreferencedBlobs("vault", marks, new Set(Object.keys(marks)));
+
+    expect(fixture.objects.deleted).toEqual([blobKey(other)]);
+    expect(result.kind === "checked" && result.marks).toEqual({});
+  });
 });
