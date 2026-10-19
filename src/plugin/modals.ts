@@ -414,7 +414,10 @@ export class StatusModal extends Modal {
       const count = cleanup.getCleanupCount() ?? 0;
       const entry = actions.createEl("button", {text: count > 0 ? `待清理（${count}）` : "待清理"});
       if (count > 0) entry.addClass("s3-vault-sync-cleanup-pending");
-      entry.addEventListener("click", () => new CleanupModal(this.app, cleanup, () => this.onOpen()).open());
+      // 列表关掉时刷新数字；同步状态窗口已经关了就不再重画（否则会重新订阅状态变化）
+      entry.addEventListener("click", () => new CleanupModal(this.app, cleanup, () => {
+        if (this.stopStatusUpdates) this.onOpen();
+      }).open());
     }
     if (this.controller.getStatusText().includes("修复模式")) {
       actions.createEl("button", {text: "恢复指引"}).addEventListener("click", () => {

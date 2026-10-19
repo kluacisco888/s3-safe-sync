@@ -888,6 +888,24 @@ describe("cleanup from the status window", () => {
     }
   });
 
+  it("refreshes the count in the status window when the list closes, but not after the status window itself was closed", async () => {
+    const cleanup = cleanupWith({serverDate: SERVER, pending: [], candidates: [recovery(1), orphan]});
+    const subscribe = vi.fn(() => () => {});
+    const status = new StatusModal({} as App, {...statusController(cleanup), onStatusChange: subscribe});
+    status.onOpen();
+    button(status, "待清理（2）").events.get("click")!();
+    const page = opened.at(-1)! as unknown as {onClose(): void; contentEl: unknown};
+    await vi.waitFor(() => expect(textsOf(page)).toContain("待清理的内容"));
+    await cleanup.move([recovery(1).key], true);
+    expect(cleanup.getCleanupCount()).toBe(1);
+    page.onClose();
+    expect(textsOf(status)).toContain("待清理（1）");
+    const subscriptions = subscribe.mock.calls.length;
+    status.onClose();
+    page.onClose();
+    expect(subscribe.mock.calls.length).toBe(subscriptions);
+  });
+
   it("says above the list why cleaning waits", async () => {
     const page = await openCleanup(cleanupWith({blockedReason: "有冲突还没处理，清理会等你处理完再继续。", serverDate: SERVER,
       pending: [], candidates: [recovery(1)]}));
