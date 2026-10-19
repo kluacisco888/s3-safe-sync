@@ -6,6 +6,7 @@ const UI_FILES = [
   "src/main.ts",
   "src/plugin/settings.ts",
   "src/plugin/modals.ts",
+  "src/plugin/cleanup-modal.ts",
   "src/plugin/content-review-modal.ts",
   "src/plugin/path-collision-modal.ts",
   "src/plugin/content-diff.ts",
