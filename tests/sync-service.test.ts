@@ -7117,6 +7117,133 @@ describe("cleaning expired content out of the remote record", () => {
     expect(remove).not.toHaveBeenCalled();
     expect(fixture.phoneVault.readText("note.md")).toBe("v0");
   });
+
+  describe("listing and removing what the user confirmed", () => {
+    const keyOf = (kind: "recovery" | "history", entryId: string, revisionId: string): string => `${kind}:${entryId}:${revisionId}`;
+
+    it("lists only expired backups and expired old versions, never current versions, conflicts or items without an expiry", async () => {
+      const fixture = await setup({});
+      const before = await judgedRecord(fixture.observer);
+      fixture.objects.serverDate = at(40);
+      const live = before.live as LiveEntry;
+      const gone = before.gone as DeletedEntry;
+      const keptDeleted = before["kept-deleted"] as DeletedEntry;
+      const deletedHistory = before["deleted-history"] as DeletedEntry;
+
+      const listed = await fixture.desktop.listCleanupCandidates("vault");
+
+      expect(listed.serverDate).toBe(at(40));
+      expect(listed.items.filter((item) => item.kind !== "orphan").map((item) => item.key).sort()).toEqual([
+        keyOf("history", "deleted-history", deletedHistory.history![0]!.revisionId),
+        keyOf("history", "live", live.history![1]!.revisionId),
+        keyOf("recovery", "gone", gone.recovery!.revisionId),
+        keyOf("recovery", "kept-deleted", keptDeleted.recovery!.revisionId),
+      ].sort());
+      expect(listed.items.find((item) => item.key === keyOf("recovery", "gone", gone.recovery!.revisionId))).toEqual({
+        blobId: gone.recovery!.blobId, deletedAt: at(0), entryId: "gone", expiresAt: at(30), key: keyOf("recovery", "gone", gone.recovery!.revisionId),
+        kind: "recovery", path: "gone.md", revisionId: gone.recovery!.revisionId, size: gone.recovery!.size,
+      });
+      expect(listed.items.find((item) => item.key === keyOf("history", "live", live.history![1]!.revisionId))).toEqual({
+        blobId: live.history![1]!.blobId, entryId: "live", expiresAt: at(30), key: keyOf("history", "live", live.history![1]!.revisionId),
+        kind: "history", path: "live.md", revisionId: live.history![1]!.revisionId, size: live.history![1]!.size,
+      });
+    });
+
+    it("lists without writing to S3 or the local cache", async () => {
+      const fixture = await setup({});
+      await judgedRecord(fixture.observer);
+      fixture.objects.serverDate = at(40);
+      const cacheBefore = structuredClone(fixture.desktopCache.state);
+      const putsBefore = fixture.objects.puts.length;
+      const generationBefore = (await readCurrent(fixture.observer)).head.value.generation;
+
+      await fixture.desktop.listCleanupCandidates("vault");
+
+      expect(fixture.objects.puts.length).toBe(putsBefore);
+      expect(fixture.desktopCache.state).toEqual(cacheBefore);
+      expect((await readCurrent(fixture.observer)).head.value.generation).toBe(generationBefore);
+    });
+
+    it("notes when an expired item's content is still used by an existing file or by another record", async () => {
+      const fixture = await setup({});
+      const current = await revisionOf(fixture.observer, "same as a current file");
+      const elsewhere = await revisionOf(fixture.observer, "kept in another history", at(90));
+      const deleted = (entryId: string, recovery: RevisionRef): VaultEntry => ({
+        deletedAt: at(0), entryId, kind: "deleted", lastContentHash: recovery.contentHash, lastRevisionId: "last",
+        path: `${entryId}.md`, recovery: { ...recovery, revisionId: `${entryId}-recovery`, expiresAt: at(30) },
+      });
+      await publish(fixture.observer, [
+        { entryId: "keep", kind: "live", path: "folder/keep.md", revision: current },
+        { entryId: "other", kind: "live", path: "other.md", revision: await revisionOf(fixture.observer, "other current"), history: [elsewhere] },
+        deleted("same-content", current),
+        deleted("in-history", elsewhere),
+        deleted("alone", await revisionOf(fixture.observer, "only here")),
+      ]);
+      fixture.objects.serverDate = at(40);
+
+      const listed = await fixture.desktop.listCleanupCandidates("vault");
+
+      const byEntry = (entryId: string) => listed.items.find((item) => item.kind === "recovery" && item.entryId === entryId);
+      expect(byEntry("same-content")).toMatchObject({ sharedWith: { path: "folder/keep.md" } });
+      expect(byEntry("in-history")).toMatchObject({ sharedWith: {} });
+      expect(byEntry("alone")).not.toHaveProperty("sharedWith");
+    });
+
+    it("removes only the confirmed items and keeps other expired content and every Deletion Record", async () => {
+      const fixture = await setup({});
+      const before = await judgedRecord(fixture.observer);
+      fixture.objects.serverDate = at(40);
+      const live = before.live as LiveEntry;
+      const gone = before.gone as DeletedEntry;
+      const selected = [keyOf("recovery", "gone", gone.recovery!.revisionId), keyOf("history", "live", live.history![1]!.revisionId)];
+
+      const result = await fixture.desktop.cleanupExpiredContent("vault", new Set(selected));
+
+      expect(result).toMatchObject({
+        kind: "committed", outcomes: { [selected[0]!]: "removed", [selected[1]!]: "removed" }, removedHistory: 1,
+        removedRecoveries: 1, serverDate: at(40),
+      });
+      const { head, snapshot } = await readCurrent(fixture.observer);
+      const { recovery: _removed, ...goneRecord } = gone;
+      expect(snapshot.entries.gone).toEqual(goneRecord);
+      expect(snapshot.entries.live).toEqual({ ...live, history: [live.history![0]] });
+      // 别的过期内容没被确认：原样留在记录里
+      expect(snapshot.entries["kept-deleted"]).toEqual(before["kept-deleted"]);
+      expect(snapshot.entries["deleted-history"]).toEqual(before["deleted-history"]);
+      expect(snapshot.entries.conflicted).toEqual(before.conflicted);
+      const commit = await fixture.observer.readCommit(head.value.commitId);
+      expect(commit!.changes.map((change) => change.entry.entryId).sort()).toEqual(["gone", "live"]);
+    });
+
+    it("reports confirmed items that are already gone or have become a Conflict, and changes neither", async () => {
+      const fixture = await setup({});
+      const before = await judgedRecord(fixture.observer);
+      const live = before.live as LiveEntry;
+      const keptDeleted = before["kept-deleted"] as DeletedEntry;
+      // 确认之后：别的设备改了 live.md（旧版本不在了），kept-deleted 变成了冲突
+      const conflicted: VaultEntry = {
+        candidates: [await revisionOf(fixture.observer, "new candidate")], entryId: "kept-deleted", kind: "conflicted",
+        path: "kept-deleted.md", reason: "delete-edit", recovery: keptDeleted.recovery,
+      };
+      await publish(fixture.observer, [{ ...live, history: [live.history![0]!] }, conflicted]);
+      fixture.objects.serverDate = at(40);
+      const putsBefore = fixture.objects.puts.length;
+      const selected = [
+        keyOf("history", "live", live.history![1]!.revisionId),
+        keyOf("recovery", "kept-deleted", keptDeleted.recovery!.revisionId),
+        keyOf("recovery", "never-existed", "missing"),
+      ];
+
+      const result = await fixture.desktop.cleanupExpiredContent("vault", new Set(selected));
+
+      expect(result).toEqual({
+        kind: "nothing-to-clean", outcomes: { [selected[0]!]: "gone", [selected[1]!]: "skipped", [selected[2]!]: "gone" },
+        removedHistory: 0, removedRecoveries: 0, serverDate: at(40),
+      });
+      expect(fixture.objects.puts.length).toBe(putsBefore);
+      expect(await entryAt(fixture.observer, "kept-deleted.md")).toEqual(conflicted);
+    });
+  });
 });
 
 describe("deleting unreferenced blobs from this vault's folder", () => {
@@ -7538,5 +7665,53 @@ describe("deleting unreferenced blobs from this vault's folder", () => {
     });
     expect(fixture.objects.deleted).toEqual([]);
     expect(await fixture.objects.get(`${prefix}/v1/head`)).toEqual(headBefore);
+  });
+
+  it("lists as unused only blobs the record does not reference, uploaded 30 days before AWS time and before the Head", async () => {
+    const fixture = await setup();
+    const old = await orphan(fixture, 1, "old orphan");
+    const recent = await orphan(fixture, 15);
+    await publishAt(fixture, 16);
+    // 上传完一直没发布：比 Head 新
+    const suspended = await orphan(fixture, 17);
+    fixture.objects.now = at(40);
+    const size = (await fixture.objects.get(blobKey(old)))!.body.byteLength;
+
+    const listed = await fixture.desktop.listCleanupCandidates("vault");
+
+    expect(listed.items).toEqual([{ blobId: old, key: `orphan:${old}`, kind: "orphan", size, uploadedAt: at(1) }]);
+    expect(listed.items.map((item) => item.blobId)).not.toContain(recent);
+    expect(listed.items.map((item) => item.blobId)).not.toContain(suspended);
+    expect(fixture.objects.deleted).toEqual([]);
+  });
+
+  it("never lists anything of a file uploaded 60 days ago and never changed since", async () => {
+    const fixture = await setup({ "untouched.md": "written once", "other.md": "x" });
+    await fixture.desktopVault.write("other.md", text("y"));
+    fixture.objects.now = at(1);
+    await fixture.desktop.synchronize();
+    fixture.objects.now = at(60);
+
+    const listed = await fixture.desktop.listCleanupCandidates("vault");
+
+    // 只有 other.md 的旧版本（被替换后满 30 天）
+    expect(listed.items.map((item) => item.kind === "orphan" ? item.blobId : item.path)).toEqual(["other.md"]);
+  });
+
+  it("considers only the given blobs when deleting, by the times it was given", async () => {
+    const fixture = await setup();
+    const confirmed = await orphan(fixture, 1);
+    const recentlyConfirmed = await orphan(fixture, 1);
+    const notConfirmed = await orphan(fixture, 1);
+    await publishAt(fixture, 2);
+    fixture.objects.now = at(41);
+    const marks = { [confirmed]: at(40), [recentlyConfirmed]: new Date(Date.parse(at(40)) + 2 * HOUR_MS).toISOString() };
+
+    const result = await fixture.desktop.deleteUnreferencedBlobs("vault", marks, new Set(Object.keys(marks)));
+
+    expect(fixture.objects.deleted).toEqual([blobKey(confirmed)]);
+    expect(result).toMatchObject({ deletedBlobs: 1, kind: "checked", marks: { [recentlyConfirmed]: marks[recentlyConfirmed] } });
+    expect(Object.keys(result.kind === "checked" ? result.marks : {})).toEqual([recentlyConfirmed]);
+    expect(await fixture.objects.exists(blobKey(notConfirmed))).toBe(true);
   });
 });

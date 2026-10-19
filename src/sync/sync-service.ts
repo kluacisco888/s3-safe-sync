@@ -28,6 +28,7 @@ import { canonicalVaultPath } from "./canonical-path";
 import { PathCollisionReviewer, type PathCollisionReview, type PathCollisionResolution } from "./path-collision-review";
 import type { CollisionRenameJournal } from "./collision-rename-journal";
 import {
+  expiredContentKey,
   planExpiredContentCleanup,
   type ExpiredRecoveryRemoval,
   type MissingExpiryItem,
@@ -64,10 +65,40 @@ export type ExpiredContentCleanupResult =
   | {
       commitId?: string;
       kind: "committed" | "nothing-to-clean";
+      // 只在指定了要去掉哪些项时给出：每一项的结果
+      outcomes?: Record<string, CleanupItemOutcome>;
       removedHistory: number;
       removedRecoveries: number;
       serverDate: string;
     };
+
+// removed：这次提交去掉了；gone：记录里已经没有这一项；skipped：对应 Entry 成了冲突，或这一项不再算过期，没动它
+export type CleanupItemOutcome = "gone" | "removed" | "skipped";
+
+// 「待清理」里的一项：过期的恢复副本、过期的旧版本，或没有任何记录引用的旧数据块
+export type CleanupCandidate =
+  | {
+      blobId: string;
+      deletedAt?: string;
+      entryId: string;
+      expiresAt: string;
+      key: string;
+      kind: "history" | "recovery";
+      path: string;
+      revisionId: string;
+      // 去掉这一项后数据块仍被记录里别的东西引用：path 是用着它的现有文件；不是现有文件时为空对象
+      sharedWith?: { path?: string };
+      size: number;
+    }
+  | { blobId: string; key: string; kind: "orphan"; size: number; uploadedAt: string };
+
+export interface CleanupCandidates {
+  items: CleanupCandidate[];
+  // 这次读到的 Head serverDate（AWS 时间）
+  serverDate: string;
+}
+
+export const orphanBlobKey = (blobId: string): string => `orphan:${blobId}`;
 
 // 下载阶段最多每隔这么久把已落地的文件写进 Sync Cache 一次；打断前和开始上传前另外各写一次
 const DOWNLOAD_PROGRESS_SAVE_INTERVAL_MS = 2_000;
@@ -110,6 +141,28 @@ const acceptedContentPurgedFromRecord = (
 ): boolean =>
   acceptedContentHash === localContentHash &&
   !retainedRevisions(entry).some((revision) => revision.contentHash === localContentHash);
+
+// 用户确认过的每一项在刚读到的记录里怎么样了。key 形如 <类型>:<Entry ID>:<Revision ID>
+const cleanupOutcomes = (
+  snapshot: VaultSnapshot,
+  selected: ReadonlySet<string>,
+  removedKeys: readonly string[],
+): Record<string, CleanupItemOutcome> => {
+  const removed = new Set(removedKeys);
+  const outcomes: Record<string, CleanupItemOutcome> = {};
+  for (const key of selected) {
+    if (removed.has(key)) { outcomes[key] = "removed"; continue; }
+    const [kind = "", ...rest] = key.split(":");
+    const revisionId = rest.pop() ?? "";
+    const entry = snapshot.entries[rest.join(":")];
+    const present = entry !== undefined && (kind === "recovery"
+      ? entry.kind !== "live" && entry.recovery?.revisionId === revisionId
+      : (entry.history ?? []).some((revision) => revision.revisionId === revisionId));
+    // 冲突一律不动；还在记录里却没被去掉的（不再算过期）也不动
+    outcomes[key] = entry?.kind === "conflicted" || present ? "skipped" : "gone";
+  }
+  return outcomes;
+};
 
 export interface LocalFileInfo {
   modifiedAt: number;
@@ -1122,14 +1175,79 @@ export class SyncService {
   }
 
   /**
+   * 「待清理」的列表，只读：只用同一次 readHead 读到的 Head、它的快照和数据块列表计算，不读本机缓存、不写 S3。
+   * 过期内容的判定和清理提交相同（AWS 时间；冲突不出现；缺到期时间的不出现）；
+   * 没有对应文件的数据块按数据块删除的前三条判定（不被引用、上传满 30 天、早于 Head 对象）。
+   */
+  async listCleanupCandidates(vaultId: string): Promise<CleanupCandidates> {
+    const remote = this.options.remote;
+    const versionedHead = await remote.readHead();
+    if (!versionedHead || versionedHead.value.vaultId !== vaultId) {
+      throw new Error("远端 Head 指针缺失，或属于另一个仓库");
+    }
+    const snapshot = await remote.readSnapshot(versionedHead.value);
+    const plan = planExpiredContentCleanup(snapshot, versionedHead.serverDate);
+    // 每个数据块被哪些项引用（范围和读 Head 时的存在性检查一样）；key 认出过期项本身，livePath 认出现有文件的当前版本
+    const referrers = new Map<string, Array<{ key?: string; livePath?: string }>>();
+    const addReferrer = (blobId: string, referrer: { key?: string; livePath?: string }): void => {
+      referrers.set(blobId, [...(referrers.get(blobId) ?? []), referrer]);
+    };
+    for (const entry of Object.values(snapshot.entries)) {
+      if (entry.kind === "live") addReferrer(entry.revision.blobId, { livePath: entry.path });
+      if (entry.kind === "conflicted") for (const candidate of entry.candidates) addReferrer(candidate.blobId, {});
+      if (entry.kind !== "live" && entry.recovery) {
+        addReferrer(entry.recovery.blobId,
+          entry.kind === "deleted" ? { key: expiredContentKey("recovery", entry.entryId, entry.recovery.revisionId) } : {});
+      }
+      for (const revision of entry.history ?? []) {
+        addReferrer(revision.blobId,
+          entry.kind === "conflicted" ? {} : { key: expiredContentKey("history", entry.entryId, revision.revisionId) });
+      }
+    }
+    const expired = plan.removals.map((removal): Extract<CleanupCandidate, { kind: "history" | "recovery" }> => {
+      const others = (referrers.get(removal.revision.blobId) ?? []).filter((referrer) => referrer.key !== removal.key);
+      const livePath = others.flatMap((referrer) => referrer.livePath === undefined ? [] : [referrer.livePath]).sort()[0];
+      return {
+        blobId: removal.revision.blobId,
+        ...(removal.deletedAt === undefined ? {} : { deletedAt: removal.deletedAt }),
+        entryId: removal.entryId,
+        expiresAt: removal.revision.expiresAt ?? "",
+        key: removal.key,
+        kind: removal.kind,
+        path: removal.path,
+        revisionId: removal.revision.revisionId,
+        ...(others.length === 0 ? {} : { sharedWith: livePath === undefined ? {} : { path: livePath } }),
+        size: removal.revision.size,
+      };
+    });
+    // 备份按删除时间、旧版本按到期时间，从早到晚
+    expired.sort((left, right) =>
+      Date.parse(left.deletedAt ?? left.expiresAt) - Date.parse(right.deletedAt ?? right.expiresAt) ||
+      (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
+    // 没有任何第一次判定记录时，满足前三条的数据块都落在 waiting 里
+    const unreferenced = planUnreferencedBlobDeletion({
+      headLastModified: versionedHead.lastModified,
+      objects: await remote.listBlobObjects(),
+      referenced: new Set(referrers.keys()),
+      serverDate: versionedHead.serverDate,
+    });
+    const orphans: CleanupCandidate[] = [...unreferenced.deletable, ...unreferenced.waiting].map((object) => ({
+      blobId: object.blobId, key: orphanBlobKey(object.blobId), kind: "orphan", size: object.size, uploadedAt: object.lastModified,
+    }));
+    return { items: [...expired, ...orphans], serverDate: versionedHead.serverDate };
+  }
+
+  /**
    * 删除本仓库文件夹里没人用的数据块（见 unreferenced-blob-cleanup.ts 的四条判据）。
    * 引用集只用同一次 readHead 读到的 Head 和它的快照计算，绝不读本机缓存；删除前重读 Head、重算引用，
    * 这期间被新提交引用的候选不删。每次最多 200 个。任何一步出错都直接抛出：宁可少删。
    * marks 是上一次检查留下的第一次判定记录（调用方保存在本地，绑定目标和 vaultId）。
+   * 给了 onlyBlobIds 时只考虑其中的数据块，列表里别的对象一概不看、不记。
    */
   async deleteUnreferencedBlobs(
     vaultId: string,
     marks?: Readonly<UnreferencedBlobMarks>,
+    onlyBlobIds?: ReadonlySet<string>,
   ): Promise<UnreferencedBlobCleanupResult> {
     const remote = this.options.remote;
     const versionedHead = await remote.readHead();
@@ -1137,10 +1255,12 @@ export class SyncService {
       return { kind: "no-head" };
     }
     const snapshot = await remote.readSnapshot(versionedHead.value);
+    // 列表照旧整批核对 key 格式，有一个对不上就整批作废；之后才按 onlyBlobIds 筛
+    const listed = await remote.listBlobObjects();
     const plan = planUnreferencedBlobDeletion({
       headLastModified: versionedHead.lastModified,
       marks,
-      objects: await remote.listBlobObjects(),
+      objects: onlyBlobIds ? listed.filter((object) => onlyBlobIds.has(object.blobId)) : listed,
       referenced: new Set(snapshotBlobReferences(snapshot).keys()),
       serverDate: versionedHead.serverDate,
     });
@@ -1169,14 +1289,16 @@ export class SyncService {
 
   // 清理提交：只用同一次 readHead 读到的 Head 和它的快照计算，CAS 也对这个 Head，绝不拿本机缓存构造
   // （否则会把别的设备的新改动覆盖回旧版本）。被别的设备抢先时抛 HeadChangedError，由调用方重读重算。
-  async cleanupExpiredContent(vaultId: string): Promise<ExpiredContentCleanupResult> {
+  // 给了 selected 时只去掉其中这些确切的项目（expiredContentKey），并报告每一项的结果
+  async cleanupExpiredContent(vaultId: string, selected?: ReadonlySet<string>): Promise<ExpiredContentCleanupResult> {
     const versionedHead = await this.options.remote.readHead();
     if (!versionedHead || versionedHead.value.vaultId !== vaultId) {
       return { kind: "no-head" };
     }
     const snapshot = await this.options.remote.readSnapshot(versionedHead.value);
-    const plan = planExpiredContentCleanup(snapshot, versionedHead.serverDate);
+    const plan = planExpiredContentCleanup(snapshot, versionedHead.serverDate, selected);
     const counts = {
+      ...(selected ? { outcomes: cleanupOutcomes(snapshot, selected, plan.removals.map((removal) => removal.key)) } : {}),
       removedHistory: plan.removedHistory,
       removedRecoveries: plan.removedRecoveries.length,
       serverDate: versionedHead.serverDate,
