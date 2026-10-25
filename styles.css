@@ -305,3 +305,214 @@
 .s3-vault-sync-cleanup-bar > .s3-vault-sync-muted {
   flex: 1;
 }
+
+/* 同步状态窗口里默认折叠的区块（已删除的文件、同步记录）：标题和「同步诊断」的 h3 同样大小、粗细和颜色 */
+.s3-vault-sync-section {
+  margin-top: var(--size-4-4);
+  padding-top: var(--size-4-2);
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.s3-vault-sync-section-title {
+  display: flex;
+  align-items: baseline;
+  gap: var(--size-4-2);
+  list-style: none;
+  cursor: pointer;
+  font-size: var(--h3-size);
+  font-weight: var(--h3-weight);
+  color: var(--h3-color);
+}
+
+.s3-vault-sync-section-title::-webkit-details-marker {
+  display: none;
+}
+
+.s3-vault-sync-section-arrow {
+  display: inline-block;
+  width: 1em;
+  font-size: 0.7em;
+  transition: transform 0.15s;
+}
+
+.s3-vault-sync-section[open] > .s3-vault-sync-section-title .s3-vault-sync-section-arrow {
+  transform: rotate(90deg);
+}
+
+.s3-vault-sync-section-count {
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-normal);
+  color: var(--text-muted);
+}
+
+/* 同步记录（最近 30 天）：按天分组，每行点开看详情；颜色都取主题变量 */
+.s3-vault-sync-records-day {
+  margin: var(--size-4-2) 0 var(--size-4-1);
+}
+
+.s3-vault-sync-records-day-title {
+  padding: var(--size-4-1) 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-semibold);
+}
+
+.s3-vault-sync-record,
+.s3-vault-sync-records-quiet {
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.s3-vault-sync-record-line {
+  display: grid;
+  grid-template-columns: 4.5em 7.5em minmax(0, 1fr) auto 1em;
+  gap: var(--size-4-2);
+  align-items: center;
+  padding: var(--size-4-1);
+  border-radius: var(--radius-s);
+  cursor: pointer;
+  font-size: var(--font-ui-small);
+}
+
+.s3-vault-sync-records-quiet-line {
+  display: flex;
+  gap: var(--size-4-2);
+  padding: var(--size-4-1) var(--size-4-1) var(--size-4-1) 5em;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
+.s3-vault-sync-record-line:hover,
+.s3-vault-sync-records-quiet-line:hover {
+  background: var(--background-modifier-hover);
+}
+
+.s3-vault-sync-record-line:focus-visible,
+.s3-vault-sync-records-quiet-line:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: -2px;
+}
+
+.s3-vault-sync-record-time {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.s3-vault-sync-record-trigger,
+.s3-vault-sync-record-summary {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.s3-vault-sync-record-state {
+  padding: 0 var(--size-4-2);
+  border: 1px solid currentColor;
+  border-radius: var(--radius-l);
+  font-size: var(--font-ui-smaller);
+  white-space: nowrap;
+}
+
+.s3-vault-sync-record-state.mod-complete { color: var(--color-green); }
+.s3-vault-sync-record-state.mod-retrying { color: var(--color-yellow); }
+.s3-vault-sync-record-state.mod-error { color: var(--color-red); }
+.s3-vault-sync-record-state.mod-action-required { color: var(--color-orange); }
+.s3-vault-sync-record-state.mod-interrupted { color: var(--text-muted); }
+.s3-vault-sync-record-state.mod-manual { color: var(--color-purple); }
+
+.s3-vault-sync-record-arrow {
+  color: var(--text-muted);
+  transition: transform 0.15s;
+}
+
+.is-open > .s3-vault-sync-record-line .s3-vault-sync-record-arrow,
+.is-open > .s3-vault-sync-records-quiet-line .s3-vault-sync-record-arrow {
+  transform: rotate(90deg);
+}
+
+.s3-vault-sync-record-body {
+  padding: 0 var(--size-4-2) 0 5em;
+  font-size: var(--font-ui-small);
+}
+
+.s3-vault-sync-record.is-open > .s3-vault-sync-record-body {
+  padding-bottom: var(--size-4-3);
+}
+
+.s3-vault-sync-records-quiet-body {
+  padding: 0 var(--size-4-1) 0 5em;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
+.s3-vault-sync-records-quiet.is-open > .s3-vault-sync-records-quiet-body {
+  padding-bottom: var(--size-4-2);
+}
+
+.s3-vault-sync-records-older {
+  padding: var(--size-4-1) var(--size-4-1) var(--size-4-1) 5em;
+  font-size: var(--font-ui-small);
+}
+
+.s3-vault-sync-record-explain {
+  margin: var(--size-4-1) 0;
+}
+
+.s3-vault-sync-record-group {
+  margin: var(--size-4-1) 0 var(--size-4-2);
+}
+
+.s3-vault-sync-record-group-title {
+  margin-bottom: var(--size-4-1);
+  font-weight: var(--font-semibold);
+}
+
+/* 文件多时列表限高，可以滚动 */
+.s3-vault-sync-record-files {
+  max-height: 16rem;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+}
+
+.s3-vault-sync-record-files li {
+  display: flex;
+  gap: var(--size-4-2);
+  align-items: baseline;
+  padding: 2px 0;
+}
+
+.s3-vault-sync-record-file-kind {
+  flex-shrink: 0;
+  width: 2.5em;
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+}
+
+.s3-vault-sync-record-file-kind.mod-added { color: var(--color-green); }
+.s3-vault-sync-record-file-kind.mod-modified,
+.s3-vault-sync-record-file-kind.mod-updated { color: var(--color-yellow); }
+.s3-vault-sync-record-file-kind.mod-deleted { color: var(--color-red); }
+.s3-vault-sync-record-file-kind.mod-moved { color: var(--color-purple); }
+.s3-vault-sync-record-file-kind.mod-restored { color: var(--color-cyan); }
+
+.s3-vault-sync-record-path {
+  overflow-wrap: anywhere;
+}
+
+.s3-vault-sync-record-tech {
+  margin-top: var(--size-4-1);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.6;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .s3-vault-sync-section-arrow,
+  .s3-vault-sync-record-arrow {
+    transition: none;
+  }
+}

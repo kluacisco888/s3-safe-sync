@@ -12,6 +12,7 @@ const UI_FILES = [
   "src/plugin/content-diff.ts",
   "src/plugin/modal-actions.ts",
   "src/plugin/sync-progress.ts",
+  "src/plugin/sync-records-view.ts",
 ];
 
 // 界面调用的起点：其后的参数（或属性值）会显示给用户

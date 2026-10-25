@@ -28,11 +28,16 @@ import { LocalContentReviewModal } from "./content-review-modal";
 import { PathCollisionModal } from "./path-collision-modal";
 import type { PathCollisionReview, PathCollisionResolution } from "../sync/path-collision-review";
 import type { SyncDiagnosticsView } from "./sync-diagnostics";
+import { errorCategoryLabels, phaseLabels } from "./sync-labels";
+import type { SyncActivitySnapshot } from "./sync-activity";
+import { renderSyncRecords } from "./sync-records-view";
 
 export interface StatusModalController {
   // 电脑上返回「待清理」的控制器；手机上返回 undefined，按钮栏里没有这个按钮
   cleanupController?(): CleanupController | undefined;
   getDiagnostics?(limit?: number): SyncDiagnosticsView;
+  // 本机同步记录；手机、平板上返回 undefined，窗口里没有「同步记录」这一节
+  getSyncActivity?(): SyncActivitySnapshot | undefined;
   exportDiagnostics?(): string;
   reviewPathCollision(paths: string[]): Promise<PathCollisionReview>;
   resolvePathCollision(request: PathCollisionResolution): Promise<string>;
@@ -336,6 +341,10 @@ class DeletedFilePreviewModal extends Modal {
 export class StatusModal extends Modal {
   private stopStatusUpdates: (() => void) | undefined;
   private pauseButton: HTMLButtonElement | undefined;
+  // 用户展开的区块；状态刷新重画后照样展开
+  private readonly openSections = new Set<string>();
+  // 同步记录里用户展开的行，同样在重画后保持
+  private readonly openRecordRows = new Set<string>();
   constructor(
     app: App,
     private readonly controller: StatusModalController,
@@ -353,18 +362,18 @@ export class StatusModal extends Modal {
     const controls = this.contentEl.createDiv();
     const diagnostics = this.contentEl.createDiv({cls: "s3-vault-sync-diagnostics"});
     const details = this.contentEl.createDiv();
-    const history = this.contentEl.createDiv({cls: "s3-vault-sync-diagnostics"});
+    const records = this.contentEl.createDiv({cls: "s3-vault-sync-diagnostics"});
     const render = (): void => {
       controls.empty();
       details.empty();
       this.renderActions(controls);
       this.renderDiagnostics(diagnostics);
-      this.renderDiagnosticHistory(history);
       this.renderBulkDeletion(details);
       this.renderConflicts(details);
       this.renderLocalIssues(details);
       this.renderDeferredDownloads(details);
       this.renderDeletedRecoveries(details);
+      this.renderSyncRecords(records);
     };
     render();
     this.stopStatusUpdates = this.controller.onStatusChange(display => {
@@ -439,7 +448,7 @@ export class StatusModal extends Modal {
     const result = [...view.records].reverse().find(record => record.counts)?.counts;
     const observed = [...view.records].reverse().find(record => record.observedRemote);
     const publication = [...view.records].reverse().find(record => record.publishedCommit);
-    const date = (time?: number): string => time === undefined ? "未记录" : new Date(time).toLocaleString();
+    const date = (time?: number): string => time === undefined ? "未记录" : formatLocalTime(time, true);
     container.createEl("h3", {text: "同步诊断"});
     container.createEl("p", {text: `上次记录的成功同步：${date(view.lastSuccessAt)}`});
     container.createEl("p", {text: `本地已接受的提交：${view.acceptedCommit ?? "尚未接受"}`});
@@ -448,23 +457,21 @@ export class StatusModal extends Modal {
     container.createEl("p", {text: `排队中的检查：${view.queued ? "有" : "无"} · 待检查的本地路径：${view.pendingLocalChanges}`});
     container.createEl("p", {text: `最近的同步计划 — 待上传：${last?.pendingUploads ?? "尚未计划"} · 待下载：${last?.pendingDownloads ?? "尚未计划"}`});
     if (result) container.createEl("p", {text: `最近的结果 — 已发布更改：${result.uploaded} · 已下载：${result.downloaded} · 暂缓下载：${result.deferred} · 未同步的本地文件：${result.unsynced}`});
-    if (last) container.createEl("p", {text: `阶段：${last.phase} · HTTP 请求：${last.requests} · 发送/接收字节：${last.sentBytes}/${last.receivedBytes}`});
+    if (last) container.createEl("p", {text: `阶段：${phaseLabels[last.phase]} · HTTP 请求：${last.requests} · 发送/接收字节：${last.sentBytes}/${last.receivedBytes}`});
     container.createEl("p", {text: `下次计划重试：${view.nextRetryAt === undefined ? "无" : date(view.nextRetryAt)}`});
-    if (last?.errorCategory) container.createEl("p", {text: `上次运行的错误：${last.errorCategory}${last.httpStatus ? `（HTTP ${last.httpStatus}）` : ""}${last.writeResultUncertain ? "。远端写入可能已经完成，重试时会重新检查 Head 指针。" : ""}`});
+    if (last?.errorCategory) container.createEl("p", {text: `上次运行的错误：${errorCategoryLabels[last.errorCategory]}${last.httpStatus ? `（HTTP ${last.httpStatus}）` : ""}${last.writeResultUncertain ? "。远端写入可能已经完成，重试时会重新检查 Head 指针。" : ""}`});
     if (view.persistenceWarning) container.createEl("p", {text: view.persistenceWarning, cls: "s3-vault-sync-error"});
     container.createEl("small", {text: "这些记录只描述本设备。发布到 S3 并不代表其他设备已收到文件。即使提交 ID 一致，也可能还有暂缓下载的文件。"});
   }
 
-  private renderDiagnosticHistory(container: HTMLElement): void {
+  // 「同步记录（最近 30 天）」放在「已删除的文件」下面；只在电脑上有
+  private renderSyncRecords(container: HTMLElement): void {
     container.empty();
-    const view = this.controller.getDiagnostics?.(20);
-    if (!view?.records.length) return;
-    const details = container.createEl("details");
-    details.createEl("summary", {text: "最近的同步记录（最多 20 条）"});
-    for (const record of [...view.records].reverse()) {
-      const elapsed = record.finishedAt === undefined ? "未完成" : `${Math.max(0, record.finishedAt - record.startedAt)} 毫秒`;
-      details.createEl("p", {text: `${new Date(record.startedAt).toLocaleString()} · ${record.triggers.join(", ")} · ${record.outcome} · ${record.phase} · ${elapsed} · ${record.requests} 次请求${record.errorCategory ? ` · ${record.errorCategory}` : ""}`});
-    }
+    const activity = this.controller.getSyncActivity?.();
+    if (!activity) return;
+    const section = this.collapsibleSection(container, "records", "同步记录（最近 30 天）",
+      `本设备 · ${activity.records.length} 次有改动或需要注意`);
+    renderSyncRecords(section, activity, this.controller.getDiagnostics?.(1_000).records ?? [], this.openRecordRows);
   }
 
   private renderBulkDeletion(container: HTMLElement): void {
@@ -550,11 +557,11 @@ export class StatusModal extends Modal {
     if (deleted.length === 0) {
       return;
     }
-    container.createEl("h3", { text: "已删除的文件（30 天内可恢复）" });
+    const section = this.collapsibleSection(container, "deleted", "已删除的文件（30 天内可恢复）", `${deleted.length} 个`);
     for (const entry of deleted) {
       // 恢复副本已过期时按不可用处理，只提供历史版本
       const recovery = entry.recovery && isUnexpired(entry.recovery, now) ? entry.recovery : undefined;
-      const item = container.createDiv({ cls: "s3-vault-sync-deleted-row" });
+      const item = section.createDiv({ cls: "s3-vault-sync-deleted-row" });
       const previewTarget = item.createDiv({
         cls: "s3-vault-sync-deleted-preview",
       });
@@ -624,6 +631,21 @@ export class StatusModal extends Modal {
           });
       }
     }
+  }
+
+  // 默认折叠的区块：标题和「同步诊断」一样大小，左边有展开箭头，后面浅色小字写数量
+  private collapsibleSection(container: HTMLElement, key: string, title: string, count: string): HTMLDetailsElement {
+    const section = container.createEl("details", {cls: "s3-vault-sync-section"});
+    section.open = this.openSections.has(key);
+    section.addEventListener("toggle", () => {
+      if (section.open) this.openSections.add(key);
+      else this.openSections.delete(key);
+    });
+    const summary = section.createEl("summary", {cls: "s3-vault-sync-section-title"});
+    summary.createSpan({cls: "s3-vault-sync-section-arrow", text: "▶"});
+    summary.createSpan({text: title});
+    summary.createSpan({cls: "s3-vault-sync-section-count", text: count});
+    return section;
   }
 
   private renderIssueTools(item: HTMLElement, issue: LocalSyncIssue): void {

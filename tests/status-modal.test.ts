@@ -17,7 +17,9 @@ const { Element, opened, dropdowns } = vi.hoisted(() => {
     constructor(readonly tag: string) {}
     empty() { this.children = []; }
     addClass(value: string) { this.classes.add(value); }
-    setAttr() {}
+    toggleClass(value: string, on: boolean) { if (on) this.classes.add(value); else this.classes.delete(value); }
+    attrs = new Map<string, string>();
+    setAttr(name: string, value: string | number | boolean) { this.attrs.set(name, String(value)); }
     addEventListener(name: string, handler: () => void) { this.events.set(name, handler); }
     setText(text: string) { this.text = text; }
     createEl(tag: string, options: { text?: string; cls?: string; type?: string } = {}) {
@@ -64,6 +66,8 @@ vi.mock("obsidian", () => ({
 import { StatusModal, VersionHistoryModal, type StatusModalController } from "../src/plugin/modals";
 import type { CleanupController, CleanupView } from "../src/plugin/cleanup-modal";
 import type { CleanupCandidate, LocalSyncIssue } from "../src/sync/sync-service";
+import type { SyncActivityRecord } from "../src/plugin/sync-activity";
+import type { SyncRunRecord } from "../src/plugin/sync-diagnostics";
 
 const reviewActions = {
   reviewPathCollision: async (paths: string[]) => ({paths, reviewToken: "collision-review", localFiles: [], remoteFiles: [], relatedPaths: [], pendingMoves: []}),
@@ -123,8 +127,29 @@ describe("StatusModal", () => {
     expect(texts).toContain("本设备上次确认发布的提交：published-version");
     expect(texts.some(text => text.includes("上次检查的 S3 Head 指针：remote-version"))).toBe(true);
     expect(texts.some(text => text.includes("待上传：1") && text.includes("待下载：4"))).toBe(true);
-    expect(texts.some(text => text.includes("service") && text.includes("503"))).toBe(true);
+    expect(texts.some(text => text.includes("S3 服务出错") && text.includes("503"))).toBe(true);
     expect(texts).toContain("复制诊断数据");
+  });
+
+  it("shows the diagnostics phase and error in Chinese and every time in the device's 24-hour format", () => {
+    const controller = {...issueController([]), getDiagnostics: () => ({
+      lastSuccessAt: 1_700_000_000_000, nextRetryAt: 1_700_000_003_000, queued: false, pendingLocalChanges: 0,
+      records: [{id: "run", vaultId: "vault", startedAt: 1_700_000_001_000, finishedAt: 1_700_000_002_000,
+        outcome: "error" as const, triggers: ["periodic" as const], phase: "saving" as const, phaseDurations: {},
+        observedRemote: "remote-version", remoteCheckedAt: 1_700_000_001_000, requests: 3, sentBytes: 0, receivedBytes: 42,
+        errorCategory: "service" as const, httpStatus: 503}],
+    })};
+    const modal = new StatusModal({} as App, controller);
+    modal.onOpen();
+    type FakeElement = InstanceType<typeof Element>;
+    const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
+    const texts = all(modal.contentEl as unknown as FakeElement).map(node => node.text);
+    // 1_700_000_000_000 是上海时间 2023-11-15 06:13:20
+    expect(texts).toContain("上次记录的成功同步：2023-11-15 06:13:20");
+    expect(texts).toContain("上次检查的 S3 Head 指针：remote-version · 2023-11-15 06:13:21");
+    expect(texts).toContain("下次计划重试：2023-11-15 06:13:23");
+    expect(texts).toContain("阶段：保存记录 · HTTP 请求：3 · 发送/接收字节：0/42");
+    expect(texts).toContain("上次运行的错误：S3 服务出错（HTTP 503）");
   });
 
   it("offers a real review action for a collision that lists only one path", () => {
@@ -640,6 +665,37 @@ describe("StatusModal", () => {
       expect(texts).toContain("candidate.md");
     });
 
+    it("folds the list by default under a title that says how many files there are", () => {
+      const nodes = openWith([expired, fresh, candidateOnly]);
+      const section = nodes.find(node => node.tag === "details" &&
+        all(node).some(child => child.text === "已删除的文件（30 天内可恢复）"))!;
+      expect(section.open).toBe(false);
+      const title = section.children.find(child => child.tag === "summary")!;
+      expect(all(title).map(child => child.text)).toEqual(expect.arrayContaining(["已删除的文件（30 天内可恢复）", "2 个"]));
+      expect(title.classes.has("s3-vault-sync-section-title")).toBe(true);
+      expect(all(section).some(child => child.text === "fresh.md")).toBe(true);
+    });
+
+    it("keeps the list open after the status refresh redraws the window", () => {
+      const listeners = new Set<(status: {text: string}) => void>();
+      const controller = {...issueController([]), getDeletedRecoveries: () => [fresh],
+        onStatusChange: (listener: (status: {text: string}) => void) => {listeners.add(listener); return () => listeners.delete(listener);}};
+      const modal = new StatusModal({} as App, controller);
+      modal.onOpen();
+      const section = () => all(modal.contentEl as unknown as FakeElement).find(node => node.tag === "details" &&
+        all(node).some(child => child.text === "已删除的文件（30 天内可恢复）"))!;
+      const first = section();
+      first.open = true;
+      first.events.get("toggle")!();
+      for (const listener of listeners) listener({text: "空闲：同步完成"});
+      expect(section()).not.toBe(first);
+      expect(section().open).toBe(true);
+      section().open = false;
+      section().events.get("toggle")!();
+      modal.onOpen();
+      expect(section().open).toBe(false);
+    });
+
     it("shows each deletion time in the device time zone with the days left", () => {
       const texts = openWith([fresh, candidateOnly]).map(node => node.text).filter(text => text.startsWith("删除于"));
       // fresh 还剩 17 天 23 小时 11 分，向下取整；candidate 只剩 10 小时
@@ -666,6 +722,338 @@ describe("StatusModal", () => {
       (target.events.get("keydown") as unknown as (event: {key: string; preventDefault(): void}) => void)(
         {key: "Enter", preventDefault() {}});
       expect(all(opened.at(-1)!.contentEl).some(node => node.text === "5 字节 · 可恢复至 2026-11-05 09:11")).toBe(true);
+    });
+  });
+
+  describe("sync records", () => {
+    type FakeElement = InstanceType<typeof Element>;
+    const all = (root: FakeElement): FakeElement[] => [root, ...root.children.flatMap(all)];
+    // 设备时间 2026-10-25 周日 16:20（上海时区）
+    const now = "2026-10-25T08:20:00Z";
+    const at = (local: string): number => Date.parse(`${local}+08:00`);
+    const sync = (id: string, startedAt: number, extra: Partial<SyncActivityRecord> = {}): SyncActivityRecord => ({
+      id, vaultId: "vault", kind: "sync", startedAt, finishedAt: startedAt + 1_737, triggers: ["edit"], outcome: "complete",
+      uploads: [], downloads: [], phase: "saving", phaseDurations: {}, requests: 98, sentBytes: 14_540, receivedBytes: 53_043, ...extra,
+    });
+    const manual = (id: string, startedAt: number, summary: string, files: SyncActivityRecord["uploads"]): SyncActivityRecord => ({
+      id, vaultId: "vault", kind: "manual", startedAt, finishedAt: startedAt + 20, triggers: [], outcome: "complete",
+      uploads: [], downloads: [], files, summary,
+    });
+    const run = (id: string, startedAt: number, extra: Partial<SyncRunRecord> = {}): SyncRunRecord => ({
+      id, vaultId: "vault", startedAt, finishedAt: startedAt + 500, outcome: "complete", triggers: ["periodic"], phase: "saving",
+      phaseDurations: {}, requests: 90, sentBytes: 0, receivedBytes: 0,
+      counts: {uploaded: 0, downloaded: 0, deleted: 0, deferred: 0, unsynced: 0}, ...extra,
+    });
+    const controllerWith = (records: SyncActivityRecord[], runs: SyncRunRecord[] = [], persistenceWarning?: string): StatusModalController => ({
+      ...issueController([]),
+      getSyncActivity: () => ({records, ...(persistenceWarning ? {persistenceWarning} : {})}),
+      getDiagnostics: () => ({records: runs, queued: false, pendingLocalChanges: 0}),
+    });
+    const open = (controller: StatusModalController): StatusModal => {
+      const modal = new StatusModal({} as App, controller);
+      modal.onOpen();
+      return modal;
+    };
+    const nodesOf = (modal: StatusModal): FakeElement[] => all(modal.contentEl as unknown as FakeElement);
+    const sectionOf = (modal: StatusModal): FakeElement | undefined => nodesOf(modal).find(node => node.tag === "details" &&
+      node.children.some(child => child.tag === "summary" && all(child).some(part => part.text === "同步记录（最近 30 天）")));
+    const rowsOf = (modal: StatusModal): FakeElement[] => all(sectionOf(modal)!).filter(node => node.classes.has("s3-vault-sync-record"));
+    const lineOf = (row: FakeElement): FakeElement => row.children.find(child => child.classes.has("s3-vault-sync-record-line"))!;
+    const lineTexts = (row: FakeElement): string[] => lineOf(row).children.map(child => child.text);
+    const textsIn = (node: FakeElement): string[] => all(node).map(child => child.text).filter(text => text !== "");
+    const click = (node: FakeElement): void => node.events.get("click")!();
+    const press = (node: FakeElement, key: string): void =>
+      (node.events.get("keydown") as unknown as (event: {key: string; preventDefault(): void}) => void)({key, preventDefault() {}});
+    beforeEach(() => {vi.useFakeTimers({toFake: ["Date"]}); vi.setSystemTime(new Date(now));});
+    afterEach(() => {vi.useRealTimers();});
+
+    it("folds the records by default under a title that counts them, and replaces the old 20-line history", () => {
+      const modal = open(controllerWith([
+        sync("one", at("2026-10-25T16:55:36"), {uploads: [{kind: "modified", path: "1-Projects/日志.md"}]}),
+        sync("two", at("2026-10-24T22:41:17"), {downloads: [{kind: "added", path: "录音/周会.md"}]}),
+      ], [run("quiet", at("2026-10-25T16:00:00"))]));
+      const section = sectionOf(modal)!;
+      expect(section.open).toBe(false);
+      const title = section.children.find(child => child.tag === "summary")!;
+      expect(title.classes.has("s3-vault-sync-section-title")).toBe(true);
+      expect(textsIn(title)).toEqual(expect.arrayContaining(["同步记录（最近 30 天）", "本设备 · 2 次有改动或需要注意"]));
+      expect(textsIn(section)).toContain("只列出动过文件、出错、需要重试的同步，以及你的手动操作。点一行查看这次同步的详情，再点一次收起。没有改动任何文件的检查，每天合成一行，只保留 7 天。");
+      expect(nodesOf(modal).some(node => node.text.startsWith("最近的同步记录"))).toBe(false);
+    });
+
+    it("groups the records by local day, newest first, and labels today and yesterday", () => {
+      const modal = open(controllerWith([
+        sync("old", at("2026-10-21T15:03:47"), {uploads: [{kind: "added", path: "图纸/新.pdf"}]}),
+        sync("late", at("2026-10-24T23:59:58"), {uploads: [{kind: "added", path: "a.md"}]}),
+        sync("early", at("2026-10-25T00:00:03"), {uploads: [{kind: "added", path: "b.md"}]}),
+        sync("noon", at("2026-10-25T12:00:00"), {uploads: [{kind: "added", path: "c.md"}]}),
+      ]));
+      const days = all(sectionOf(modal)!).filter(node => node.classes.has("s3-vault-sync-records-day"));
+      expect(days.map(day => day.children[0]!.text)).toEqual(["今天 · 10月25日 周日", "昨天 · 10月24日 周六", "10月21日 周三"]);
+      // 两次同步隔着本机的午夜，分在两天（按 UTC 它们都在 10 月 24 日）
+      expect(days.map(day => all(day).filter(node => node.classes.has("s3-vault-sync-record")).map(row => lineTexts(row)[0])))
+        .toEqual([["12:00:00", "00:00:03"], ["23:59:58"], ["15:03:47"]]);
+    });
+
+    it("writes the time, trigger, what changed and the result on each row", () => {
+      const modal = open(controllerWith([
+        sync("one", at("2026-10-25T16:55:36"), {uploads: [{kind: "modified", path: "1-Projects/日志.md"}]}),
+        sync("two", at("2026-10-25T16:54:10"), {uploads: [{kind: "modified", path: "1-Projects/日志.md"}, {kind: "added", path: "附件/图.png"}],
+          downloads: [{kind: "updated", path: "待办.md"}]}),
+        sync("three", at("2026-10-25T07:42:05"), {triggers: ["startup"], downloads: [{kind: "moved", fromPath: "旧/甲.md", path: "新/甲.md"}]}),
+      ]));
+      expect(rowsOf(modal).map(lineTexts)).toEqual([
+        ["16:55:36", "编辑后同步", "上传 1 个：修改 日志.md", "完成", "›"],
+        ["16:54:10", "编辑后同步", "上传 2 个 · 下载 1 个：日志.md 等", "完成", "›"],
+        ["07:42:05", "启动时同步", "下载 1 个：挪动 甲.md", "完成", "›"],
+      ]);
+    });
+
+    const bodyOf = (row: FakeElement): FakeElement => row.children.find(child => child.classes.has("s3-vault-sync-record-body"))!;
+    const groupsOf = (row: FakeElement): Array<{title: string; files: string[][]; note?: string}> =>
+      all(bodyOf(row)).filter(node => node.classes.has("s3-vault-sync-record-group")).map(group => ({
+        title: group.children[0]!.text,
+        files: all(group).filter(node => node.tag === "li").map(item => item.children.map(part => part.text)),
+        ...(group.children.find(child => child.tag === "p") ? {note: group.children.find(child => child.tag === "p")!.text} : {}),
+      }));
+
+    it("opens a row on click to list every uploaded and downloaded file with its kind, and closes it on the next click", () => {
+      const modal = open(controllerWith([sync("mixed", at("2026-10-25T16:55:36"), {
+        uploads: [{kind: "modified", path: "1-Projects/日志.md"}, {kind: "added", path: "附件/图.png"},
+          {kind: "moved", fromPath: "图纸/旧.pdf", path: "图纸/过程文档/旧.pdf"}, {kind: "deleted", path: "WX/旧.md"}],
+        downloads: [{kind: "updated", path: "2-Areas/待办.md"}, {kind: "added", path: "录音/周会.md"},
+          {kind: "deleted", path: "录音/草稿.md"}, {kind: "moved", fromPath: "甲/乙.md", path: "丙/乙.md"}],
+        phaseDurations: {remote: 310, scanning: 180, uploading: 640, publishing: 290, saving: 190},
+      })]));
+      const [row] = rowsOf(modal);
+      expect(groupsOf(row!)).toEqual([]);
+      expect(row!.classes.has("is-open")).toBe(false);
+      click(lineOf(row!));
+      expect(row!.classes.has("is-open")).toBe(true);
+      expect(groupsOf(row!)).toEqual([
+        {title: "上传到 S3（4 个）", files: [["修改", "1-Projects/日志.md"], ["新增", "附件/图.png"],
+          ["挪动", "图纸/旧.pdf → 图纸/过程文档/旧.pdf"], ["删除", "WX/旧.md"]]},
+        {title: "从 S3 下载（4 个）", files: [["更新", "2-Areas/待办.md"], ["新增", "录音/周会.md"],
+          ["删除", "录音/草稿.md"], ["挪动", "甲/乙.md → 丙/乙.md"]]},
+      ]);
+      const body = textsIn(bodyOf(row!));
+      expect(body).toContain("开始 16:55:36 · 用时 1.7 秒 · 98 次请求 · 发送 14.2 KB / 接收 51.8 KB");
+      expect(body).toContain("各阶段：读取远端 310 毫秒、扫描本地 180 毫秒、上传 640 毫秒、发布 290 毫秒、保存记录 190 毫秒");
+      // 每种类型的标签各带自己的样式类，颜色在样式表里按类型给
+      const tags = all(bodyOf(row!)).filter(node => node.classes.has("s3-vault-sync-record-file-kind"));
+      expect(tags.map(tag => [...tag.classes].find(name => name.startsWith("mod-")))).toEqual(
+        ["mod-modified", "mod-added", "mod-moved", "mod-deleted", "mod-updated", "mod-added", "mod-deleted", "mod-moved"]);
+      click(lineOf(row!));
+      expect(row!.classes.has("is-open")).toBe(false);
+      expect(groupsOf(row!)).toEqual([]);
+    });
+
+    it("lists the one changed file with its full path, and writes short times in milliseconds and large sizes in MB", () => {
+      const modal = open(controllerWith([sync("one", at("2026-10-25T16:54:40"), {finishedAt: at("2026-10-25T16:54:40") + 777,
+        sentBytes: 1_887_437, receivedBytes: 0, uploads: [{kind: "modified", path: "1-Projects/Raycloud/日志.md"}]})]));
+      const [row] = rowsOf(modal);
+      expect(lineTexts(row!)[2]).toBe("上传 1 个：修改 日志.md");
+      click(lineOf(row!));
+      expect(groupsOf(row!)).toEqual([{title: "上传到 S3（1 个）", files: [["修改", "1-Projects/Raycloud/日志.md"]]}]);
+      expect(textsIn(bodyOf(row!))).toContain("开始 16:54:40 · 用时 777 毫秒 · 98 次请求 · 发送 1.8 MB / 接收 0 KB");
+    });
+
+    it("opens and closes a row with Enter and Space once it has keyboard focus", () => {
+      const modal = open(controllerWith([sync("one", at("2026-10-25T16:55:36"), {uploads: [{kind: "added", path: "a.md"}]})]));
+      const [row] = rowsOf(modal);
+      const line = lineOf(row!);
+      expect(line.attrs.get("role")).toBe("button");
+      expect(line.attrs.get("tabindex")).toBe("0");
+      expect(line.attrs.get("aria-expanded")).toBe("false");
+      press(line, "Enter");
+      expect(row!.classes.has("is-open")).toBe(true);
+      expect(line.attrs.get("aria-expanded")).toBe("true");
+      press(line, " ");
+      expect(row!.classes.has("is-open")).toBe(false);
+      press(line, "a");
+      expect(row!.classes.has("is-open")).toBe(false);
+    });
+
+    it("keeps the section and the opened rows open after the status refresh redraws the window", () => {
+      const listeners = new Set<(status: {text: string}) => void>();
+      const controller = {...controllerWith([
+        sync("first", at("2026-10-25T16:55:36"), {uploads: [{kind: "added", path: "a.md"}]}),
+        sync("second", at("2026-10-25T16:50:00"), {uploads: [{kind: "added", path: "b.md"}]}),
+      ]), onStatusChange: (listener: (status: {text: string}) => void) => {listeners.add(listener); return () => listeners.delete(listener);}};
+      const modal = open(controller);
+      const section = sectionOf(modal)!;
+      section.open = true;
+      section.events.get("toggle")!();
+      click(lineOf(rowsOf(modal)[1]!));
+      for (const listener of listeners) listener({text: "空闲：同步完成"});
+      expect(sectionOf(modal)).not.toBe(section);
+      expect(sectionOf(modal)!.open).toBe(true);
+      expect(rowsOf(modal).map(row => row.classes.has("is-open"))).toEqual([false, true]);
+      expect(groupsOf(rowsOf(modal)[1]!)).toEqual([{title: "上传到 S3（1 个）", files: [["新增", "b.md"]]}]);
+      click(lineOf(rowsOf(modal)[1]!));
+      modal.onOpen();
+      expect(rowsOf(modal).map(row => row.classes.has("is-open"))).toEqual([false, false]);
+    });
+
+    it("counts the files past the 200 kept names and says how many are not listed", () => {
+      const uploads = Array.from({length: 200}, (_, index) => ({kind: "added" as const, path: `剪藏/第${String(index + 1).padStart(3, "0")}篇.md`}));
+      const modal = open(controllerWith([sync("many", at("2026-10-25T10:00:00"), {uploads, moreFiles: 1})]));
+      const [row] = rowsOf(modal);
+      expect(lineTexts(row!)[2]).toBe("上传 201 个：第001篇.md 等");
+      click(lineOf(row!));
+      const [group] = groupsOf(row!);
+      expect(group!.title).toBe("上传到 S3（201 个）");
+      expect(group!.files).toHaveLength(200);
+      expect(group!.note).toBe("只记录了前 200 个文件名，另有 1 个没有列出。");
+      expect(all(bodyOf(row!)).find(node => node.tag === "ul")!.classes.has("s3-vault-sync-record-files")).toBe(true);
+    });
+
+    it("puts the unlisted files under downloads when some downloads were named", () => {
+      const uploads = Array.from({length: 150}, (_, index) => ({kind: "modified" as const, path: `上/${index}.md`}));
+      const downloads = Array.from({length: 50}, (_, index) => ({kind: "added" as const, path: `下/${index}.md`}));
+      const modal = open(controllerWith([sync("both", at("2026-10-25T10:00:00"), {uploads, downloads, moreFiles: 30})]));
+      const [row] = rowsOf(modal);
+      expect(lineTexts(row!)[2]).toBe("上传 150 个 · 下载 80 个：0.md 等");
+      click(lineOf(row!));
+      expect(groupsOf(row!).map(group => [group.title, group.files.length, group.note])).toEqual([
+        ["上传到 S3（150 个）", 150, undefined], ["从 S3 下载（80 个）", 50, "只记录了前 200 个文件名，另有 30 个没有列出。"]]);
+    });
+
+    it("labels retries, errors, interrupted runs and manual operations, each with its own result style and explanation", () => {
+      const modal = open(controllerWith([
+        sync("editing", at("2026-10-25T16:53:50"), {outcome: "retrying", errorCategory: "local-change"}),
+        sync("offline", at("2026-10-25T16:40:00"), {outcome: "retrying", errorCategory: "network", triggers: ["periodic"]}),
+        sync("broken", at("2026-10-25T16:30:00"), {outcome: "error", errorCategory: "service"}),
+        sync("review", at("2026-10-25T16:20:00"), {outcome: "action-required", uploads: [{kind: "added", path: "甲.md"}]}),
+        sync("stopped", at("2026-10-25T16:10:00"), {outcome: "interrupted", triggers: ["shutdown"]}),
+        manual("restore", at("2026-10-25T09:05:12"), "恢复已删除的文件：旧报价.xlsx", [{kind: "restored", path: "4-Archives/旧报价.xlsx"}]),
+        sync("pulled", at("2026-10-25T07:42:05"), {triggers: ["startup"], downloads: [{kind: "updated", path: "待办.md"}]}),
+      ]));
+      const rows = rowsOf(modal);
+      expect(rows.map(row => lineTexts(row).slice(1, 4))).toEqual([
+        ["编辑后同步", "文件还在被修改，稍后重试", "稍后重试"],
+        ["定时检查", "网络出错，稍后重试", "稍后重试"],
+        ["编辑后同步", "S3 服务出错", "出错"],
+        ["编辑后同步", "上传 1 个：新增 甲.md", "需要处理"],
+        ["关闭前同步", "没有改动文件", "被中断"],
+        ["手动操作", "恢复已删除的文件：旧报价.xlsx", "手动操作"],
+        ["启动时同步", "下载 1 个：更新 待办.md", "完成"],
+      ]);
+      const styles = rows.map(row => [...lineOf(row).children[3]!.classes].find(name => name.startsWith("mod-")));
+      expect(styles).toEqual(["mod-retrying", "mod-retrying", "mod-error", "mod-action-required", "mod-interrupted", "mod-manual", "mod-complete"]);
+      const explain = (row: FakeElement): string | undefined => {
+        click(lineOf(row));
+        return all(bodyOf(row)).find(node => node.classes.has("s3-vault-sync-record-explain"))?.text;
+      };
+      expect(explain(rows[0]!)).toBe("同步时文件还在被修改，插件先停下，等编辑停下几秒后重新同步。这不算出错，没有丢任何改动。");
+      expect(explain(rows[1]!)).toBe("网络出错，连不上 S3。稍后会自动重试。");
+      expect(explain(rows[2]!)).toBe("S3 服务出错。");
+      expect(explain(rows[6]!)).toBe("下载的文件是别的设备改的。本机只知道从 S3 下载了，看不出是哪台设备改的。");
+      explain(rows[5]!);
+      expect(groupsOf(rows[5]!)).toEqual([{title: "涉及的文件（1 个）", files: [["恢复", "4-Archives/旧报价.xlsx"]]}]);
+      expect(textsIn(bodyOf(rows[5]!)).some(text => text.startsWith("开始"))).toBe(false);
+    });
+
+    const dayOf = (modal: StatusModal, title: string): FakeElement => all(sectionOf(modal)!).find(node =>
+      node.classes.has("s3-vault-sync-records-day") && node.children[0]!.text === title)!;
+    const quietOf = (day: FakeElement): FakeElement | undefined => day.children.at(-1)!.classes.has("s3-vault-sync-records-quiet") ? day.children.at(-1) : undefined;
+
+    it("ends each day with the number of checks that changed nothing, taken from the diagnostics of that day", () => {
+      const modal = open(controllerWith([
+        sync("one", at("2026-10-25T16:55:36"), {uploads: [{kind: "added", path: "a.md"}]}),
+        sync("yday", at("2026-10-24T12:00:00"), {uploads: [{kind: "added", path: "b.md"}]}),
+        sync("edge", at("2026-10-18T09:00:00"), {uploads: [{kind: "added", path: "c.md"}]}),
+      ], [
+        run("q1", at("2026-10-25T00:00:01")), run("q2", at("2026-10-25T08:00:00")), run("q3", at("2026-10-25T16:00:00")),
+        run("q4", at("2026-10-25T09:00:00"), {triggers: ["foreground"]}),
+        run("one", at("2026-10-25T16:55:36"), {triggers: ["edit"], counts: {uploaded: 1, downloaded: 0, deleted: 0, deferred: 0, unsynced: 0}}),
+        run("legacy", at("2026-10-25T10:00:00"), {counts: {uploaded: 0, downloaded: 0, deleted: 1, deferred: 0, unsynced: 0}}),
+        run("failed", at("2026-10-25T11:00:00"), {outcome: "error", errorCategory: "network"}),
+        run("y1", at("2026-10-24T23:59:59")),
+        run("e1", at("2026-10-18T20:00:00")),
+      ]));
+      const today = quietOf(dayOf(modal, "今天 · 10月25日 周日"))!;
+      const line = today.children.find(child => child.classes.has("s3-vault-sync-records-quiet-line"))!;
+      expect(textsIn(line)[0]).toBe("另有 4 次检查，没有改动任何文件");
+      const body = (): string[] => textsIn(today.children.find(child => child.classes.has("s3-vault-sync-records-quiet-body"))!);
+      expect(body()).toEqual([]);
+      click(line);
+      expect(body()).toEqual(["定时检查 3 次 · 回到前台 1 次。每次都成功完成。"]);
+      press(line, "Enter");
+      expect(body()).toEqual([]);
+      expect(line.attrs.get("role")).toBe("button");
+      expect(textsIn(quietOf(dayOf(modal, "昨天 · 10月24日 周六"))!)[0]).toBe("另有 1 次检查，没有改动任何文件");
+      // 10 月 18 日下午 4 点 20 分以后的诊断还在，这一天照样数
+      expect(textsIn(quietOf(dayOf(modal, "10月18日 周日"))!)[0]).toBe("另有 1 次检查，没有改动任何文件");
+    });
+
+    it("says that quiet checks of the days past the 7-day diagnostics are no longer kept", () => {
+      const modal = open(controllerWith([
+        sync("old", at("2026-10-17T22:36:08"), {uploads: [{kind: "added", path: "a.md"}]}),
+        sync("older", at("2026-10-12T20:18:44"), {uploads: [{kind: "added", path: "b.md"}]}),
+      ], [run("r", at("2026-10-25T08:00:00"))]));
+      for (const title of ["10月17日 周六", "10月12日 周一"]) {
+        expect(dayOf(modal, title).children.at(-1)!.text).toBe("超过 7 天，没有改动的检查已经不保留。");
+      }
+    });
+
+    it("keeps an opened quiet-check line open after the status refresh redraws the window", () => {
+      const listeners = new Set<(status: {text: string}) => void>();
+      const controller = {...controllerWith([sync("one", at("2026-10-25T16:55:36"), {uploads: [{kind: "added", path: "a.md"}]})],
+        [run("q", at("2026-10-25T08:00:00"))]),
+      onStatusChange: (listener: (status: {text: string}) => void) => {listeners.add(listener); return () => listeners.delete(listener);}};
+      const modal = open(controller);
+      click(quietOf(dayOf(modal, "今天 · 10月25日 周日"))!.children[0]!);
+      for (const listener of listeners) listener({text: "空闲：同步完成"});
+      const quiet = quietOf(dayOf(modal, "今天 · 10月25日 周日"))!;
+      expect(quiet.classes.has("is-open")).toBe(true);
+      expect(textsIn(quiet)).toContain("定时检查 1 次。每次都成功完成。");
+    });
+
+    it("says so when there is no record yet, and shows the warning when the record file could not be read", () => {
+      const empty = open(controllerWith([]));
+      expect(textsIn(sectionOf(empty)!)).toEqual(expect.arrayContaining(["本设备 · 0 次有改动或需要注意", "最近 30 天还没有改动过文件的同步。"]));
+      const broken = open(controllerWith([], [], "无法读取本地同步记录。同步数据没有受影响。"));
+      const warning = all(sectionOf(broken)!).find(node => node.text === "无法读取本地同步记录。同步数据没有受影响。")!;
+      expect(warning.classes.has("s3-vault-sync-error")).toBe(true);
+    });
+
+    it("shows no English trigger, result or phase name and no English time format anywhere in the window", () => {
+      const listeners = new Set<(status: {text: string}) => void>();
+      const base = controllerWith([
+        sync("one", at("2026-10-25T16:55:36"), {triggers: ["periodic", "network-retry"], phaseDurations: {saving: 20, hashing: 30},
+          uploads: [{kind: "moved", fromPath: "旧/甲.md", path: "新/甲.md"}], downloads: [{kind: "updated", path: "乙.md"}]}),
+        sync("two", at("2026-10-24T08:15:38"), {outcome: "retrying", errorCategory: "timeout", triggers: ["head-retry"]}),
+        manual("three", at("2026-10-24T09:00:00"), "处理冲突：丙.md", [{kind: "modified", path: "丙.md"}]),
+      ], [
+        run("q", at("2026-10-25T08:00:00")),
+        run("last", at("2026-10-25T16:00:00"), {outcome: "retrying", errorCategory: "network", phase: "saving",
+          observedRemote: "remote-version", remoteCheckedAt: at("2026-10-25T16:00:01")}),
+      ]);
+      const controller = {...base, getDiagnostics: () => ({...base.getDiagnostics!(), lastSuccessAt: at("2026-10-25T08:00:00"),
+        nextRetryAt: at("2026-10-25T16:02:00")}), onStatusChange: (listener: (status: {text: string}) => void) => {listeners.add(listener); return () => listeners.delete(listener);}};
+      const modal = open(controller);
+      const section = sectionOf(modal)!;
+      section.open = true;
+      section.events.get("toggle")!();
+      for (const node of all(section)) {
+        if (node.classes.has("s3-vault-sync-record-line") || node.classes.has("s3-vault-sync-records-quiet-line")) click(node);
+      }
+      for (const listener of listeners) listener({text: "空闲：同步完成"});
+      const texts = nodesOf(modal).map(node => node.text).filter(text => text !== "S3 Vault Sync");
+      expect(texts).toContain("旧/甲.md → 新/甲.md");
+      expect(texts).toContain("下次计划重试：2026-10-25 16:02:00");
+      // 提交 ID 是内部取值，原样显示
+      expect(texts.filter(text => /[A-Za-z]{3,}/.test(text.replace(/HTTP|Head|remote-version/g, "")))).toEqual([]);
+      expect(texts.filter(text => /\d{1,2}\/\d{1,2}\/\d{4}|\b[AP]M\b/.test(text))).toEqual([]);
+    });
+
+    it("does not draw the sync records on a phone or tablet, where there is no sync activity", () => {
+      const without = open({...issueController([]), getDeletedRecoveries: () => []});
+      expect(sectionOf(without)).toBeUndefined();
+      const mobile = open({...issueController([]), getSyncActivity: () => undefined});
+      expect(sectionOf(mobile)).toBeUndefined();
+      expect(nodesOf(mobile).some(node => node.text.includes("同步记录"))).toBe(false);
     });
   });
 });

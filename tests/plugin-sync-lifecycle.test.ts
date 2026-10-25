@@ -83,7 +83,8 @@ import type { ObsidianRequestExecutor } from "../src/storage/obsidian-request-ad
 import { RemoteStore } from "../src/storage/remote-store";
 import { ObsidianVaultPort } from "../src/plugin/obsidian-vault-port";
 import { withVaultMutationLock } from "../src/plugin/safe-vault-write";
-import { SyncService, type LocalSyncIssue } from "../src/sync/sync-service";
+import { SyncService, type LocalSyncIssue, type SyncResult } from "../src/sync/sync-service";
+import { S3TransportError } from "../src/storage/obsidian-request-adapter";
 
 const cleanups: Array<() => Promise<void>> = [];
 // 数据块名和真实仓库一样是 UUID
@@ -1177,8 +1178,8 @@ describe("opening sync status when synchronization stops", () => {
 
   const stubSyncResult = (localIssues: LocalSyncIssue[]) =>
     vi.spyOn(SyncService.prototype, "synchronize").mockResolvedValue({
-      cacheUpdated: false, deferredDownloadEntries: [], deferredDownloads: 0, deleted: 0, downloaded: 0,
-      localIssues, status: "action-required", unsyncedLocalEntries: 0, uploaded: 0,
+      cacheUpdated: false, deferredDownloadEntries: [], deferredDownloads: 0, deleted: 0, downloaded: 0, downloads: [],
+      localIssues, status: "action-required", unsyncedLocalEntries: 0, uploaded: 0, uploads: [],
     });
 
   it("does not open sync status when a sync only reports unsynced local files", async () => {
@@ -1201,12 +1202,12 @@ describe("opening sync status when synchronization stops", () => {
     expect(host.openedModals).toHaveLength(1);
     host.openedModals[0]!.close();
     synchronize.mockResolvedValue({
-      cacheUpdated: false, deferredDownloadEntries: [], deferredDownloads: 0, deleted: 0, downloaded: 0,
+      cacheUpdated: false, deferredDownloadEntries: [], deferredDownloads: 0, deleted: 0, downloaded: 0, downloads: [],
       localIssues: [
         {kind: "possible-rename", oldPaths: ["notes/example.md"], newPaths: ["notes/moved.md"], reviewToken: "token-1"},
         {kind: "unsynced-local", path: "notes/third.md"},
       ],
-      status: "action-required", unsyncedLocalEntries: 0, uploaded: 0,
+      status: "action-required", unsyncedLocalEntries: 0, uploaded: 0, uploads: [],
     });
     await plugin.syncNow();
     expect(plugin.getStatusText()).toMatch(/^需要处理：/u);
@@ -1466,6 +1467,29 @@ describe("manual cleanup from the status window", () => {
     await plugin.syncNow();
     expect(await recoveryOf(remote, "gone")).toBeDefined();
     expect(deletes()).toEqual([]);
+    plugin.onunload();
+  });
+
+  it("writes one sync activity line per confirmation and undo with counts and bytes but no blob names", async () => {
+    const { plugin, app, diagnosticFiles } = await desktop();
+    const manualRecords = () => plugin.getSyncActivity()!.records.filter((record) => record.kind === "manual");
+    await plugin.loadCleanup();
+    const goneKey = keyOf(plugin, (candidate) => candidate.path === "old/gone.md");
+    const orphanKey = keyOf(plugin, (candidate) => candidate.kind === "orphan");
+    // 第一次没确认所有设备已更新：操作抛错，不记
+    await expect(plugin.confirmCleanup([goneKey, orphanKey], false)).rejects.toThrow("0.1.10");
+    expect(manualRecords()).toEqual([]);
+
+    await plugin.confirmCleanup([goneKey, orphanKey], true);
+    await plugin.undoCleanup(orphanKey);
+
+    expect(manualRecords().map((record) => [record.summary, record.files])).toEqual([
+      ["待清理：确认删除 2 份数据（1 KB）", []],
+      ["待清理：撤销 1 份数据（1 KB）", []],
+    ]);
+    const saved = diagnosticFiles.get(`${app.vault.configDir}/plugins/s3-vault-sync/sync-activity.json`)!;
+    expect(saved).not.toContain(ORPHANS[0]!);
+    expect(saved).not.toContain(orphanKey);
     plugin.onunload();
   });
 
@@ -1750,5 +1774,301 @@ describe("manual cleanup that keeps losing the Head race", () => {
       cleanup.mockRestore();
     }
     plugin.onunload();
+  });
+});
+
+describe("local sync activity on the desktop", () => {
+  const activityPath = (app: App) => `${app.vault.configDir}/plugins/s3-vault-sync/sync-activity.json`;
+  const stubbedResult = (overrides: Partial<SyncResult> = {}): SyncResult => ({
+    cacheUpdated: true, deferredDownloadEntries: [], deferredDownloads: 0, deleted: 0, downloaded: 0, downloads: [],
+    localIssues: [], status: "complete", unsyncedLocalEntries: 0, uploaded: 0, uploads: [], ...overrides,
+  });
+  // 重试之间的等待用假计时器：每拨 50 毫秒真等 1 毫秒，让走真实线程的加密运算跑完
+  const settle = async (run: Promise<unknown>) => {
+    let done = false;
+    void run.finally(() => { done = true; });
+    for (let step = 0; !done; step++) {
+      if (step >= 2_000) throw new Error("同步一直没有结束");
+      await vi.advanceTimersByTimeAsync(50);
+      if (!done) await realDelay(1);
+    }
+    await run;
+  };
+  const restoreSpies: Array<() => void> = [];
+  afterEach(() => {
+    for (const restore of restoreSpies.splice(0)) restore();
+  });
+
+  it("records the uploaded file under the diagnostic record's id without putting it into the diagnostics export", async () => {
+    host.desktop = true;
+    const {plugin, app, edit, diagnosticFiles} = await setup();
+    edit("A changed article.");
+
+    await plugin.togglePause();
+
+    const run = plugin.getDiagnostics().records.at(-1)!;
+    const records = plugin.getSyncActivity()!.records;
+    expect(records).toEqual([expect.objectContaining({
+      id: run.id, vaultId: "vault-1", kind: "sync", startedAt: run.startedAt, finishedAt: run.finishedAt,
+      triggers: ["resume"], outcome: "complete", phase: "saving", requests: run.requests, sentBytes: run.sentBytes,
+      receivedBytes: run.receivedBytes, phaseDurations: run.phaseDurations,
+      uploads: [{kind: "modified", path: "notes/example.md"}], downloads: [],
+    })]);
+    expect(JSON.parse(diagnosticFiles.get(activityPath(app))!)).toEqual({version: 1, records});
+    expect(plugin.exportDiagnostics()).not.toContain("notes/example.md");
+    plugin.onunload();
+  });
+
+  it("does not record a complete synchronization that changed no files", async () => {
+    host.desktop = true;
+    const {plugin, app, diagnosticFiles} = await setup();
+
+    await plugin.togglePause();
+    await plugin.syncNow();
+
+    expect(plugin.getDiagnostics().records.map(record => record.outcome)).toEqual(["complete", "complete"]);
+    expect(plugin.getSyncActivity()!.records).toEqual([]);
+    expect(diagnosticFiles.has(activityPath(app))).toBe(false);
+    plugin.onunload();
+  });
+
+  it("records a retry for a file still being edited without any files, then the upload that follows", async () => {
+    host.desktop = true;
+    const {plugin, hooks, edit} = await setup();
+    edit("A paragraph in progress.");
+    hooks.beforeBlobRead = () => {
+      hooks.beforeBlobRead = undefined;
+      edit("The complete paragraph.");
+    };
+
+    await plugin.togglePause();
+    expect(plugin.getSyncActivity()!.records).toEqual([expect.objectContaining({outcome: "retrying", uploads: [], downloads: []})]);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.waitFor(() => expect(plugin.getStatusText()).toMatch(/^空闲：/u));
+
+    expect(plugin.getSyncActivity()!.records.map(record => [record.outcome, record.uploads]))
+      .toEqual([["retrying", []], ["complete", [{kind: "modified", path: "notes/example.md"}]]]);
+    plugin.onunload();
+  });
+
+  it("records no upload when another device keeps publishing first", async () => {
+    host.desktop = true;
+    const {plugin, edit} = await setup();
+    const execute = host.requestUrl.getMockImplementation() as ObsidianRequestExecutor;
+    host.requestUrl.mockImplementation((request: Parameters<ObsidianRequestExecutor>[0]) =>
+      request.method === "PUT" && request.url.endsWith("/head")
+        ? Promise.resolve({status: 412, arrayBuffer: new ArrayBuffer(0), headers: {date: new Date().toUTCString()}})
+        : execute(request));
+    edit("A draft that loses the race.");
+
+    await settle(plugin.togglePause());
+
+    expect(plugin.getDiagnostics().records.at(-1)).toMatchObject({outcome: "retrying", errorCategory: "head-race"});
+    expect(plugin.getSyncActivity()!.records).toEqual([expect.objectContaining({outcome: "retrying", uploads: [], downloads: []})]);
+    plugin.onunload();
+  });
+
+  it.each([
+    {failure: "another device publishing first", error: async () => new (await import("../src/storage/remote-store")).HeadChangedError(), outcome: "retrying"},
+    {failure: "a network error", error: async () => new S3TransportError("network", false), outcome: "retrying"},
+    {failure: "an unexpected error", error: async () => new Error("disk failure"), outcome: "error"},
+  ])("keeps the files downloaded before publishing failed because of $failure", async ({error, outcome}) => {
+    host.desktop = true;
+    const {plugin} = await setup();
+    const failure = await error();
+    let calls = 0;
+    const synchronize = vi.spyOn(SyncService.prototype, "synchronize").mockImplementation((_approved, options) => {
+      // 第一次尝试下载落地一个文件后发布失败；重试时文件已经在本机，不会再下载
+      if (calls++ === 0) options?.onDownloadApplied?.({kind: "added", path: "notes/from-phone.md"});
+      return Promise.reject(failure);
+    });
+    restoreSpies.push(() => synchronize.mockRestore());
+
+    await settle(plugin.togglePause());
+
+    expect(plugin.getSyncActivity()!.records).toEqual([expect.objectContaining({
+      outcome, uploads: [], downloads: [{kind: "added", path: "notes/from-phone.md"}],
+    })]);
+    plugin.onunload();
+  });
+
+  it("records both directions and downloads from an earlier attempt that lost the Head race", async () => {
+    host.desktop = true;
+    const {plugin} = await setup();
+    const {HeadChangedError} = await import("../src/storage/remote-store");
+    let calls = 0;
+    const synchronize = vi.spyOn(SyncService.prototype, "synchronize").mockImplementation((_approved, options) => {
+      if (calls++ === 0) {
+        options?.onDownloadApplied?.({kind: "updated", path: "notes/from-phone.md"});
+        return Promise.reject(new HeadChangedError());
+      }
+      return Promise.resolve(stubbedResult({uploads: [{kind: "modified", path: "notes/example.md"}], uploaded: 1}));
+    });
+    restoreSpies.push(() => synchronize.mockRestore());
+
+    await settle(plugin.togglePause());
+
+    expect(plugin.getSyncActivity()!.records).toEqual([expect.objectContaining({
+      outcome: "complete", uploads: [{kind: "modified", path: "notes/example.md"}],
+      downloads: [{kind: "updated", path: "notes/from-phone.md"}],
+    })]);
+    plugin.onunload();
+  });
+
+  it("starts an empty record with a notice when the file is damaged, and keeps synchronizing", async () => {
+    host.desktop = true;
+    const {plugin, app, edit, diagnosticFiles, remote} = await setup();
+    plugin.onunload();
+    for (const damaged of ["{not json", JSON.stringify({version: 1, records: "nope"})]) {
+      diagnosticFiles.set(activityPath(app), damaged);
+      const replacement = new S3VaultSyncPlugin(app, {id: "s3-vault-sync"} as PluginManifest);
+      await replacement.onload();
+      expect(replacement.getSyncActivity()).toEqual({records: [], persistenceWarning: "无法读取本地同步记录。同步数据没有受影响。"});
+      edit(`An article saved after the damage: ${damaged}`);
+      if (replacement.isPaused()) await replacement.togglePause(); else await replacement.syncNow();
+      expect(replacement.getStatusText()).toMatch(/^空闲：/u);
+      expect((await remote.readHead())!.value.commitId).toBe(replacement.getDiagnostics().acceptedCommit);
+      expect(replacement.getSyncActivity()!.records).toEqual([expect.objectContaining({uploads: [{kind: "modified", path: "notes/example.md"}]})]);
+      await replacement.togglePause();
+      replacement.onunload();
+    }
+  });
+
+  it("neither reads nor writes the record on a phone or tablet", async () => {
+    host.desktop = false;
+    host.mobile = true;
+    const {plugin, app, edit, diagnosticFiles} = await setup();
+    plugin.onunload();
+    const existing = JSON.stringify({version: 1, records: []});
+    diagnosticFiles.set(activityPath(app), existing);
+    const touched: string[] = [];
+    for (const method of ["exists", "read", "write"] as const) {
+      const original = app.vault.adapter[method].bind(app.vault.adapter) as (...args: unknown[]) => Promise<unknown>;
+      vi.spyOn(app.vault.adapter, method).mockImplementation(((path: string, ...rest: unknown[]) => {
+        touched.push(path);
+        return original(path, ...rest);
+      }) as never);
+    }
+    const restore = vi.spyOn(SyncService.prototype, "restoreRevision").mockResolvedValue();
+    restoreSpies.push(() => restore.mockRestore());
+    const phone = new S3VaultSyncPlugin(app, {id: "s3-vault-sync"} as PluginManifest);
+    await phone.onload();
+    edit("Edited on the phone.");
+
+    await phone.togglePause();
+    await phone.restoreRevision("entry-1", "revision-1");
+
+    expect(phone.getStatusText()).toMatch(/^空闲：/u);
+    expect(phone.getSyncActivity()).toBeUndefined();
+    expect(touched).not.toContain(activityPath(app));
+    expect(diagnosticFiles.get(activityPath(app))).toBe(existing);
+    phone.onunload();
+  });
+
+  describe("manual operations", () => {
+    const manualRecords = (plugin: S3VaultSyncPlugin) => plugin.getSyncActivity()!.records.filter(record => record.kind === "manual");
+    // 电脑上、已恢复同步；之后的同步都返回「没有改动」，只留下手动操作那一条
+    const ready = async () => {
+      host.desktop = true;
+      const fixture = await setup();
+      await fixture.plugin.togglePause();
+      const synchronize = vi.spyOn(SyncService.prototype, "synchronize").mockResolvedValue(stubbedResult());
+      restoreSpies.push(() => synchronize.mockRestore());
+      return {...fixture, synchronize};
+    };
+    type StubbedMethod = "restoreDeleted" | "restoreRevision" | "resolveConflict" | "resolvePathCollision" | "resolveLocalContent";
+    const stub = (name: StubbedMethod, result: "resolve" | "reject", value?: string) => {
+      // 各个方法的返回类型不同，这里只按调用结果统一处理
+      const spy = vi.spyOn(SyncService.prototype as unknown as Record<StubbedMethod, () => Promise<unknown>>, name)
+        .mockImplementation(() => result === "resolve" ? Promise.resolve(value) : Promise.reject(new Error("操作失败")));
+      restoreSpies.push(() => spy.mockRestore());
+    };
+    interface ManualCase {
+      operation: string; service: StubbedMethod; value?: string; run: (plugin: S3VaultSyncPlugin) => Promise<unknown>;
+      summary: string; files: Array<{kind: string; path: string; fromPath?: string}>;
+    }
+    const renameIssue: LocalSyncIssue = {kind: "possible-rename", oldPaths: ["notes/example.md", "notes/gone.md"],
+      newPaths: ["notes/moved.md", "notes/fresh.md"], reviewToken: "token-1"};
+
+    it.each<ManualCase>([
+      {operation: "restoreDeleted", service: "restoreDeleted", run: (plugin: S3VaultSyncPlugin) => plugin.restoreDeleted("entry-1"),
+        summary: "恢复已删除的文件：example.md", files: [{kind: "restored", path: "notes/example.md"}]},
+      {operation: "restoreRevision", service: "restoreRevision", run: (plugin: S3VaultSyncPlugin) => plugin.restoreRevision("entry-1", "revision-1"),
+        summary: "恢复历史版本：example.md", files: [{kind: "restored", path: "notes/example.md"}]},
+      {operation: "resolveConflict", service: "resolveConflict", run: (plugin: S3VaultSyncPlugin) => plugin.resolveConflict("entry-1", "revision-1"),
+        summary: "处理冲突：example.md", files: [{kind: "modified", path: "notes/example.md"}]},
+      {operation: "keepConflictDeleted", service: "resolveConflict", run: (plugin: S3VaultSyncPlugin) => plugin.keepConflictDeleted("entry-1"),
+        summary: "处理冲突（保留删除）：example.md", files: [{kind: "deleted", path: "notes/example.md"}]},
+      {operation: "resolvePathCollision", service: "resolvePathCollision", value: "notes/example 2.md",
+        run: (plugin: S3VaultSyncPlugin) => plugin.resolvePathCollision({paths: ["notes/example.md", "notes/Example.md"], reviewToken: "token-1",
+          side: "local", path: "notes/example.md", newName: "example 2.md"}),
+        summary: "路径撞名：改名为 example 2.md", files: [{kind: "moved", fromPath: "notes/example.md", path: "notes/example 2.md"}]},
+      {operation: "resolveLocalContent (local)", service: "resolveLocalContent", run: (plugin: S3VaultSyncPlugin) => plugin.resolveLocalContent("notes/example.md", "token-1", "local"),
+        summary: "处理本地内容（保留本机版本）：example.md", files: [{kind: "modified", path: "notes/example.md"}]},
+      {operation: "resolveLocalContent (remote)", service: "resolveLocalContent", run: (plugin: S3VaultSyncPlugin) => plugin.resolveLocalContent("notes/example.md", "token-1", "remote"),
+        summary: "处理本地内容（使用 S3 版本）：example.md", files: [{kind: "updated", path: "notes/example.md"}]},
+      {operation: "resolveLocalContent (both)", service: "resolveLocalContent", value: "notes/example (local copy).md",
+        run: (plugin: S3VaultSyncPlugin) => plugin.resolveLocalContent("notes/example.md", "token-1", "both"),
+        summary: "处理本地内容（两份都保留）：example.md",
+        files: [{kind: "added", path: "notes/example (local copy).md"}, {kind: "updated", path: "notes/example.md"}]},
+    ])("records $operation after it succeeds and not after it fails", async ({service, value, run, summary, files}) => {
+      const {plugin} = await ready();
+      stub(service, "reject");
+      await expect(run(plugin)).rejects.toThrow("操作失败");
+      expect(manualRecords(plugin)).toEqual([]);
+
+      stub(service, "resolve", value);
+      await run(plugin);
+
+      expect(manualRecords(plugin)).toEqual([expect.objectContaining({kind: "manual", vaultId: "vault-1", outcome: "complete", summary, files})]);
+      plugin.onunload();
+    });
+
+    it("records a reviewed move with the paired, deleted and added files, and not a review that fails", async () => {
+      const {plugin, synchronize} = await ready();
+      synchronize.mockResolvedValueOnce(stubbedResult({cacheUpdated: false, status: "action-required", localIssues: [renameIssue]}));
+      await plugin.syncNow();
+      await plugin.togglePause();
+      await expect(plugin.resolvePossibleRename({kind: "moves", reviewToken: "token-1",
+        pairs: [{fromPath: "notes/example.md", toPath: "notes/moved.md"}]})).rejects.toThrow("恢复同步");
+      await plugin.togglePause();
+      synchronize.mockResolvedValueOnce(stubbedResult({cacheUpdated: false, status: "action-required", localIssues: [renameIssue]}));
+      await plugin.syncNow();
+      expect(manualRecords(plugin)).toEqual([]);
+
+      await plugin.resolvePossibleRename({kind: "moves", reviewToken: "token-1", pairs: [{fromPath: "notes/example.md", toPath: "notes/moved.md"}]});
+
+      expect(manualRecords(plugin)).toEqual([expect.objectContaining({summary: "审查挪动：按挪动处理 1 个文件", files: [
+        {kind: "moved", fromPath: "notes/example.md", path: "notes/moved.md"},
+        {kind: "deleted", path: "notes/gone.md"},
+        {kind: "added", path: "notes/fresh.md"},
+      ]})]);
+      synchronize.mockResolvedValueOnce(stubbedResult({cacheUpdated: false, status: "action-required", localIssues: [renameIssue]}));
+      await plugin.syncNow();
+      await plugin.resolvePossibleRename({kind: "separate", reviewToken: "token-1"});
+      expect(manualRecords(plugin).at(-1)).toMatchObject({summary: "审查挪动：按删除和新增处理", files: [
+        {kind: "deleted", path: "notes/example.md"}, {kind: "deleted", path: "notes/gone.md"},
+        {kind: "added", path: "notes/moved.md"}, {kind: "added", path: "notes/fresh.md"},
+      ]});
+      plugin.onunload();
+    });
+
+    it("records a confirmed Bulk Deletion once its synchronization succeeds, and not one whose synchronization fails", async () => {
+      const {plugin, synchronize} = await ready();
+      const bulkDeletion = {count: 1, entryIds: ["entry-1"], totalLiveEntries: 1};
+      synchronize.mockResolvedValueOnce(stubbedResult({cacheUpdated: false, status: "action-required", bulkDeletion}));
+      await plugin.syncNow();
+      synchronize.mockRejectedValueOnce(new Error("disk failure"));
+      await plugin.confirmBulkDeletion();
+      expect(plugin.getPendingBulkDeletion()).toEqual(bulkDeletion);
+      expect(manualRecords(plugin)).toEqual([]);
+
+      await plugin.confirmBulkDeletion();
+
+      expect(plugin.getPendingBulkDeletion()).toBeUndefined();
+      expect(manualRecords(plugin)).toEqual([expect.objectContaining({summary: "确认批量删除：1 个文件",
+        files: [{kind: "deleted", path: "notes/example.md"}]})]);
+      plugin.onunload();
+    });
   });
 });
