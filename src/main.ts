@@ -12,13 +12,14 @@ import { RemotelySaveMigration } from "./migration/remotely-save-migration";
 import { CredentialStore, type AwsCredentials } from "./plugin/credential-store";
 import { createCooperativeYield } from "./plugin/cooperative-yield";
 import { StatusModal, VersionHistoryModal } from "./plugin/modals";
-import type { CleanupController, CleanupView, PendingCleanupItem } from "./plugin/cleanup-modal";
+import { formatSize, type CleanupController, type CleanupView, type PendingCleanupItem } from "./plugin/cleanup-modal";
 import { ObsidianVaultPort, isInSyncScope } from "./plugin/obsidian-vault-port";
 import { SerializedDataWriter } from "./plugin/serialized-data-writer";
 import { SyncSession, SyncStoppedError } from "./plugin/sync-session";
 import { formatSyncProgress } from "./plugin/sync-progress";
 import { SyncProgressThrottle } from "./plugin/sync-progress-throttle";
 import { SyncDiagnostics, type SyncDiagnosticsView, type SyncRunRecord, type SyncTrigger } from "./plugin/sync-diagnostics";
+import { SyncActivity, type SyncActivityFile, type SyncActivitySnapshot } from "./plugin/sync-activity";
 import {
   DEFAULT_SETTINGS,
   S3VaultSyncSettingsTab,
@@ -38,6 +39,7 @@ import {
   type LocalContentChoice,
   type PossibleRenameResolution,
   type SyncCachePort,
+  type SyncFileChange,
   type SyncProgress,
   type SyncResult,
   type VerifiedLocalFile,
@@ -136,6 +138,8 @@ interface PersistedPluginData {
 const normalizePrefix = (prefix: string): string =>
   prefix.replace(/^\/+|\/+$/gu, "");
 
+const fileName = (path: string): string => path.slice(path.lastIndexOf("/") + 1);
+
 interface ManualCleanupState {
   target: string;
   // 用户已确认所有设备都更新到 0.1.10 或更高；同一目标之后不再问
@@ -201,6 +205,8 @@ export default class S3VaultSyncPlugin
   private credentials!: CredentialStore;
   private data!: PersistedPluginData;
   private diagnostics!: SyncDiagnostics;
+  // 本机同步记录：只在电脑上创建，手机、平板上没有
+  private syncActivity: SyncActivity | undefined;
   private activeRun: SyncRunRecord | undefined;
   private acceptedCommit: string | undefined;
   private readonly pendingTriggers = new Set<SyncTrigger>();
@@ -258,6 +264,23 @@ export default class S3VaultSyncPlugin
     });
     await this.session.run(() => this.diagnostics.load());
     this.session.assertActive();
+    if (Platform.isDesktopApp) {
+      const activityPath = `${this.app.vault.configDir}/plugins/${this.manifest.id}/sync-activity.json`;
+      const activity = new SyncActivity({
+        read: async () => {
+          const exists = await this.app.vault.adapter.exists(activityPath);
+          this.session.assertActive();
+          if (!exists) return undefined;
+          const body = await this.app.vault.adapter.read(activityPath);
+          this.session.assertActive();
+          return JSON.parse(body) as unknown;
+        },
+        write: value => this.session.run(() => this.app.vault.adapter.write(activityPath, JSON.stringify(value))),
+      });
+      await this.session.run(() => activity.load());
+      this.session.assertActive();
+      this.syncActivity = activity;
+    }
     this.credentials = new CredentialStore(this.app.secretStorage);
     this.addSettingTab(new S3VaultSyncSettingsTab(this.app, this));
     this.addRibbonIcon("refresh-cw", "打开 S3 Vault Sync", () => {
@@ -393,6 +416,11 @@ export default class S3VaultSyncPlugin
       pendingLocalChanges: this.dirtyPaths.capture().size};
   }
 
+  // 本机同步记录（当前仓库）；手机、平板上返回 undefined
+  getSyncActivity(): SyncActivitySnapshot | undefined {
+    return this.syncActivity?.snapshot(this.data.settings.vaultId ?? "");
+  }
+
   exportDiagnostics(): string {
     return JSON.stringify({version: 1, ...this.getDiagnostics(1_000)}, null, 2);
   }
@@ -500,6 +528,7 @@ export default class S3VaultSyncPlugin
 
   // 点「删除所选」：不写 S3，只把选中的项目记进本机队列，确认时间用这次页面读到的 Head serverDate（AWS 时间）
   async confirmCleanup(keys: string[], allDevicesUpdated: boolean): Promise<void> {
+    const startedAt = Date.now();
     await this.syncRequests.runExclusive(() => this.session.run(async () => {
       if (!Platform.isDesktopApp) throw new Error("清理只能在电脑上使用。");
       const loaded = this.loadedCleanup;
@@ -514,11 +543,16 @@ export default class S3VaultSyncPlugin
       }));
       this.data.manualCleanup = {...state, devicesConfirmed: true, queue: [...state.queue, ...added]};
       await this.savePluginData();
+      // 只记项目数和字节，不记数据块编号
+      if (added.length > 0) {
+        await this.recordManualActivity(startedAt, `待清理：确认删除 ${added.length} 份数据（${formatSize(added.reduce((sum, item) => sum + item.size, 0))}）`, []);
+      }
     }));
   }
 
   // 撤销只是把它从本机队列里拿掉，不写 S3；记录已经改过的不能再撤销
   async undoCleanup(key: string): Promise<void> {
+    const startedAt = Date.now();
     await this.syncRequests.runExclusive(() => this.session.run(async () => {
       const state = this.cleanupState();
       const item = state.queue.find(queued => queued.key === key);
@@ -526,6 +560,7 @@ export default class S3VaultSyncPlugin
       if (item.recordRemovedAt !== undefined) throw new Error("它已经从同步记录里去掉了，不能再撤销。");
       this.data.manualCleanup = {...state, queue: state.queue.filter(queued => queued.key !== key)};
       await this.savePluginData();
+      await this.recordManualActivity(startedAt, `待清理：撤销 1 份数据（${formatSize(item.size)}）`, []);
     }));
   }
 
@@ -569,6 +604,12 @@ export default class S3VaultSyncPlugin
     if (!this.pendingBulkDeletion || this.syncRequests.isRunning) {
       return;
     }
+    const startedAt = Date.now();
+    const pending = this.pendingBulkDeletion;
+    const files = pending.entryIds.flatMap((entryId): SyncActivityFile[] => {
+      const path = this.data.cache?.snapshot.entries[entryId]?.path;
+      return path ? [{kind: "deleted", path}] : [];
+    });
     this.approvedBulkDeletionEntryIds = [
       ...this.pendingBulkDeletion.entryIds,
     ];
@@ -577,6 +618,8 @@ export default class S3VaultSyncPlugin
         allowBulkDeletion: true,
         fullHashVerification: true,
       });
+      // 同步没拿到结果时批量删除仍在等确认，这时不记
+      if (!this.pendingBulkDeletion) await this.recordManualActivity(startedAt, `确认批量删除：${pending.count} 个文件`, files);
     } finally {
       this.approvedBulkDeletionEntryIds = undefined;
       this.approvedRenameResolution = undefined;
@@ -588,10 +631,22 @@ export default class S3VaultSyncPlugin
       throw new Error("同步正在进行。请等它结束后再审查一次。");
     }
     if (this.isPaused()) throw new Error("请先恢复同步，再处理挪动。");
+    const startedAt = Date.now();
+    const issue = this.pendingLocalIssues.find((item): item is Extract<LocalSyncIssue, {kind: "possible-rename"}> =>
+      item.kind === "possible-rename" && item.reviewToken === resolution.reviewToken);
     this.approvedRenameResolution = resolution;
     try {
       await this.requestSync({ fullHashVerification: true });
       if (this.status === "Error") throw new Error(this.statusDetail);
+      // 配对的按挪动记；没配对的消失文件按删除、新文件按新增记
+      const pairs = resolution.kind === "moves" ? resolution.pairs : [];
+      const paired = new Set(pairs.flatMap(pair => [pair.fromPath, pair.toPath]));
+      await this.recordManualActivity(startedAt,
+        resolution.kind === "moves" ? `审查挪动：按挪动处理 ${pairs.length} 个文件` : "审查挪动：按删除和新增处理", [
+          ...pairs.map((pair): SyncActivityFile => ({kind: "moved", fromPath: pair.fromPath, path: pair.toPath})),
+          ...(issue?.oldPaths ?? []).filter(path => !paired.has(path)).map((path): SyncActivityFile => ({kind: "deleted", path})),
+          ...(issue?.newPaths ?? []).filter(path => !paired.has(path)).map((path): SyncActivityFile => ({kind: "added", path})),
+        ]);
     } finally {
       // A separate delete/add decision may still need the existing bulk-delete confirmation.
       if (!this.pendingBulkDeletion) this.approvedRenameResolution = undefined;
@@ -613,6 +668,7 @@ export default class S3VaultSyncPlugin
   }
 
   async resolvePathCollision(request: PathCollisionResolution): Promise<string> {
+    const startedAt = Date.now();
     try {
       const newPath = await this.runExclusiveSyncService(service => {
         const expectedRenames = JSON.stringify(this.pathRenames.serialize());
@@ -620,6 +676,7 @@ export default class S3VaultSyncPlugin
           this.collisionRenameJournal(expectedRenames));
       });
       await this.requestSync();
+      await this.recordManualActivity(startedAt, `路径撞名：改名为 ${fileName(newPath)}`, [{kind: "moved", fromPath: request.path, path: newPath}]);
       return newPath;
     } catch (error) { this.showError(error); throw error; }
   }
@@ -692,12 +749,19 @@ export default class S3VaultSyncPlugin
   }
 
   async resolveLocalContent(path: string, reviewToken: string, choice: LocalContentChoice): Promise<string | undefined> {
+    const startedAt = Date.now();
     try {
       const copyPath = await this.runExclusiveSyncService(service =>
         service.resolveLocalContent(path, reviewToken, choice),
       );
       this.pendingLocalIssues = this.pendingLocalIssues.filter(issue => !("path" in issue && issue.path === path));
       await this.requestSync();
+      // 保留本机版本：S3 改成本机内容；使用 S3 版本或两份都保留：本机改成 S3 内容，两份都保留时另存一份本机副本
+      const label = {local: "保留本机版本", remote: "使用 S3 版本", both: "两份都保留"}[choice];
+      await this.recordManualActivity(startedAt, `处理本地内容（${label}）：${fileName(path)}`, [
+        ...(copyPath ? [{kind: "added" as const, path: copyPath}] : []),
+        {kind: choice === "local" ? "modified" : "updated", path},
+      ]);
       return copyPath;
     } catch (error) {
       this.showError(error);
@@ -755,11 +819,13 @@ export default class S3VaultSyncPlugin
   }
 
   async restoreRevision(entryId: string, revisionId: string): Promise<void> {
+    const startedAt = Date.now();
     try {
       await this.runExclusiveSyncService((service) =>
         service.restoreRevision(entryId, revisionId),
       );
       this.reportManualCompletion("历史版本已恢复。");
+      await this.recordEntryActivity(startedAt, "恢复历史版本", entryId, "restored");
     } catch (error) {
       this.showError(error);
       throw error;
@@ -776,11 +842,13 @@ export default class S3VaultSyncPlugin
   }
 
   async restoreDeleted(entryId: string, revisionId?: string): Promise<void> {
+    const startedAt = Date.now();
     try {
       await this.runExclusiveSyncService((service) =>
         service.restoreDeleted(entryId, revisionId),
       );
       this.reportManualCompletion("已删除的文件已作为新版本恢复。");
+      await this.recordEntryActivity(startedAt, "恢复已删除的文件", entryId, "restored");
     } catch (error) {
       this.showError(error);
       throw error;
@@ -1209,6 +1277,9 @@ export default class S3VaultSyncPlugin
     }
     const diagnostic = await this.diagnostics.start(this.acceptedCommit, this.data.settings.vaultId, triggers);
     this.activeRun = diagnostic;
+    // 这次同步的文件明细：下载按落地逐个收集（含 Head 重试前那次尝试已落地的），上传只取发布成功的结果
+    const downloads: SyncFileChange[] = [];
+    let uploads: SyncFileChange[] = [];
     let fullHashVerification = false;
     try {
       this.session.assertActive();
@@ -1287,6 +1358,7 @@ export default class S3VaultSyncPlugin
               forceHashPaths: new Set(dirtySnapshot.keys()),
               fullHashVerification:
                 fullHashVerification && attempt === 1,
+              onDownloadApplied: change => downloads.push(change),
               pathRenames: this.pathRenames.toPathMap(pathRenameSnapshot),
               renameResolution: this.approvedRenameResolution,
               retryHashMemo,
@@ -1306,6 +1378,7 @@ export default class S3VaultSyncPlugin
       this.pendingLocalIssues = result.localIssues;
       this.pendingDeferredDownloads = result.deferredDownloadEntries;
       diagnostic.outcome = result.status;
+      uploads = result.uploads;
       diagnostic.counts = {uploaded: result.uploaded, downloaded: result.downloaded, deleted: result.deleted,
         deferred: result.deferredDownloads, unsynced: result.unsyncedLocalEntries};
       if (result.cacheUpdated) {diagnostic.pendingUploads = 0; diagnostic.pendingDownloads = 0;}
@@ -1404,6 +1477,7 @@ export default class S3VaultSyncPlugin
       diagnostic.nextRetryAt = this.networkRetryAt ?? this.headRetryAt;
       this.activeRun = undefined;
       await this.diagnostics.finish(diagnostic);
+      await this.syncActivity?.recordSync(diagnostic, uploads, downloads);
       this.emitStatus();
       if (
         !this.session.signal.aborted &&
@@ -1600,15 +1674,30 @@ export default class S3VaultSyncPlugin
       | { kind: "keep-deleted" }
       | { kind: "restore-candidate"; revisionId: string },
   ): Promise<void> {
+    const startedAt = Date.now();
     try {
       await this.runExclusiveSyncService((service) =>
         service.resolveConflict(entryId, resolution),
       );
       this.reportManualCompletion("冲突处理结果已保存到 S3。");
+      await (resolution.kind === "keep-deleted"
+        ? this.recordEntryActivity(startedAt, "处理冲突（保留删除）", entryId, "deleted")
+        : this.recordEntryActivity(startedAt, "处理冲突", entryId, "modified"));
     } catch (error) {
       this.showError(error);
       throw error;
     }
+  }
+
+  // 手动操作成功完成后记一条本机同步记录；手机、平板上什么都不做
+  private async recordManualActivity(startedAt: number, summary: string, files: SyncActivityFile[]): Promise<void> {
+    await this.syncActivity?.recordManual(this.data.settings.vaultId, startedAt, summary, files);
+  }
+
+  // 按 entryId 在接受的状态里找到文件路径，记一条只涉及这个文件的手动操作
+  private recordEntryActivity(startedAt: number, label: string, entryId: string, kind: SyncActivityFile["kind"]): Promise<void> {
+    const path = this.data.cache?.snapshot.entries[entryId]?.path ?? "";
+    return this.recordManualActivity(startedAt, `${label}：${fileName(path)}`, path ? [{kind, path}] : []);
   }
 
   private reportManualCompletion(detail: string): void {

@@ -56,7 +56,7 @@ const GROUPS: Array<{kind: CleanupCandidate["kind"]; label: string; note?: strin
 ];
 
 // 大小只用于显示，按 1024 进位
-const formatSize = (bytes: number): string =>
+export const formatSize = (bytes: number): string =>
   bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(1)} GB`
     : bytes >= 1024 ** 2 ? `${(bytes / 1024 ** 2).toFixed(1)} MB`
       : bytes === 0 ? "0 KB" : `${Math.max(1, Math.round(bytes / 1024))} KB`;
