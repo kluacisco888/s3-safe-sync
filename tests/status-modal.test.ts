@@ -954,6 +954,70 @@ describe("StatusModal", () => {
       expect(textsIn(bodyOf(rows[5]!)).some(text => text.startsWith("开始"))).toBe(false);
     });
 
+    const dayOf = (modal: StatusModal, title: string): FakeElement => all(sectionOf(modal)!).find(node =>
+      node.classes.has("s3-vault-sync-records-day") && node.children[0]!.text === title)!;
+    const quietOf = (day: FakeElement): FakeElement | undefined => day.children.at(-1)!.classes.has("s3-vault-sync-records-quiet") ? day.children.at(-1) : undefined;
+
+    it("ends each day with the number of checks that changed nothing, taken from the diagnostics of that day", () => {
+      const modal = open(controllerWith([
+        sync("one", at("2026-10-25T16:55:36"), {uploads: [{kind: "added", path: "a.md"}]}),
+        sync("yday", at("2026-10-24T12:00:00"), {uploads: [{kind: "added", path: "b.md"}]}),
+        sync("edge", at("2026-10-18T09:00:00"), {uploads: [{kind: "added", path: "c.md"}]}),
+      ], [
+        run("q1", at("2026-10-25T00:00:01")), run("q2", at("2026-10-25T08:00:00")), run("q3", at("2026-10-25T16:00:00")),
+        run("q4", at("2026-10-25T09:00:00"), {triggers: ["foreground"]}),
+        run("one", at("2026-10-25T16:55:36"), {triggers: ["edit"], counts: {uploaded: 1, downloaded: 0, deleted: 0, deferred: 0, unsynced: 0}}),
+        run("legacy", at("2026-10-25T10:00:00"), {counts: {uploaded: 0, downloaded: 0, deleted: 1, deferred: 0, unsynced: 0}}),
+        run("failed", at("2026-10-25T11:00:00"), {outcome: "error", errorCategory: "network"}),
+        run("y1", at("2026-10-24T23:59:59")),
+        run("e1", at("2026-10-18T20:00:00")),
+      ]));
+      const today = quietOf(dayOf(modal, "今天 · 10月25日 周日"))!;
+      const line = today.children.find(child => child.classes.has("s3-vault-sync-records-quiet-line"))!;
+      expect(textsIn(line)[0]).toBe("另有 4 次检查，没有改动任何文件");
+      const body = (): string[] => textsIn(today.children.find(child => child.classes.has("s3-vault-sync-records-quiet-body"))!);
+      expect(body()).toEqual([]);
+      click(line);
+      expect(body()).toEqual(["定时检查 3 次 · 回到前台 1 次。每次都成功完成。"]);
+      press(line, "Enter");
+      expect(body()).toEqual([]);
+      expect(line.attrs.get("role")).toBe("button");
+      expect(textsIn(quietOf(dayOf(modal, "昨天 · 10月24日 周六"))!)[0]).toBe("另有 1 次检查，没有改动任何文件");
+      // 10 月 18 日下午 4 点 20 分以后的诊断还在，这一天照样数
+      expect(textsIn(quietOf(dayOf(modal, "10月18日 周日"))!)[0]).toBe("另有 1 次检查，没有改动任何文件");
+    });
+
+    it("says that quiet checks of the days past the 7-day diagnostics are no longer kept", () => {
+      const modal = open(controllerWith([
+        sync("old", at("2026-10-17T22:36:08"), {uploads: [{kind: "added", path: "a.md"}]}),
+        sync("older", at("2026-10-12T20:18:44"), {uploads: [{kind: "added", path: "b.md"}]}),
+      ], [run("r", at("2026-10-25T08:00:00"))]));
+      for (const title of ["10月17日 周六", "10月12日 周一"]) {
+        expect(dayOf(modal, title).children.at(-1)!.text).toBe("超过 7 天，没有改动的检查已经不保留。");
+      }
+    });
+
+    it("keeps an opened quiet-check line open after the status refresh redraws the window", () => {
+      const listeners = new Set<(status: {text: string}) => void>();
+      const controller = {...controllerWith([sync("one", at("2026-10-25T16:55:36"), {uploads: [{kind: "added", path: "a.md"}]})],
+        [run("q", at("2026-10-25T08:00:00"))]),
+      onStatusChange: (listener: (status: {text: string}) => void) => {listeners.add(listener); return () => listeners.delete(listener);}};
+      const modal = open(controller);
+      click(quietOf(dayOf(modal, "今天 · 10月25日 周日"))!.children[0]!);
+      for (const listener of listeners) listener({text: "空闲：同步完成"});
+      const quiet = quietOf(dayOf(modal, "今天 · 10月25日 周日"))!;
+      expect(quiet.classes.has("is-open")).toBe(true);
+      expect(textsIn(quiet)).toContain("定时检查 1 次。每次都成功完成。");
+    });
+
+    it("says so when there is no record yet, and shows the warning when the record file could not be read", () => {
+      const empty = open(controllerWith([]));
+      expect(textsIn(sectionOf(empty)!)).toEqual(expect.arrayContaining(["本设备 · 0 次有改动或需要注意", "最近 30 天还没有改动过文件的同步。"]));
+      const broken = open(controllerWith([], [], "无法读取本地同步记录。同步数据没有受影响。"));
+      const warning = all(sectionOf(broken)!).find(node => node.text === "无法读取本地同步记录。同步数据没有受影响。")!;
+      expect(warning.classes.has("s3-vault-sync-error")).toBe(true);
+    });
+
     it("does not draw the sync records on a phone or tablet, where there is no sync activity", () => {
       const without = open({...issueController([]), getDeletedRecoveries: () => []});
       expect(sectionOf(without)).toBeUndefined();

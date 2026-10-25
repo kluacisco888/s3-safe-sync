@@ -471,7 +471,7 @@ export class StatusModal extends Modal {
     if (!activity) return;
     const section = this.collapsibleSection(container, "records", "同步记录（最近 30 天）",
       `本设备 · ${activity.records.length} 次有改动或需要注意`);
-    renderSyncRecords(section, activity, this.openRecordRows);
+    renderSyncRecords(section, activity, this.controller.getDiagnostics?.(1_000).records ?? [], this.openRecordRows);
   }
 
   private renderBulkDeletion(container: HTMLElement): void {

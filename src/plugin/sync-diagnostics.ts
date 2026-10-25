@@ -54,7 +54,7 @@ export interface SyncDiagnosticsView extends SyncDiagnosticsSnapshot {
 }
 
 const MAX_RECORDS = 1_000;
-const RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+export const RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 export const identifier = (value: unknown): string | undefined =>
   typeof value === "string" && /^[\w.:-]{1,128}$/u.test(value) ? value : undefined;
 export const nonnegative = (value: unknown): number | undefined =>

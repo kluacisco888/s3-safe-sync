@@ -1,6 +1,6 @@
 import type { SyncActivityFile, SyncActivityRecord, SyncActivitySnapshot } from "./sync-activity";
 import { formatLocalClock } from "./local-time";
-import { PHASES } from "./sync-diagnostics";
+import { PHASES, RETENTION_MS as DIAGNOSTICS_RETENTION_MS, type SyncRunRecord } from "./sync-diagnostics";
 import { errorCategoryLabels, fileKindLabels, outcomeLabels, phaseLabels, triggerLabels } from "./sync-labels";
 
 // 同步状态窗口里的「同步记录（最近 30 天）」：按本机时区的天分组，点一行展开这次同步的详情
@@ -147,9 +147,48 @@ const renderRecord = (container: HTMLElement, record: SyncActivityRecord, openRo
   expandable(item, line, body, `record:${record.id}`, openRows, () => renderDetails(body, record));
 };
 
-/** 画进已经建好的折叠区块里；openRows 是用户展开的行，由窗口保管 */
-export const renderSyncRecords = (section: HTMLElement, activity: SyncActivitySnapshot, openRows: Set<string>, now = Date.now()): void => {
+/**
+ * 每天最后一行：诊断日志里这一天结果是 complete、没有改动文件的运行次数，点开按触发原因分类。
+ * 诊断日志只留 7 天，整天都在 7 天以前的写「已经不保留」
+ */
+const renderQuietChecks = (day: HTMLElement, start: number, quietRuns: readonly SyncRunRecord[], openRows: Set<string>, now: number): void => {
+  if (dayStart(start, 1) <= now - DIAGNOSTICS_RETENTION_MS) {
+    day.createDiv({cls: "s3-vault-sync-records-older s3-vault-sync-muted", text: "超过 7 天，没有改动的检查已经不保留。"});
+    return;
+  }
+  const runs = quietRuns.filter(run => dayStart(run.startedAt) === start);
+  if (runs.length === 0) return;
+  const byTrigger = new Map<string, number>();
+  for (const run of runs) {
+    const label = run.triggers[0] ? triggerLabels[run.triggers[0]] : "其他";
+    byTrigger.set(label, (byTrigger.get(label) ?? 0) + 1);
+  }
+  const item = day.createDiv({cls: "s3-vault-sync-records-quiet"});
+  const line = item.createDiv({cls: "s3-vault-sync-records-quiet-line"});
+  line.createSpan({text: `另有 ${runs.length} 次检查，没有改动任何文件`});
+  line.createSpan({cls: "s3-vault-sync-record-arrow", text: "›"});
+  const body = item.createDiv({cls: "s3-vault-sync-records-quiet-body"});
+  expandable(item, line, body, `quiet:${start}`, openRows, () => body.createSpan({
+    text: `${[...byTrigger].sort((left, right) => right[1] - left[1]).map(([label, count]) => `${label} ${count} 次`).join(" · ")}。每次都成功完成。`,
+  }));
+};
+
+/**
+ * 画进已经建好的折叠区块里。runs 是诊断日志里的运行（只用来数没有改动的检查），
+ * openRows 是用户展开的行，由窗口保管
+ */
+export const renderSyncRecords = (section: HTMLElement, activity: SyncActivitySnapshot, runs: readonly SyncRunRecord[],
+  openRows: Set<string>, now = Date.now()): void => {
   section.createEl("p", {cls: "s3-vault-sync-muted", text: HINT});
+  if (activity.persistenceWarning) section.createEl("p", {cls: "s3-vault-sync-error", text: activity.persistenceWarning});
+  if (activity.records.length === 0) {
+    section.createEl("p", {cls: "s3-vault-sync-muted", text: "最近 30 天还没有改动过文件的同步。"});
+    return;
+  }
+  // 进了同步记录的运行都动过文件或出了问题；旧版本留下的运行再按结果里的数量排除一次
+  const recorded = new Set(activity.records.map(record => record.id));
+  const quietRuns = runs.filter(run => run.outcome === "complete" && !recorded.has(run.id) &&
+    (run.counts?.uploaded ?? 0) + (run.counts?.downloaded ?? 0) + (run.counts?.deleted ?? 0) === 0);
   const days = new Map<number, SyncActivityRecord[]>();
   for (const record of [...activity.records].sort((left, right) => right.startedAt - left.startedAt)) {
     const start = dayStart(record.startedAt);
@@ -159,5 +198,6 @@ export const renderSyncRecords = (section: HTMLElement, activity: SyncActivitySn
     const day = section.createDiv({cls: "s3-vault-sync-records-day"});
     day.createDiv({cls: "s3-vault-sync-records-day-title", text: dayLabel(start, now)});
     for (const record of records) renderRecord(day, record, openRows);
+    renderQuietChecks(day, start, quietRuns, openRows, now);
   }
 };
