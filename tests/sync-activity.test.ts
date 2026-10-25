@@ -102,9 +102,27 @@ describe("local sync activity", () => {
     await activity.recordSync(retrying, [], []);
     expect(activity.snapshot().records).toEqual([{
       id: retrying.id, vaultId: "vault-1", kind: "sync", startedAt: retrying.startedAt, finishedAt: retrying.finishedAt,
-      triggers: ["edit"], outcome: "retrying", phase: "hashing", phaseDurations: {hashing: 20, uploading: 300},
+      triggers: ["edit"], outcome: "retrying", phase: "hashing", errorCategory: "local-change", phaseDurations: {hashing: 20, uploading: 300},
       requests: 12, sentBytes: 2_048, receivedBytes: 4_096, uploads: [], downloads: [],
     }]);
+  });
+
+  it("keeps the error category of a synchronization that failed or has to retry, and drops an unknown one when loading", async () => {
+    const storage = memoryStorage();
+    const activity = new SyncActivity(storage);
+    await activity.load();
+
+    await activity.recordSync(run({id: "network", outcome: "retrying", errorCategory: "network"}), [], []);
+    await activity.recordSync(run({id: "service", outcome: "error", errorCategory: "service"}), [], []);
+
+    expect(activity.snapshot().records.map(record => record.errorCategory)).toEqual(["network", "service"]);
+    const reloaded = new SyncActivity(memoryStorage(stored([
+      ...(storage.value as {records: unknown[]}).records,
+      {...run({id: "odd"}), kind: "sync", outcome: "error", errorCategory: "INJECTED", uploads: [], downloads: []},
+    ])));
+    await reloaded.load();
+    expect(reloaded.snapshot().records.map(record => record.errorCategory)).toEqual(["network", "service", undefined]);
+    expect(JSON.stringify(reloaded.snapshot())).not.toContain("INJECTED");
   });
 
   it("records a manual operation with its summary and files", async () => {

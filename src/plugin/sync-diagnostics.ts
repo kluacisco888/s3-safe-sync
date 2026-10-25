@@ -4,7 +4,7 @@ export const SYNC_TRIGGERS = ["startup", "manual", "edit", "periodic", "foregrou
 export type SyncTrigger = typeof SYNC_TRIGGERS[number];
 export const PHASES = ["recovery", "remote", "scanning", "hashing", "uploading", "downloading", "publishing", "saving"] as const;
 export type SyncPhase = typeof PHASES[number];
-const ERROR_CATEGORIES = ["network", "timeout", "service", "authentication", "remote-integrity", "local-change", "head-race", "cancelled", "unknown"] as const;
+export const ERROR_CATEGORIES = ["network", "timeout", "service", "authentication", "remote-integrity", "local-change", "head-race", "cancelled", "unknown"] as const;
 export type SyncErrorCategory = typeof ERROR_CATEGORIES[number];
 export interface SyncRunCounts {uploaded: number; downloaded: number; deleted: number; deferred: number; unsynced: number;}
 // 这次同步之后的过期内容清理：只记时间和数量，不记路径

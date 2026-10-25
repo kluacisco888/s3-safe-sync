@@ -1,6 +1,6 @@
 import type { SyncFileChange } from "../sync/sync-service";
 import { SerializedDataWriter } from "./serialized-data-writer";
-import { PHASES, SYNC_TRIGGERS, identifier, nonnegative, type SyncPhase, type SyncRunRecord, type SyncTrigger } from "./sync-diagnostics";
+import { ERROR_CATEGORIES, PHASES, SYNC_TRIGGERS, identifier, nonnegative, type SyncErrorCategory, type SyncPhase, type SyncRunRecord, type SyncTrigger } from "./sync-diagnostics";
 
 // 本机同步记录（sync-activity.json）：只在电脑上，含文件路径，保留 30 天；和诊断日志分开存，不进导出
 // 记录里的一个文件：同步时的上传和下载，加上手动操作的「恢复」
@@ -27,6 +27,8 @@ export interface SyncActivityRecord {
   // 超出 200 个的文件只记数量
   moreFiles?: number;
   phase?: SyncPhase;
+  // 出错或重试时的错误类型，窗口里据此写「网络出错」「文件还在被修改」等说明
+  errorCategory?: SyncErrorCategory;
   phaseDurations?: Partial<Record<SyncPhase, number>>;
   requests?: number;
   sentBytes?: number;
@@ -85,6 +87,7 @@ const parseRecord = (value: unknown): SyncActivityRecord | undefined => {
   const {kept: [uploads = [], downloads = [], files = []], moreFiles} = capFiles(
     [parseFiles(record.uploads), parseFiles(record.downloads), parseFiles(record.files)], nonnegative(record.moreFiles) ?? 0);
   const phase = PHASES.find(known => known === record.phase);
+  const errorCategory = ERROR_CATEGORIES.find(known => known === record.errorCategory);
   const summary = text(record.summary, 500);
   return {
     id, ...(identifier(record.vaultId) ? {vaultId: identifier(record.vaultId)} : {}), kind, startedAt,
@@ -92,6 +95,7 @@ const parseRecord = (value: unknown): SyncActivityRecord | undefined => {
     triggers: SYNC_TRIGGERS.filter(trigger => triggers.includes(trigger)),
     outcome: outcome === "running" ? "interrupted" : outcome,
     ...(phase ? {phase} : {}),
+    ...(errorCategory ? {errorCategory} : {}),
     ...(durations ? {phaseDurations: Object.fromEntries(PHASES.flatMap(name => {
       const duration = nonnegative(durations[name]);
       return duration === undefined ? [] : [[name, duration]];
@@ -138,7 +142,7 @@ export class SyncActivity {
     this.records.push({
       id: run.id, ...(run.vaultId ? {vaultId: run.vaultId} : {}), kind: "sync", startedAt: run.startedAt,
       finishedAt: run.finishedAt ?? Date.now(), triggers: [...run.triggers], outcome: run.outcome, phase: run.phase,
-      phaseDurations: {...run.phaseDurations}, requests: run.requests, sentBytes: run.sentBytes, receivedBytes: run.receivedBytes,
+      ...(run.errorCategory ? {errorCategory: run.errorCategory} : {}), phaseDurations: {...run.phaseDurations}, requests: run.requests, sentBytes: run.sentBytes, receivedBytes: run.receivedBytes,
       uploads: keptUploads, downloads: keptDownloads, ...(moreFiles !== undefined ? {moreFiles} : {}),
     });
     await this.save();
