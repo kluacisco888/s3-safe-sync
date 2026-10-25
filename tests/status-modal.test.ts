@@ -17,7 +17,9 @@ const { Element, opened, dropdowns } = vi.hoisted(() => {
     constructor(readonly tag: string) {}
     empty() { this.children = []; }
     addClass(value: string) { this.classes.add(value); }
-    setAttr() {}
+    toggleClass(value: string, on: boolean) { if (on) this.classes.add(value); else this.classes.delete(value); }
+    attrs = new Map<string, string>();
+    setAttr(name: string, value: string | number | boolean) { this.attrs.set(name, String(value)); }
     addEventListener(name: string, handler: () => void) { this.events.set(name, handler); }
     setText(text: string) { this.text = text; }
     createEl(tag: string, options: { text?: string; cls?: string; type?: string } = {}) {
@@ -64,6 +66,8 @@ vi.mock("obsidian", () => ({
 import { StatusModal, VersionHistoryModal, type StatusModalController } from "../src/plugin/modals";
 import type { CleanupController, CleanupView } from "../src/plugin/cleanup-modal";
 import type { CleanupCandidate, LocalSyncIssue } from "../src/sync/sync-service";
+import type { SyncActivityRecord } from "../src/plugin/sync-activity";
+import type { SyncRunRecord } from "../src/plugin/sync-diagnostics";
 
 const reviewActions = {
   reviewPathCollision: async (paths: string[]) => ({paths, reviewToken: "collision-review", localFiles: [], remoteFiles: [], relatedPaths: [], pendingMoves: []}),
@@ -718,6 +722,99 @@ describe("StatusModal", () => {
       (target.events.get("keydown") as unknown as (event: {key: string; preventDefault(): void}) => void)(
         {key: "Enter", preventDefault() {}});
       expect(all(opened.at(-1)!.contentEl).some(node => node.text === "5 字节 · 可恢复至 2026-11-05 09:11")).toBe(true);
+    });
+  });
+
+  describe("sync records", () => {
+    type FakeElement = InstanceType<typeof Element>;
+    const all = (root: FakeElement): FakeElement[] => [root, ...root.children.flatMap(all)];
+    // 设备时间 2026-10-25 周日 16:20（上海时区）
+    const now = "2026-10-25T08:20:00Z";
+    const at = (local: string): number => Date.parse(`${local}+08:00`);
+    const sync = (id: string, startedAt: number, extra: Partial<SyncActivityRecord> = {}): SyncActivityRecord => ({
+      id, vaultId: "vault", kind: "sync", startedAt, finishedAt: startedAt + 1_737, triggers: ["edit"], outcome: "complete",
+      uploads: [], downloads: [], phase: "saving", phaseDurations: {}, requests: 98, sentBytes: 14_540, receivedBytes: 53_043, ...extra,
+    });
+    const manual = (id: string, startedAt: number, summary: string, files: SyncActivityRecord["uploads"]): SyncActivityRecord => ({
+      id, vaultId: "vault", kind: "manual", startedAt, finishedAt: startedAt + 20, triggers: [], outcome: "complete",
+      uploads: [], downloads: [], files, summary,
+    });
+    const run = (id: string, startedAt: number, extra: Partial<SyncRunRecord> = {}): SyncRunRecord => ({
+      id, vaultId: "vault", startedAt, finishedAt: startedAt + 500, outcome: "complete", triggers: ["periodic"], phase: "saving",
+      phaseDurations: {}, requests: 90, sentBytes: 0, receivedBytes: 0,
+      counts: {uploaded: 0, downloaded: 0, deleted: 0, deferred: 0, unsynced: 0}, ...extra,
+    });
+    const controllerWith = (records: SyncActivityRecord[], runs: SyncRunRecord[] = [], persistenceWarning?: string): StatusModalController => ({
+      ...issueController([]),
+      getSyncActivity: () => ({records, ...(persistenceWarning ? {persistenceWarning} : {})}),
+      getDiagnostics: () => ({records: runs, queued: false, pendingLocalChanges: 0}),
+    });
+    const open = (controller: StatusModalController): StatusModal => {
+      const modal = new StatusModal({} as App, controller);
+      modal.onOpen();
+      return modal;
+    };
+    const nodesOf = (modal: StatusModal): FakeElement[] => all(modal.contentEl as unknown as FakeElement);
+    const sectionOf = (modal: StatusModal): FakeElement | undefined => nodesOf(modal).find(node => node.tag === "details" &&
+      node.children.some(child => child.tag === "summary" && all(child).some(part => part.text === "同步记录（最近 30 天）")));
+    const rowsOf = (modal: StatusModal): FakeElement[] => all(sectionOf(modal)!).filter(node => node.classes.has("s3-vault-sync-record"));
+    const lineOf = (row: FakeElement): FakeElement => row.children.find(child => child.classes.has("s3-vault-sync-record-line"))!;
+    const lineTexts = (row: FakeElement): string[] => lineOf(row).children.map(child => child.text);
+    const textsIn = (node: FakeElement): string[] => all(node).map(child => child.text).filter(text => text !== "");
+    const click = (node: FakeElement): void => node.events.get("click")!();
+    const press = (node: FakeElement, key: string): void =>
+      (node.events.get("keydown") as unknown as (event: {key: string; preventDefault(): void}) => void)({key, preventDefault() {}});
+    beforeEach(() => {vi.useFakeTimers({toFake: ["Date"]}); vi.setSystemTime(new Date(now));});
+    afterEach(() => {vi.useRealTimers();});
+
+    it("folds the records by default under a title that counts them, and replaces the old 20-line history", () => {
+      const modal = open(controllerWith([
+        sync("one", at("2026-10-25T16:55:36"), {uploads: [{kind: "modified", path: "1-Projects/日志.md"}]}),
+        sync("two", at("2026-10-24T22:41:17"), {downloads: [{kind: "added", path: "录音/周会.md"}]}),
+      ], [run("quiet", at("2026-10-25T16:00:00"))]));
+      const section = sectionOf(modal)!;
+      expect(section.open).toBe(false);
+      const title = section.children.find(child => child.tag === "summary")!;
+      expect(title.classes.has("s3-vault-sync-section-title")).toBe(true);
+      expect(textsIn(title)).toEqual(expect.arrayContaining(["同步记录（最近 30 天）", "本设备 · 2 次有改动或需要注意"]));
+      expect(textsIn(section)).toContain("只列出动过文件、出错、需要重试的同步，以及你的手动操作。点一行查看这次同步的详情，再点一次收起。没有改动任何文件的检查，每天合成一行，只保留 7 天。");
+      expect(nodesOf(modal).some(node => node.text.startsWith("最近的同步记录"))).toBe(false);
+    });
+
+    it("groups the records by local day, newest first, and labels today and yesterday", () => {
+      const modal = open(controllerWith([
+        sync("old", at("2026-10-21T15:03:47"), {uploads: [{kind: "added", path: "图纸/新.pdf"}]}),
+        sync("late", at("2026-10-24T23:59:58"), {uploads: [{kind: "added", path: "a.md"}]}),
+        sync("early", at("2026-10-25T00:00:03"), {uploads: [{kind: "added", path: "b.md"}]}),
+        sync("noon", at("2026-10-25T12:00:00"), {uploads: [{kind: "added", path: "c.md"}]}),
+      ]));
+      const days = all(sectionOf(modal)!).filter(node => node.classes.has("s3-vault-sync-records-day"));
+      expect(days.map(day => day.children[0]!.text)).toEqual(["今天 · 10月25日 周日", "昨天 · 10月24日 周六", "10月21日 周三"]);
+      // 两次同步隔着本机的午夜，分在两天（按 UTC 它们都在 10 月 24 日）
+      expect(days.map(day => all(day).filter(node => node.classes.has("s3-vault-sync-record")).map(row => lineTexts(row)[0])))
+        .toEqual([["12:00:00", "00:00:03"], ["23:59:58"], ["15:03:47"]]);
+    });
+
+    it("writes the time, trigger, what changed and the result on each row", () => {
+      const modal = open(controllerWith([
+        sync("one", at("2026-10-25T16:55:36"), {uploads: [{kind: "modified", path: "1-Projects/日志.md"}]}),
+        sync("two", at("2026-10-25T16:54:10"), {uploads: [{kind: "modified", path: "1-Projects/日志.md"}, {kind: "added", path: "附件/图.png"}],
+          downloads: [{kind: "updated", path: "待办.md"}]}),
+        sync("three", at("2026-10-25T07:42:05"), {triggers: ["startup"], downloads: [{kind: "moved", fromPath: "旧/甲.md", path: "新/甲.md"}]}),
+      ]));
+      expect(rowsOf(modal).map(lineTexts)).toEqual([
+        ["16:55:36", "编辑后同步", "上传 1 个：修改 日志.md", "完成", "›"],
+        ["16:54:10", "编辑后同步", "上传 2 个 · 下载 1 个：日志.md 等", "完成", "›"],
+        ["07:42:05", "启动时同步", "下载 1 个：挪动 甲.md", "完成", "›"],
+      ]);
+    });
+
+    it("does not draw the sync records on a phone or tablet, where there is no sync activity", () => {
+      const without = open({...issueController([]), getDeletedRecoveries: () => []});
+      expect(sectionOf(without)).toBeUndefined();
+      const mobile = open({...issueController([]), getSyncActivity: () => undefined});
+      expect(sectionOf(mobile)).toBeUndefined();
+      expect(nodesOf(mobile).some(node => node.text.includes("同步记录"))).toBe(false);
     });
   });
 });

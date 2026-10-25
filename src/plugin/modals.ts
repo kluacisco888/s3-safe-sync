@@ -29,11 +29,15 @@ import { PathCollisionModal } from "./path-collision-modal";
 import type { PathCollisionReview, PathCollisionResolution } from "../sync/path-collision-review";
 import type { SyncDiagnosticsView } from "./sync-diagnostics";
 import { errorCategoryLabels, phaseLabels } from "./sync-labels";
+import type { SyncActivitySnapshot } from "./sync-activity";
+import { renderSyncRecords } from "./sync-records-view";
 
 export interface StatusModalController {
   // 电脑上返回「待清理」的控制器；手机上返回 undefined，按钮栏里没有这个按钮
   cleanupController?(): CleanupController | undefined;
   getDiagnostics?(limit?: number): SyncDiagnosticsView;
+  // 本机同步记录；手机、平板上返回 undefined，窗口里没有「同步记录」这一节
+  getSyncActivity?(): SyncActivitySnapshot | undefined;
   exportDiagnostics?(): string;
   reviewPathCollision(paths: string[]): Promise<PathCollisionReview>;
   resolvePathCollision(request: PathCollisionResolution): Promise<string>;
@@ -356,18 +360,18 @@ export class StatusModal extends Modal {
     const controls = this.contentEl.createDiv();
     const diagnostics = this.contentEl.createDiv({cls: "s3-vault-sync-diagnostics"});
     const details = this.contentEl.createDiv();
-    const history = this.contentEl.createDiv({cls: "s3-vault-sync-diagnostics"});
+    const records = this.contentEl.createDiv({cls: "s3-vault-sync-diagnostics"});
     const render = (): void => {
       controls.empty();
       details.empty();
       this.renderActions(controls);
       this.renderDiagnostics(diagnostics);
-      this.renderDiagnosticHistory(history);
       this.renderBulkDeletion(details);
       this.renderConflicts(details);
       this.renderLocalIssues(details);
       this.renderDeferredDownloads(details);
       this.renderDeletedRecoveries(details);
+      this.renderSyncRecords(records);
     };
     render();
     this.stopStatusUpdates = this.controller.onStatusChange(display => {
@@ -458,16 +462,14 @@ export class StatusModal extends Modal {
     container.createEl("small", {text: "这些记录只描述本设备。发布到 S3 并不代表其他设备已收到文件。即使提交 ID 一致，也可能还有暂缓下载的文件。"});
   }
 
-  private renderDiagnosticHistory(container: HTMLElement): void {
+  // 「同步记录（最近 30 天）」放在「已删除的文件」下面；只在电脑上有
+  private renderSyncRecords(container: HTMLElement): void {
     container.empty();
-    const view = this.controller.getDiagnostics?.(20);
-    if (!view?.records.length) return;
-    const details = container.createEl("details");
-    details.createEl("summary", {text: "最近的同步记录（最多 20 条）"});
-    for (const record of [...view.records].reverse()) {
-      const elapsed = record.finishedAt === undefined ? "未完成" : `${Math.max(0, record.finishedAt - record.startedAt)} 毫秒`;
-      details.createEl("p", {text: `${new Date(record.startedAt).toLocaleString()} · ${record.triggers.join(", ")} · ${record.outcome} · ${record.phase} · ${elapsed} · ${record.requests} 次请求${record.errorCategory ? ` · ${record.errorCategory}` : ""}`});
-    }
+    const activity = this.controller.getSyncActivity?.();
+    if (!activity) return;
+    const section = this.collapsibleSection(container, "records", "同步记录（最近 30 天）",
+      `本设备 · ${activity.records.length} 次有改动或需要注意`);
+    renderSyncRecords(section, activity);
   }
 
   private renderBulkDeletion(container: HTMLElement): void {
