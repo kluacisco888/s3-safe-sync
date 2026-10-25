@@ -73,11 +73,29 @@ const renderFiles = (container: HTMLElement, title: string, files: readonly Sync
   if (more > 0) group.createEl("p", {cls: "s3-vault-sync-muted", text: `只记录了前 200 个文件名，另有 ${more} 个没有列出。`});
 };
 
+/** 详情最上面的一句说明：出错和重试时说发生了什么；只有下载时说明看不出是哪台设备改的 */
+const explanation = (record: SyncActivityRecord): string => {
+  if (record.kind === "manual") return "";
+  const category = record.errorCategory;
+  const problem = category === "local-change" ? "同步时文件还在被修改，插件先停下，等编辑停下几秒后重新同步。这不算出错，没有丢任何改动。"
+    : category === "network" || category === "timeout" ? `${errorCategoryLabels[category]}，连不上 S3。`
+    : category ? `${errorCategoryLabels[category]}。` : "";
+  const retry = record.outcome === "retrying" && category !== "local-change" ? "稍后会自动重试。" : "";
+  const downloadsOnly = record.uploads.length === 0 && record.downloads.length > 0
+    ? "下载的文件是别的设备改的。本机只知道从 S3 下载了，看不出是哪台设备改的。" : "";
+  return `${problem}${retry}${downloadsOnly}`;
+};
+
 const renderDetails = (body: HTMLElement, record: SyncActivityRecord): void => {
+  const note = explanation(record);
+  if (note) body.createEl("p", {cls: "s3-vault-sync-record-explain", text: note});
   const more = unlisted(record);
+  if (record.kind === "manual") {
+    renderFiles(body, "涉及的文件", record.files ?? [], more.files);
+    return;
+  }
   renderFiles(body, "上传到 S3", record.uploads, more.uploads);
   renderFiles(body, "从 S3 下载", record.downloads, more.downloads);
-  if (record.kind === "manual") return;
   body.createDiv({cls: "s3-vault-sync-record-tech", text: `开始 ${formatLocalClock(record.startedAt)} · 用时 ${duration(record.finishedAt - record.startedAt)}`
     + ` · ${record.requests ?? 0} 次请求 · 发送 ${size(record.sentBytes ?? 0)} / 接收 ${size(record.receivedBytes ?? 0)}`});
   const phases = PHASES.flatMap(phase => {

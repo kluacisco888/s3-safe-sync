@@ -895,6 +895,65 @@ describe("StatusModal", () => {
       expect(rowsOf(modal).map(row => row.classes.has("is-open"))).toEqual([false, false]);
     });
 
+    it("counts the files past the 200 kept names and says how many are not listed", () => {
+      const uploads = Array.from({length: 200}, (_, index) => ({kind: "added" as const, path: `剪藏/第${String(index + 1).padStart(3, "0")}篇.md`}));
+      const modal = open(controllerWith([sync("many", at("2026-10-25T10:00:00"), {uploads, moreFiles: 1})]));
+      const [row] = rowsOf(modal);
+      expect(lineTexts(row!)[2]).toBe("上传 201 个：第001篇.md 等");
+      click(lineOf(row!));
+      const [group] = groupsOf(row!);
+      expect(group!.title).toBe("上传到 S3（201 个）");
+      expect(group!.files).toHaveLength(200);
+      expect(group!.note).toBe("只记录了前 200 个文件名，另有 1 个没有列出。");
+      expect(all(bodyOf(row!)).find(node => node.tag === "ul")!.classes.has("s3-vault-sync-record-files")).toBe(true);
+    });
+
+    it("puts the unlisted files under downloads when some downloads were named", () => {
+      const uploads = Array.from({length: 150}, (_, index) => ({kind: "modified" as const, path: `上/${index}.md`}));
+      const downloads = Array.from({length: 50}, (_, index) => ({kind: "added" as const, path: `下/${index}.md`}));
+      const modal = open(controllerWith([sync("both", at("2026-10-25T10:00:00"), {uploads, downloads, moreFiles: 30})]));
+      const [row] = rowsOf(modal);
+      expect(lineTexts(row!)[2]).toBe("上传 150 个 · 下载 80 个：0.md 等");
+      click(lineOf(row!));
+      expect(groupsOf(row!).map(group => [group.title, group.files.length, group.note])).toEqual([
+        ["上传到 S3（150 个）", 150, undefined], ["从 S3 下载（80 个）", 50, "只记录了前 200 个文件名，另有 30 个没有列出。"]]);
+    });
+
+    it("labels retries, errors, interrupted runs and manual operations, each with its own result style and explanation", () => {
+      const modal = open(controllerWith([
+        sync("editing", at("2026-10-25T16:53:50"), {outcome: "retrying", errorCategory: "local-change"}),
+        sync("offline", at("2026-10-25T16:40:00"), {outcome: "retrying", errorCategory: "network", triggers: ["periodic"]}),
+        sync("broken", at("2026-10-25T16:30:00"), {outcome: "error", errorCategory: "service"}),
+        sync("review", at("2026-10-25T16:20:00"), {outcome: "action-required", uploads: [{kind: "added", path: "甲.md"}]}),
+        sync("stopped", at("2026-10-25T16:10:00"), {outcome: "interrupted", triggers: ["shutdown"]}),
+        manual("restore", at("2026-10-25T09:05:12"), "恢复已删除的文件：旧报价.xlsx", [{kind: "restored", path: "4-Archives/旧报价.xlsx"}]),
+        sync("pulled", at("2026-10-25T07:42:05"), {triggers: ["startup"], downloads: [{kind: "updated", path: "待办.md"}]}),
+      ]));
+      const rows = rowsOf(modal);
+      expect(rows.map(row => lineTexts(row).slice(1, 4))).toEqual([
+        ["编辑后同步", "文件还在被修改，稍后重试", "稍后重试"],
+        ["定时检查", "网络出错，稍后重试", "稍后重试"],
+        ["编辑后同步", "S3 服务出错", "出错"],
+        ["编辑后同步", "上传 1 个：新增 甲.md", "需要处理"],
+        ["关闭前同步", "没有改动文件", "被中断"],
+        ["手动操作", "恢复已删除的文件：旧报价.xlsx", "手动操作"],
+        ["启动时同步", "下载 1 个：更新 待办.md", "完成"],
+      ]);
+      const styles = rows.map(row => [...lineOf(row).children[3]!.classes].find(name => name.startsWith("mod-")));
+      expect(styles).toEqual(["mod-retrying", "mod-retrying", "mod-error", "mod-action-required", "mod-interrupted", "mod-manual", "mod-complete"]);
+      const explain = (row: FakeElement): string | undefined => {
+        click(lineOf(row));
+        return all(bodyOf(row)).find(node => node.classes.has("s3-vault-sync-record-explain"))?.text;
+      };
+      expect(explain(rows[0]!)).toBe("同步时文件还在被修改，插件先停下，等编辑停下几秒后重新同步。这不算出错，没有丢任何改动。");
+      expect(explain(rows[1]!)).toBe("网络出错，连不上 S3。稍后会自动重试。");
+      expect(explain(rows[2]!)).toBe("S3 服务出错。");
+      expect(explain(rows[6]!)).toBe("下载的文件是别的设备改的。本机只知道从 S3 下载了，看不出是哪台设备改的。");
+      explain(rows[5]!);
+      expect(groupsOf(rows[5]!)).toEqual([{title: "涉及的文件（1 个）", files: [["恢复", "4-Archives/旧报价.xlsx"]]}]);
+      expect(textsIn(bodyOf(rows[5]!)).some(text => text.startsWith("开始"))).toBe(false);
+    });
+
     it("does not draw the sync records on a phone or tablet, where there is no sync activity", () => {
       const without = open({...issueController([]), getDeletedRecoveries: () => []});
       expect(sectionOf(without)).toBeUndefined();
