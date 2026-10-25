@@ -661,6 +661,37 @@ describe("StatusModal", () => {
       expect(texts).toContain("candidate.md");
     });
 
+    it("folds the list by default under a title that says how many files there are", () => {
+      const nodes = openWith([expired, fresh, candidateOnly]);
+      const section = nodes.find(node => node.tag === "details" &&
+        all(node).some(child => child.text === "已删除的文件（30 天内可恢复）"))!;
+      expect(section.open).toBe(false);
+      const title = section.children.find(child => child.tag === "summary")!;
+      expect(all(title).map(child => child.text)).toEqual(expect.arrayContaining(["已删除的文件（30 天内可恢复）", "2 个"]));
+      expect(title.classes.has("s3-vault-sync-section-title")).toBe(true);
+      expect(all(section).some(child => child.text === "fresh.md")).toBe(true);
+    });
+
+    it("keeps the list open after the status refresh redraws the window", () => {
+      const listeners = new Set<(status: {text: string}) => void>();
+      const controller = {...issueController([]), getDeletedRecoveries: () => [fresh],
+        onStatusChange: (listener: (status: {text: string}) => void) => {listeners.add(listener); return () => listeners.delete(listener);}};
+      const modal = new StatusModal({} as App, controller);
+      modal.onOpen();
+      const section = () => all(modal.contentEl as unknown as FakeElement).find(node => node.tag === "details" &&
+        all(node).some(child => child.text === "已删除的文件（30 天内可恢复）"))!;
+      const first = section();
+      first.open = true;
+      first.events.get("toggle")!();
+      for (const listener of listeners) listener({text: "空闲：同步完成"});
+      expect(section()).not.toBe(first);
+      expect(section().open).toBe(true);
+      section().open = false;
+      section().events.get("toggle")!();
+      modal.onOpen();
+      expect(section().open).toBe(false);
+    });
+
     it("shows each deletion time in the device time zone with the days left", () => {
       const texts = openWith([fresh, candidateOnly]).map(node => node.text).filter(text => text.startsWith("删除于"));
       // fresh 还剩 17 天 23 小时 11 分，向下取整；candidate 只剩 10 小时

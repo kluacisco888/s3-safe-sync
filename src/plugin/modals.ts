@@ -337,6 +337,8 @@ class DeletedFilePreviewModal extends Modal {
 export class StatusModal extends Modal {
   private stopStatusUpdates: (() => void) | undefined;
   private pauseButton: HTMLButtonElement | undefined;
+  // 用户展开的区块；状态刷新重画后照样展开
+  private readonly openSections = new Set<string>();
   constructor(
     app: App,
     private readonly controller: StatusModalController,
@@ -551,11 +553,11 @@ export class StatusModal extends Modal {
     if (deleted.length === 0) {
       return;
     }
-    container.createEl("h3", { text: "已删除的文件（30 天内可恢复）" });
+    const section = this.collapsibleSection(container, "deleted", "已删除的文件（30 天内可恢复）", `${deleted.length} 个`);
     for (const entry of deleted) {
       // 恢复副本已过期时按不可用处理，只提供历史版本
       const recovery = entry.recovery && isUnexpired(entry.recovery, now) ? entry.recovery : undefined;
-      const item = container.createDiv({ cls: "s3-vault-sync-deleted-row" });
+      const item = section.createDiv({ cls: "s3-vault-sync-deleted-row" });
       const previewTarget = item.createDiv({
         cls: "s3-vault-sync-deleted-preview",
       });
@@ -625,6 +627,21 @@ export class StatusModal extends Modal {
           });
       }
     }
+  }
+
+  // 默认折叠的区块：标题和「同步诊断」一样大小，左边有展开箭头，后面浅色小字写数量
+  private collapsibleSection(container: HTMLElement, key: string, title: string, count: string): HTMLDetailsElement {
+    const section = container.createEl("details", {cls: "s3-vault-sync-section"});
+    section.open = this.openSections.has(key);
+    section.addEventListener("toggle", () => {
+      if (section.open) this.openSections.add(key);
+      else this.openSections.delete(key);
+    });
+    const summary = section.createEl("summary", {cls: "s3-vault-sync-section-title"});
+    summary.createSpan({cls: "s3-vault-sync-section-arrow", text: "▶"});
+    summary.createSpan({text: title});
+    summary.createSpan({cls: "s3-vault-sync-section-count", text: count});
+    return section;
   }
 
   private renderIssueTools(item: HTMLElement, issue: LocalSyncIssue): void {
