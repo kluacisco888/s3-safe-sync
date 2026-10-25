@@ -2,7 +2,7 @@ import { SerializedDataWriter } from "./serialized-data-writer";
 
 export const SYNC_TRIGGERS = ["startup", "manual", "edit", "periodic", "foreground", "shutdown", "resume", "online", "network-retry", "head-retry", "integrity-check"] as const;
 export type SyncTrigger = typeof SYNC_TRIGGERS[number];
-const PHASES = ["recovery", "remote", "scanning", "hashing", "uploading", "downloading", "publishing", "saving"] as const;
+export const PHASES = ["recovery", "remote", "scanning", "hashing", "uploading", "downloading", "publishing", "saving"] as const;
 export type SyncPhase = typeof PHASES[number];
 const ERROR_CATEGORIES = ["network", "timeout", "service", "authentication", "remote-integrity", "local-change", "head-race", "cancelled", "unknown"] as const;
 export type SyncErrorCategory = typeof ERROR_CATEGORIES[number];
@@ -55,9 +55,9 @@ export interface SyncDiagnosticsView extends SyncDiagnosticsSnapshot {
 
 const MAX_RECORDS = 1_000;
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
-const identifier = (value: unknown): string | undefined =>
+export const identifier = (value: unknown): string | undefined =>
   typeof value === "string" && /^[\w.:-]{1,128}$/u.test(value) ? value : undefined;
-const nonnegative = (value: unknown): number | undefined =>
+export const nonnegative = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 
 // Reconstruct only known fields; persisted diagnostics never import arbitrary objects.
