@@ -123,8 +123,29 @@ describe("StatusModal", () => {
     expect(texts).toContain("本设备上次确认发布的提交：published-version");
     expect(texts.some(text => text.includes("上次检查的 S3 Head 指针：remote-version"))).toBe(true);
     expect(texts.some(text => text.includes("待上传：1") && text.includes("待下载：4"))).toBe(true);
-    expect(texts.some(text => text.includes("service") && text.includes("503"))).toBe(true);
+    expect(texts.some(text => text.includes("S3 服务出错") && text.includes("503"))).toBe(true);
     expect(texts).toContain("复制诊断数据");
+  });
+
+  it("shows the diagnostics phase and error in Chinese and every time in the device's 24-hour format", () => {
+    const controller = {...issueController([]), getDiagnostics: () => ({
+      lastSuccessAt: 1_700_000_000_000, nextRetryAt: 1_700_000_003_000, queued: false, pendingLocalChanges: 0,
+      records: [{id: "run", vaultId: "vault", startedAt: 1_700_000_001_000, finishedAt: 1_700_000_002_000,
+        outcome: "error" as const, triggers: ["periodic" as const], phase: "saving" as const, phaseDurations: {},
+        observedRemote: "remote-version", remoteCheckedAt: 1_700_000_001_000, requests: 3, sentBytes: 0, receivedBytes: 42,
+        errorCategory: "service" as const, httpStatus: 503}],
+    })};
+    const modal = new StatusModal({} as App, controller);
+    modal.onOpen();
+    type FakeElement = InstanceType<typeof Element>;
+    const all = (node: FakeElement): FakeElement[] => [node, ...node.children.flatMap(all)];
+    const texts = all(modal.contentEl as unknown as FakeElement).map(node => node.text);
+    // 1_700_000_000_000 是上海时间 2023-11-15 06:13:20
+    expect(texts).toContain("上次记录的成功同步：2023-11-15 06:13:20");
+    expect(texts).toContain("上次检查的 S3 Head 指针：remote-version · 2023-11-15 06:13:21");
+    expect(texts).toContain("下次计划重试：2023-11-15 06:13:23");
+    expect(texts).toContain("阶段：保存记录 · HTTP 请求：3 · 发送/接收字节：0/42");
+    expect(texts).toContain("上次运行的错误：S3 服务出错（HTTP 503）");
   });
 
   it("offers a real review action for a collision that lists only one path", () => {

@@ -28,6 +28,7 @@ import { LocalContentReviewModal } from "./content-review-modal";
 import { PathCollisionModal } from "./path-collision-modal";
 import type { PathCollisionReview, PathCollisionResolution } from "../sync/path-collision-review";
 import type { SyncDiagnosticsView } from "./sync-diagnostics";
+import { errorCategoryLabels, phaseLabels } from "./sync-labels";
 
 export interface StatusModalController {
   // 电脑上返回「待清理」的控制器；手机上返回 undefined，按钮栏里没有这个按钮
@@ -439,7 +440,7 @@ export class StatusModal extends Modal {
     const result = [...view.records].reverse().find(record => record.counts)?.counts;
     const observed = [...view.records].reverse().find(record => record.observedRemote);
     const publication = [...view.records].reverse().find(record => record.publishedCommit);
-    const date = (time?: number): string => time === undefined ? "未记录" : new Date(time).toLocaleString();
+    const date = (time?: number): string => time === undefined ? "未记录" : formatLocalTime(time, true);
     container.createEl("h3", {text: "同步诊断"});
     container.createEl("p", {text: `上次记录的成功同步：${date(view.lastSuccessAt)}`});
     container.createEl("p", {text: `本地已接受的提交：${view.acceptedCommit ?? "尚未接受"}`});
@@ -448,9 +449,9 @@ export class StatusModal extends Modal {
     container.createEl("p", {text: `排队中的检查：${view.queued ? "有" : "无"} · 待检查的本地路径：${view.pendingLocalChanges}`});
     container.createEl("p", {text: `最近的同步计划 — 待上传：${last?.pendingUploads ?? "尚未计划"} · 待下载：${last?.pendingDownloads ?? "尚未计划"}`});
     if (result) container.createEl("p", {text: `最近的结果 — 已发布更改：${result.uploaded} · 已下载：${result.downloaded} · 暂缓下载：${result.deferred} · 未同步的本地文件：${result.unsynced}`});
-    if (last) container.createEl("p", {text: `阶段：${last.phase} · HTTP 请求：${last.requests} · 发送/接收字节：${last.sentBytes}/${last.receivedBytes}`});
+    if (last) container.createEl("p", {text: `阶段：${phaseLabels[last.phase]} · HTTP 请求：${last.requests} · 发送/接收字节：${last.sentBytes}/${last.receivedBytes}`});
     container.createEl("p", {text: `下次计划重试：${view.nextRetryAt === undefined ? "无" : date(view.nextRetryAt)}`});
-    if (last?.errorCategory) container.createEl("p", {text: `上次运行的错误：${last.errorCategory}${last.httpStatus ? `（HTTP ${last.httpStatus}）` : ""}${last.writeResultUncertain ? "。远端写入可能已经完成，重试时会重新检查 Head 指针。" : ""}`});
+    if (last?.errorCategory) container.createEl("p", {text: `上次运行的错误：${errorCategoryLabels[last.errorCategory]}${last.httpStatus ? `（HTTP ${last.httpStatus}）` : ""}${last.writeResultUncertain ? "。远端写入可能已经完成，重试时会重新检查 Head 指针。" : ""}`});
     if (view.persistenceWarning) container.createEl("p", {text: view.persistenceWarning, cls: "s3-vault-sync-error"});
     container.createEl("small", {text: "这些记录只描述本设备。发布到 S3 并不代表其他设备已收到文件。即使提交 ID 一致，也可能还有暂缓下载的文件。"});
   }
