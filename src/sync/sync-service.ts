@@ -241,10 +241,21 @@ export interface SyncResult {
   deferredDownloads: number;
   deleted: number;
   downloaded: number;
+  // 这次实际执行完的本地动作（下载新增、下载更新、本地删除、本地挪动）
+  downloads: SyncFileChange[];
   localIssues: LocalSyncIssue[];
   status: "action-required" | "complete";
   unsyncedLocalEntries: number;
   uploaded: number;
+  // Head 发布成功的远端改动；没发布成功时为空
+  uploads: SyncFileChange[];
+}
+
+// 一次同步里改动的一个文件：挪动时 fromPath 是旧路径、path 是新路径
+export interface SyncFileChange {
+  fromPath?: string;
+  kind: "added" | "deleted" | "modified" | "moved" | "updated";
+  path: string;
 }
 
 export interface SyncScanOptions {
@@ -255,6 +266,8 @@ export interface SyncScanOptions {
 
 export interface SynchronizeOptions extends SyncScanOptions {
   assertLocalObservationCurrent?: () => void;
+  // 每个本地动作落地后立即交出；之后的上传或发布失败时，调用方仍知道哪些文件已经下载
+  onDownloadApplied?: (change: SyncFileChange) => void;
   pathRenames?: ReadonlyMap<string, PersistedPathRename>;
   renameResolution?: PossibleRenameResolution;
 }
@@ -1781,10 +1794,12 @@ export class SyncService {
         deferredDownloads: deferredEntryIds.size,
         deleted: 0,
         downloaded: 0,
+        downloads: [],
         localIssues,
         status: "action-required",
         unsyncedLocalEntries: scan.unsyncedLocalEntries,
         uploaded: 0,
+        uploads: [],
       };
     }
 
@@ -1805,10 +1820,12 @@ export class SyncService {
         deferredDownloads: deferredEntryIds.size,
         deleted: 0,
         downloaded: 0,
+        downloads: [],
         localIssues,
         status: "action-required",
         unsyncedLocalEntries: scan.unsyncedLocalEntries,
         uploaded: 0,
+        uploads: [],
       };
     }
 
@@ -1846,6 +1863,11 @@ export class SyncService {
     let deleted = 0;
     let downloaded = 0;
     let downloadedBytes = 0;
+    const downloads: SyncFileChange[] = [];
+    const recordDownload = (change: SyncFileChange): void => {
+      downloads.push(change);
+      syncOptions.onDownloadApplied?.(change);
+    };
     // 下载落地后就把「这个 Entry 的本地 base = 刚落地的 Revision」记进 Sync Cache，
     // 同步在之后被打断时，下一次同步把这些文件当成没改过，而不是本机修改或首次连接不一致。
     // 与手动审查一样只接受这些 Entry：其余 Entry、Deletion Record 和 Conflict 仍保留上一次接受的状态。
@@ -1924,6 +1946,7 @@ export class SyncService {
           retiredLocalPaths.add(action.path);
           expectedLocalContentByPath.delete(action.path);
           deleted += 1;
+          recordDownload({kind: "deleted", path: action.path});
         } else if (action.kind === "move-local") {
           const expectedContentHash =
             expectedLocalContentByPath.get(action.fromPath) ?? null;
@@ -1947,6 +1970,7 @@ export class SyncService {
           if (expectedContentHash) {
             expectedLocalContentByPath.set(action.toPath, expectedContentHash);
           }
+          recordDownload({kind: "moved", fromPath: action.fromPath, path: action.toPath});
         } else {
           this.reportProgress({
             completed: downloaded,
@@ -1990,6 +2014,8 @@ export class SyncService {
           await recordMaterializedDownload(action.entryId, action.path, action.revision);
           downloaded += 1;
           downloadedBytes += action.revision.size;
+          // 写入前本机没有这个文件是新增，否则是更新
+          recordDownload({kind: expectedContentHash === null ? "added" : "updated", path: action.path});
           this.reportProgress({
             completed: downloaded,
             currentPath: action.path,
@@ -2039,6 +2065,7 @@ export class SyncService {
       Object.values(remote.entries).filter((entry) => entry.kind === "conflicted")
         .length;
     let publishedChanges = plan.remoteChanges.length;
+    const uploads: SyncFileChange[] = [];
     if (plan.remoteChanges.length > 0 || sharedConflicts.length > 0) {
       // 上传和发布 Head 也可能被打断，先把已落地的下载记下来
       await saveDownloadProgress();
@@ -2365,6 +2392,11 @@ export class SyncService {
         head,
       });
       this.options.onRemotePublished?.(commitId);
+      // Head 发布成功（CAS 通过）后才算上传了
+      for (const change of plan.remoteChanges) {
+        uploads.push(change.kind === "move-remote" ? {kind: "moved", fromPath: change.fromPath, path: change.toPath}
+          : {kind: change.kind === "upload-new" ? "added" : change.kind === "upload-local" ? "modified" : "deleted", path: change.path});
+      }
       remote = {
         commitId,
         entries: nextEntries,
@@ -2434,10 +2466,12 @@ export class SyncService {
       deferredDownloads: deferredEntryIds.size,
       deleted,
       downloaded,
+      downloads,
       localIssues,
       status,
       unsyncedLocalEntries: scan.unsyncedLocalEntries,
       uploaded: publishedChanges,
+      uploads,
     };
   }
 

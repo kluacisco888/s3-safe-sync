@@ -1177,8 +1177,8 @@ describe("opening sync status when synchronization stops", () => {
 
   const stubSyncResult = (localIssues: LocalSyncIssue[]) =>
     vi.spyOn(SyncService.prototype, "synchronize").mockResolvedValue({
-      cacheUpdated: false, deferredDownloadEntries: [], deferredDownloads: 0, deleted: 0, downloaded: 0,
-      localIssues, status: "action-required", unsyncedLocalEntries: 0, uploaded: 0,
+      cacheUpdated: false, deferredDownloadEntries: [], deferredDownloads: 0, deleted: 0, downloaded: 0, downloads: [],
+      localIssues, status: "action-required", unsyncedLocalEntries: 0, uploaded: 0, uploads: [],
     });
 
   it("does not open sync status when a sync only reports unsynced local files", async () => {
@@ -1201,12 +1201,12 @@ describe("opening sync status when synchronization stops", () => {
     expect(host.openedModals).toHaveLength(1);
     host.openedModals[0]!.close();
     synchronize.mockResolvedValue({
-      cacheUpdated: false, deferredDownloadEntries: [], deferredDownloads: 0, deleted: 0, downloaded: 0,
+      cacheUpdated: false, deferredDownloadEntries: [], deferredDownloads: 0, deleted: 0, downloaded: 0, downloads: [],
       localIssues: [
         {kind: "possible-rename", oldPaths: ["notes/example.md"], newPaths: ["notes/moved.md"], reviewToken: "token-1"},
         {kind: "unsynced-local", path: "notes/third.md"},
       ],
-      status: "action-required", unsyncedLocalEntries: 0, uploaded: 0,
+      status: "action-required", unsyncedLocalEntries: 0, uploaded: 0, uploads: [],
     });
     await plugin.syncNow();
     expect(plugin.getStatusText()).toMatch(/^需要处理：/u);

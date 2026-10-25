@@ -7683,3 +7683,96 @@ describe("deleting unreferenced blobs from this vault's folder", () => {
     expect(result.kind === "checked" && result.marks).toEqual({});
   });
 });
+
+describe("which files a synchronization changed", () => {
+  const encode = (text: string) => new TextEncoder().encode(text);
+  const byPath = <T extends {path: string}>(changes: readonly T[]) => [...changes].sort((a, b) => a.path.localeCompare(b.path));
+  // 电脑建立 6 个文件的仓库，手机同步一次建立 base；删除 1 个不到 20%，不会触发批量删除确认
+  const setup = async () => {
+    const objects = new MemoryObjectStore();
+    const remote = await RemoteStore.open({objects, prefix: "activity", vaultKey: new Uint8Array(32)});
+    const desktopVault = new MemoryVault();
+    const desktop = new SyncService({cache: new MemorySyncCache(), local: desktopVault, remote, replicaId: "desktop"});
+    for (const name of ["a", "b", "c", "d", "e", "f"]) await desktopVault.write(`notes/${name}.md`, encode(`${name} first`));
+    await desktop.initializeNew("vault");
+    const phoneVault = new MemoryVault();
+    const phone = new SyncService({cache: new MemorySyncCache(), local: phoneVault, remote, replicaId: "phone"});
+    const first = await phone.synchronize();
+    // 电脑上新增、修改、删除、挪动各一个文件
+    const changeOnDesktop = async () => {
+      await desktopVault.write("notes/new.txt", encode("brand new"));
+      await desktopVault.write("notes/a.md", encode("a second"));
+      await desktopVault.delete("notes/b.md");
+      await desktopVault.move("notes/c.md", "archive/c.md");
+      return desktop.synchronize();
+    };
+    return {objects, desktop, phone, phoneVault, first, changeOnDesktop};
+  };
+
+  it("lists an added, a modified, a deleted and a moved upload once Head is published", async () => {
+    const {changeOnDesktop} = await setup();
+
+    const result = await changeOnDesktop();
+
+    expect(result.status).toBe("complete");
+    expect(byPath(result.uploads)).toEqual([
+      {kind: "moved", fromPath: "notes/c.md", path: "archive/c.md"},
+      {kind: "modified", path: "notes/a.md"},
+      {kind: "deleted", path: "notes/b.md"},
+      {kind: "added", path: "notes/new.txt"},
+    ]);
+    expect(result.downloads).toEqual([]);
+  });
+
+  it("tells a downloaded new file from an updated one and records downloaded deletes and moves", async () => {
+    const {phone, first, changeOnDesktop} = await setup();
+    expect(first.downloads).toHaveLength(6);
+    expect(first.downloads.every(change => change.kind === "added")).toBe(true);
+    await changeOnDesktop();
+
+    const applied: Array<{kind: string; path: string}> = [];
+    const result = await phone.synchronize([], {fullHashVerification: true, onDownloadApplied: change => applied.push(change)});
+
+    const expected = [
+      {kind: "moved", fromPath: "notes/c.md", path: "archive/c.md"},
+      {kind: "updated", path: "notes/a.md"},
+      {kind: "deleted", path: "notes/b.md"},
+      {kind: "added", path: "notes/new.txt"},
+    ];
+    expect(byPath(result.downloads)).toEqual(expected);
+    expect(byPath(applied)).toEqual(expected);
+    expect(result.uploads).toEqual([]);
+  });
+
+  it("records both directions when one synchronization uploads and downloads", async () => {
+    const {phone, phoneVault, changeOnDesktop} = await setup();
+    await changeOnDesktop();
+    await phoneVault.write("notes/e.md", encode("e edited on the phone"));
+
+    const result = await phone.synchronize();
+
+    expect(result.uploads).toEqual([{kind: "modified", path: "notes/e.md"}]);
+    expect(byPath(result.downloads).map(change => change.path)).toEqual(["archive/c.md", "notes/a.md", "notes/b.md", "notes/new.txt"]);
+  });
+
+  it.each([
+    {failure: "another device publishing first", error: () => new ObjectPreconditionError()},
+    {failure: "a network error", error: () => new Error("network lost")},
+  ])("still hands over the landed downloads when publishing fails because of $failure", async ({error}) => {
+    const {objects, phone, phoneVault, changeOnDesktop} = await setup();
+    await changeOnDesktop();
+    await phoneVault.write("notes/e.md", encode("e edited on the phone"));
+    objects.onPut = key => {
+      if (!key.endsWith("/head")) return;
+      objects.onPut = undefined;
+      throw error();
+    };
+
+    const applied: Array<{kind: string; path: string}> = [];
+    await expect(phone.synchronize([], {fullHashVerification: true, onDownloadApplied: change => applied.push(change)}))
+      .rejects.toBeDefined();
+
+    expect(byPath(applied).map(change => `${change.kind} ${change.path}`))
+      .toEqual(["moved archive/c.md", "updated notes/a.md", "deleted notes/b.md", "added notes/new.txt"]);
+  });
+});
