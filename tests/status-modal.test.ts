@@ -1018,6 +1018,36 @@ describe("StatusModal", () => {
       expect(warning.classes.has("s3-vault-sync-error")).toBe(true);
     });
 
+    it("shows no English trigger, result or phase name and no English time format anywhere in the window", () => {
+      const listeners = new Set<(status: {text: string}) => void>();
+      const base = controllerWith([
+        sync("one", at("2026-10-25T16:55:36"), {triggers: ["periodic", "network-retry"], phaseDurations: {saving: 20, hashing: 30},
+          uploads: [{kind: "moved", fromPath: "旧/甲.md", path: "新/甲.md"}], downloads: [{kind: "updated", path: "乙.md"}]}),
+        sync("two", at("2026-10-24T08:15:38"), {outcome: "retrying", errorCategory: "timeout", triggers: ["head-retry"]}),
+        manual("three", at("2026-10-24T09:00:00"), "处理冲突：丙.md", [{kind: "modified", path: "丙.md"}]),
+      ], [
+        run("q", at("2026-10-25T08:00:00")),
+        run("last", at("2026-10-25T16:00:00"), {outcome: "retrying", errorCategory: "network", phase: "saving",
+          observedRemote: "remote-version", remoteCheckedAt: at("2026-10-25T16:00:01")}),
+      ]);
+      const controller = {...base, getDiagnostics: () => ({...base.getDiagnostics!(), lastSuccessAt: at("2026-10-25T08:00:00"),
+        nextRetryAt: at("2026-10-25T16:02:00")}), onStatusChange: (listener: (status: {text: string}) => void) => {listeners.add(listener); return () => listeners.delete(listener);}};
+      const modal = open(controller);
+      const section = sectionOf(modal)!;
+      section.open = true;
+      section.events.get("toggle")!();
+      for (const node of all(section)) {
+        if (node.classes.has("s3-vault-sync-record-line") || node.classes.has("s3-vault-sync-records-quiet-line")) click(node);
+      }
+      for (const listener of listeners) listener({text: "空闲：同步完成"});
+      const texts = nodesOf(modal).map(node => node.text).filter(text => text !== "S3 Vault Sync");
+      expect(texts).toContain("旧/甲.md → 新/甲.md");
+      expect(texts).toContain("下次计划重试：2026-10-25 16:02:00");
+      // 提交 ID 是内部取值，原样显示
+      expect(texts.filter(text => /[A-Za-z]{3,}/.test(text.replace(/HTTP|Head|remote-version/g, "")))).toEqual([]);
+      expect(texts.filter(text => /\d{1,2}\/\d{1,2}\/\d{4}|\b[AP]M\b/.test(text))).toEqual([]);
+    });
+
     it("does not draw the sync records on a phone or tablet, where there is no sync activity", () => {
       const without = open({...issueController([]), getDeletedRecoveries: () => []});
       expect(sectionOf(without)).toBeUndefined();
