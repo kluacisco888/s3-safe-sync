@@ -343,6 +343,8 @@ export class StatusModal extends Modal {
   private pauseButton: HTMLButtonElement | undefined;
   // 用户展开的区块；状态刷新重画后照样展开
   private readonly openSections = new Set<string>();
+  // 同步记录里用户展开的行，同样在重画后保持
+  private readonly openRecordRows = new Set<string>();
   constructor(
     app: App,
     private readonly controller: StatusModalController,
@@ -469,7 +471,7 @@ export class StatusModal extends Modal {
     if (!activity) return;
     const section = this.collapsibleSection(container, "records", "同步记录（最近 30 天）",
       `本设备 · ${activity.records.length} 次有改动或需要注意`);
-    renderSyncRecords(section, activity);
+    renderSyncRecords(section, activity, this.openRecordRows);
   }
 
   private renderBulkDeletion(container: HTMLElement): void {

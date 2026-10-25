@@ -809,6 +809,92 @@ describe("StatusModal", () => {
       ]);
     });
 
+    const bodyOf = (row: FakeElement): FakeElement => row.children.find(child => child.classes.has("s3-vault-sync-record-body"))!;
+    const groupsOf = (row: FakeElement): Array<{title: string; files: string[][]; note?: string}> =>
+      all(bodyOf(row)).filter(node => node.classes.has("s3-vault-sync-record-group")).map(group => ({
+        title: group.children[0]!.text,
+        files: all(group).filter(node => node.tag === "li").map(item => item.children.map(part => part.text)),
+        ...(group.children.find(child => child.tag === "p") ? {note: group.children.find(child => child.tag === "p")!.text} : {}),
+      }));
+
+    it("opens a row on click to list every uploaded and downloaded file with its kind, and closes it on the next click", () => {
+      const modal = open(controllerWith([sync("mixed", at("2026-10-25T16:55:36"), {
+        uploads: [{kind: "modified", path: "1-Projects/日志.md"}, {kind: "added", path: "附件/图.png"},
+          {kind: "moved", fromPath: "图纸/旧.pdf", path: "图纸/过程文档/旧.pdf"}, {kind: "deleted", path: "WX/旧.md"}],
+        downloads: [{kind: "updated", path: "2-Areas/待办.md"}, {kind: "added", path: "录音/周会.md"},
+          {kind: "deleted", path: "录音/草稿.md"}, {kind: "moved", fromPath: "甲/乙.md", path: "丙/乙.md"}],
+        phaseDurations: {remote: 310, scanning: 180, uploading: 640, publishing: 290, saving: 190},
+      })]));
+      const [row] = rowsOf(modal);
+      expect(groupsOf(row!)).toEqual([]);
+      expect(row!.classes.has("is-open")).toBe(false);
+      click(lineOf(row!));
+      expect(row!.classes.has("is-open")).toBe(true);
+      expect(groupsOf(row!)).toEqual([
+        {title: "上传到 S3（4 个）", files: [["修改", "1-Projects/日志.md"], ["新增", "附件/图.png"],
+          ["挪动", "图纸/旧.pdf → 图纸/过程文档/旧.pdf"], ["删除", "WX/旧.md"]]},
+        {title: "从 S3 下载（4 个）", files: [["更新", "2-Areas/待办.md"], ["新增", "录音/周会.md"],
+          ["删除", "录音/草稿.md"], ["挪动", "甲/乙.md → 丙/乙.md"]]},
+      ]);
+      const body = textsIn(bodyOf(row!));
+      expect(body).toContain("开始 16:55:36 · 用时 1.7 秒 · 98 次请求 · 发送 14.2 KB / 接收 51.8 KB");
+      expect(body).toContain("各阶段：读取远端 310 毫秒、扫描本地 180 毫秒、上传 640 毫秒、发布 290 毫秒、保存记录 190 毫秒");
+      // 每种类型的标签各带自己的样式类，颜色在样式表里按类型给
+      const tags = all(bodyOf(row!)).filter(node => node.classes.has("s3-vault-sync-record-file-kind"));
+      expect(tags.map(tag => [...tag.classes].find(name => name.startsWith("mod-")))).toEqual(
+        ["mod-modified", "mod-added", "mod-moved", "mod-deleted", "mod-updated", "mod-added", "mod-deleted", "mod-moved"]);
+      click(lineOf(row!));
+      expect(row!.classes.has("is-open")).toBe(false);
+      expect(groupsOf(row!)).toEqual([]);
+    });
+
+    it("lists the one changed file with its full path, and writes short times in milliseconds and large sizes in MB", () => {
+      const modal = open(controllerWith([sync("one", at("2026-10-25T16:54:40"), {finishedAt: at("2026-10-25T16:54:40") + 777,
+        sentBytes: 1_887_437, receivedBytes: 0, uploads: [{kind: "modified", path: "1-Projects/Raycloud/日志.md"}]})]));
+      const [row] = rowsOf(modal);
+      expect(lineTexts(row!)[2]).toBe("上传 1 个：修改 日志.md");
+      click(lineOf(row!));
+      expect(groupsOf(row!)).toEqual([{title: "上传到 S3（1 个）", files: [["修改", "1-Projects/Raycloud/日志.md"]]}]);
+      expect(textsIn(bodyOf(row!))).toContain("开始 16:54:40 · 用时 777 毫秒 · 98 次请求 · 发送 1.8 MB / 接收 0 KB");
+    });
+
+    it("opens and closes a row with Enter and Space once it has keyboard focus", () => {
+      const modal = open(controllerWith([sync("one", at("2026-10-25T16:55:36"), {uploads: [{kind: "added", path: "a.md"}]})]));
+      const [row] = rowsOf(modal);
+      const line = lineOf(row!);
+      expect(line.attrs.get("role")).toBe("button");
+      expect(line.attrs.get("tabindex")).toBe("0");
+      expect(line.attrs.get("aria-expanded")).toBe("false");
+      press(line, "Enter");
+      expect(row!.classes.has("is-open")).toBe(true);
+      expect(line.attrs.get("aria-expanded")).toBe("true");
+      press(line, " ");
+      expect(row!.classes.has("is-open")).toBe(false);
+      press(line, "a");
+      expect(row!.classes.has("is-open")).toBe(false);
+    });
+
+    it("keeps the section and the opened rows open after the status refresh redraws the window", () => {
+      const listeners = new Set<(status: {text: string}) => void>();
+      const controller = {...controllerWith([
+        sync("first", at("2026-10-25T16:55:36"), {uploads: [{kind: "added", path: "a.md"}]}),
+        sync("second", at("2026-10-25T16:50:00"), {uploads: [{kind: "added", path: "b.md"}]}),
+      ]), onStatusChange: (listener: (status: {text: string}) => void) => {listeners.add(listener); return () => listeners.delete(listener);}};
+      const modal = open(controller);
+      const section = sectionOf(modal)!;
+      section.open = true;
+      section.events.get("toggle")!();
+      click(lineOf(rowsOf(modal)[1]!));
+      for (const listener of listeners) listener({text: "空闲：同步完成"});
+      expect(sectionOf(modal)).not.toBe(section);
+      expect(sectionOf(modal)!.open).toBe(true);
+      expect(rowsOf(modal).map(row => row.classes.has("is-open"))).toEqual([false, true]);
+      expect(groupsOf(rowsOf(modal)[1]!)).toEqual([{title: "上传到 S3（1 个）", files: [["新增", "b.md"]]}]);
+      click(lineOf(rowsOf(modal)[1]!));
+      modal.onOpen();
+      expect(rowsOf(modal).map(row => row.classes.has("is-open"))).toEqual([false, false]);
+    });
+
     it("does not draw the sync records on a phone or tablet, where there is no sync activity", () => {
       const without = open({...issueController([]), getDeletedRecoveries: () => []});
       expect(sectionOf(without)).toBeUndefined();

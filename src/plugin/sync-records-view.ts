@@ -1,6 +1,7 @@
 import type { SyncActivityFile, SyncActivityRecord, SyncActivitySnapshot } from "./sync-activity";
 import { formatLocalClock } from "./local-time";
-import { errorCategoryLabels, fileKindLabels, outcomeLabels, triggerLabels } from "./sync-labels";
+import { PHASES } from "./sync-diagnostics";
+import { errorCategoryLabels, fileKindLabels, outcomeLabels, phaseLabels, triggerLabels } from "./sync-labels";
 
 // 同步状态窗口里的「同步记录（最近 30 天）」：按本机时区的天分组，点一行展开这次同步的详情
 
@@ -52,7 +53,70 @@ const recordSummary = (record: SyncActivityRecord): string => {
   return "没有改动文件";
 };
 
-const renderRecord = (container: HTMLElement, record: SyncActivityRecord): void => {
+/** 不到 1 秒写毫秒，否则写一位小数的秒 */
+const duration = (ms: number): string => ms < 1_000 ? `${Math.round(ms)} 毫秒` : `${(ms / 1_000).toFixed(1)} 秒`;
+
+/** 字节数写成 KB，满 1 MB 写 MB，都保留一位小数 */
+const size = (bytes: number): string => bytes === 0 ? "0 KB"
+  : bytes < 1_024 * 1_024 ? `${(bytes / 1_024).toFixed(1)} KB` : `${(bytes / 1_024 / 1_024).toFixed(1)} MB`;
+
+const renderFiles = (container: HTMLElement, title: string, files: readonly SyncActivityFile[], more: number): void => {
+  if (files.length + more === 0) return;
+  const group = container.createDiv({cls: "s3-vault-sync-record-group"});
+  group.createDiv({cls: "s3-vault-sync-record-group-title", text: `${title}（${files.length + more} 个）`});
+  const list = group.createEl("ul", {cls: "s3-vault-sync-record-files"});
+  for (const file of files) {
+    const item = list.createEl("li");
+    item.createSpan({cls: `s3-vault-sync-record-file-kind mod-${file.kind}`, text: fileKindLabels[file.kind]});
+    item.createSpan({cls: "s3-vault-sync-record-path", text: file.fromPath ? `${file.fromPath} → ${file.path}` : file.path});
+  }
+  if (more > 0) group.createEl("p", {cls: "s3-vault-sync-muted", text: `只记录了前 200 个文件名，另有 ${more} 个没有列出。`});
+};
+
+const renderDetails = (body: HTMLElement, record: SyncActivityRecord): void => {
+  const more = unlisted(record);
+  renderFiles(body, "上传到 S3", record.uploads, more.uploads);
+  renderFiles(body, "从 S3 下载", record.downloads, more.downloads);
+  if (record.kind === "manual") return;
+  body.createDiv({cls: "s3-vault-sync-record-tech", text: `开始 ${formatLocalClock(record.startedAt)} · 用时 ${duration(record.finishedAt - record.startedAt)}`
+    + ` · ${record.requests ?? 0} 次请求 · 发送 ${size(record.sentBytes ?? 0)} / 接收 ${size(record.receivedBytes ?? 0)}`});
+  const phases = PHASES.flatMap(phase => {
+    const spent = record.phaseDurations?.[phase];
+    return spent === undefined ? [] : [`${phaseLabels[phase]} ${duration(spent)}`];
+  });
+  if (phases.length > 0) body.createDiv({cls: "s3-vault-sync-record-tech", text: `各阶段：${phases.join("、")}`});
+};
+
+/**
+ * 点一下或聚焦后按回车 / 空格展开，再按一次收起。展开时才画详情（一条记录最多 200 个文件名）。
+ * 展开状态按 key 记在 openRows 里，状态刷新重画后照样展开
+ */
+const expandable = (item: HTMLElement, target: HTMLElement, body: HTMLElement, key: string, openRows: Set<string>, fill: () => void): void => {
+  target.setAttr("role", "button");
+  target.setAttr("tabindex", "0");
+  const show = (): void => {
+    const open = openRows.has(key);
+    item.toggleClass("is-open", open);
+    target.setAttr("aria-expanded", String(open));
+    body.empty();
+    if (open) fill();
+  };
+  const flip = (): void => {
+    if (openRows.has(key)) openRows.delete(key);
+    else openRows.add(key);
+    show();
+  };
+  target.addEventListener("click", flip);
+  target.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      flip();
+    }
+  });
+  show();
+};
+
+const renderRecord = (container: HTMLElement, record: SyncActivityRecord, openRows: Set<string>): void => {
   const item = container.createDiv({cls: "s3-vault-sync-record"});
   const line = item.createDiv({cls: "s3-vault-sync-record-line"});
   line.createSpan({cls: "s3-vault-sync-record-time", text: formatLocalClock(record.startedAt)});
@@ -61,10 +125,12 @@ const renderRecord = (container: HTMLElement, record: SyncActivityRecord): void 
   const state = record.kind === "manual" ? "manual" : record.outcome;
   line.createSpan({cls: `s3-vault-sync-record-state mod-${state}`, text: record.kind === "manual" ? "手动操作" : outcomeLabels[record.outcome]});
   line.createSpan({cls: "s3-vault-sync-record-arrow", text: "›"});
+  const body = item.createDiv({cls: "s3-vault-sync-record-body"});
+  expandable(item, line, body, `record:${record.id}`, openRows, () => renderDetails(body, record));
 };
 
-/** 画进已经建好的折叠区块里 */
-export const renderSyncRecords = (section: HTMLElement, activity: SyncActivitySnapshot, now = Date.now()): void => {
+/** 画进已经建好的折叠区块里；openRows 是用户展开的行，由窗口保管 */
+export const renderSyncRecords = (section: HTMLElement, activity: SyncActivitySnapshot, openRows: Set<string>, now = Date.now()): void => {
   section.createEl("p", {cls: "s3-vault-sync-muted", text: HINT});
   const days = new Map<number, SyncActivityRecord[]>();
   for (const record of [...activity.records].sort((left, right) => right.startedAt - left.startedAt)) {
@@ -74,6 +140,6 @@ export const renderSyncRecords = (section: HTMLElement, activity: SyncActivitySn
   for (const [start, records] of days) {
     const day = section.createDiv({cls: "s3-vault-sync-records-day"});
     day.createDiv({cls: "s3-vault-sync-records-day-title", text: dayLabel(start, now)});
-    for (const record of records) renderRecord(day, record);
+    for (const record of records) renderRecord(day, record, openRows);
   }
 };
