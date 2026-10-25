@@ -96,7 +96,7 @@ const renderDetails = (body: HTMLElement, record: SyncActivityRecord): void => {
   }
   renderFiles(body, "上传到 S3", record.uploads, more.uploads);
   renderFiles(body, "从 S3 下载", record.downloads, more.downloads);
-  body.createDiv({cls: "s3-vault-sync-record-tech", text: `开始 ${formatLocalClock(record.startedAt)} · 用时 ${duration(record.finishedAt - record.startedAt)}`
+  body.createDiv({cls: "s3-vault-sync-record-tech", text: `开始 ${formatLocalClock(record.startedAt)} · 用时 ${duration(Math.max(0, record.finishedAt - record.startedAt))}`
     + ` · ${record.requests ?? 0} 次请求 · 发送 ${size(record.sentBytes ?? 0)} / 接收 ${size(record.receivedBytes ?? 0)}`});
   const phases = PHASES.flatMap(phase => {
     const spent = record.phaseDurations?.[phase];

@@ -400,6 +400,7 @@
   font-variant-numeric: tabular-nums;
 }
 
+.s3-vault-sync-record-trigger,
 .s3-vault-sync-record-summary {
   overflow: hidden;
   text-overflow: ellipsis;
