@@ -109,7 +109,11 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
     beforeBlobRead?: () => void;
     headFailure?: "network" | "corrupt" | "forbidden";
     failNextBlobPut?: boolean;
+    // 下一次 Head PUT 不写入，直接按这个状态码失败（412 = Head 冲突，503 = 服务暂时不可用）
+    failNextHeadPut?: 412 | 503;
     afterProbePut?: () => void;
+    // 每次数据块 PUT 处理完（成功或按 failNextBlobPut 失败）都调用
+    afterBlobPut?: () => void;
     afterHeadPut?: () => void;
     wireFault?: "reset-read" | "hang-read" | "drop-head-put";
     // 假 S3 的 AWS 时间 = 设备时间 + 这个偏移：用来造「设备时间和 AWS 时间不一致」
@@ -147,6 +151,9 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
       if (key.includes("/blobs/") && hooks.failNextBlobPut) {
         hooks.failNextBlobPut = false;
         status = 503;
+      } else if (key.endsWith("/head") && hooks.failNextHeadPut) {
+        status = hooks.failNextHeadPut;
+        hooks.failNextHeadPut = undefined;
       } else if ((request.headers["if-none-match"] && current) ||
           (request.headers["if-match"] && request.headers["if-match"] !== current?.etag)) {
         status = 412;
@@ -161,6 +168,7 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
       throw new Error(`Unexpected request method: ${request.method}`);
     }
     if (request.method === "PUT" && key.includes(".s3-vault-sync-probe-")) hooks.afterProbePut?.();
+    if (request.method === "PUT" && key.includes("/blobs/")) hooks.afterBlobPut?.();
     if (request.method === "PUT" && key.endsWith("/head") && status === 200) hooks.afterHeadPut?.();
     const awsNow = Date.now() + (hooks.awsOffsetMs ?? 0);
     return {
@@ -272,6 +280,33 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
       listener(Object.assign(new TFile(), {path, stat: file.stat}), oldPath);
     }
   };
+  // 用户新建的文件（不在 Sync Cache 里），只在内存里，不写回环目录
+  const createdFiles: Array<{file: TFile; text: string}> = [];
+  const createdAt = (path: string) => createdFiles.find(created => created.file.path === path);
+  const createFile = (path: string, value: string) => {
+    const created = {file: Object.assign(new TFile(), {path, stat: {mtime: 1, size: new TextEncoder().encode(value).length}}), text: value};
+    createdFiles.push(created);
+    for (const listener of events.get("create") ?? []) listener(created.file);
+  };
+  const editCreated = (path: string, value: string) => {
+    const created = createdAt(path);
+    if (!created) throw new Error(`Missing created file ${path}`);
+    created.text = value;
+    created.file.stat = {...created.file.stat, mtime: created.file.stat.mtime + 1, size: new TextEncoder().encode(value).length};
+    for (const listener of events.get("modify") ?? []) listener(created.file);
+  };
+  // 挪动新建的文件或包含它们的文件夹；event=false 表示在磁盘上直接挪、Obsidian 不发改名事件
+  const renameCreated = (oldPath: string, path: string, event = true) => {
+    for (const created of createdFiles) {
+      if (created.file.path === oldPath || created.file.path.startsWith(`${oldPath}/`)) {
+        created.file.path = `${path}${created.file.path.slice(oldPath.length)}`;
+      }
+    }
+    if (!event) return;
+    for (const listener of events.get("rename") ?? []) {
+      listener(Object.assign(new TFile(), {path, stat: createdAt(path)?.file.stat ?? {mtime: 1, size: 0}}), oldPath);
+    }
+  };
   const app = {
     secretStorage,
     vault: {
@@ -281,9 +316,13 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
         read: async (path: string) => { if (localRoot) return readFile(join(localRoot, path), "utf8"); const body = diagnosticFiles.get(path); if (body === undefined) throw new Error("Missing file"); return body; },
         write: async (path: string, body: string) => { if (localRoot) {await mkdir(dirname(join(localRoot, path)), {recursive: true}); await writeFile(join(localRoot, path), body);} else diagnosticFiles.set(path, body); },
       },
-      getFiles: () => localPresent ? [file] : [],
-      getAbstractFileByPath: (path: string) => localPresent && path === file.path ? file : null,
-      readBinary: () => localRoot ? readFile(join(localRoot, initialFile.path)).then(body => Uint8Array.from(body).buffer) : Promise.resolve(new TextEncoder().encode(text).buffer),
+      getFiles: () => [...(localPresent ? [file] : []), ...createdFiles.map(created => created.file)],
+      getAbstractFileByPath: (path: string) => localPresent && path === file.path ? file : createdAt(path)?.file ?? null,
+      readBinary: (target?: TFile) => {
+        const created = createdFiles.find(candidate => candidate.file === target);
+        if (created) return Promise.resolve(new TextEncoder().encode(created.text).buffer);
+        return localRoot ? readFile(join(localRoot, initialFile.path)).then(body => Uint8Array.from(body).buffer) : Promise.resolve(new TextEncoder().encode(text).buffer);
+      },
       on: (name: string, listener: (file: TFile, oldPath?: string) => void) => {
         const listeners = events.get(name) ?? [];
         listeners.push(listener);
@@ -313,7 +352,7 @@ const setup = async (initialized = true, configDir = ".obsidian", initialFile = 
   await plugin.onload();
   if (loopback) cleanups.push(() => {plugin.onunload(); return Promise.resolve();});
   const setLocalPresent = (present: boolean) => {localPresent = present;};
-  return { plugin, remote, hooks, edit, rename, setLocalPresent, localText: () => localRoot ? readFileSync(join(localRoot, initialFile.path), "utf8") : text, app, objects, diagnosticFiles, wire, localRoot };
+  return { plugin, remote, hooks, edit, rename, createFile, editCreated, renameCreated, setLocalPresent, localText: () => localRoot ? readFileSync(join(localRoot, initialFile.path), "utf8") : text, app, objects, diagnosticFiles, wire, localRoot };
 };
 
 afterEach(async () => {
@@ -2068,6 +2107,249 @@ describe("local sync activity on the desktop", () => {
       expect(plugin.getPendingBulkDeletion()).toBeUndefined();
       expect(manualRecords(plugin)).toEqual([expect.objectContaining({summary: "确认批量删除：1 个文件",
         files: [{kind: "deleted", path: "notes/example.md"}]})]);
+      plugin.onunload();
+    });
+  });
+});
+
+describe("renaming a new file while its first upload is running", () => {
+  const remoteEntries = async (remote: RemoteStore) =>
+    Object.values((await remote.readSnapshot((await remote.readHead())!.value)).entries);
+  const pendingRenames = () => (host.data as {pendingPathRenames: unknown}).pendingPathRenames;
+  const expectClean = (plugin: S3VaultSyncPlugin) => {
+    expect(plugin.getLocalIssues()).toEqual([]);
+    expect(host.openedModals).toHaveLength(0);
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+  };
+  // Head 冲突重试之间的等待走假时钟：边拨时钟边等这次同步结束
+  const settle = async (run: Promise<unknown>) => {
+    let done = false;
+    void run.finally(() => { done = true; });
+    for (let step = 0; !done; step++) {
+      if (step >= 2_000) throw new Error("同步一直没有结束");
+      await vi.advanceTimersByTimeAsync(50);
+      if (!done) await realDelay(1);
+    }
+    await run;
+  };
+  // 新名字上只有原 Entry 一个 live 记录，旧路径既没有 live 记录也没有删除记录
+  const expectFollowedRename = async (remote: RemoteStore, entryId: string, fromPath: string, toPath: string, body: string) => {
+    const entries = await remoteEntries(remote);
+    const moved = entries.find(entry => entry.entryId === entryId);
+    if (moved?.kind !== "live") throw new Error("Expected the original Entry to stay live");
+    expect(moved.path).toBe(toPath);
+    expect(new TextDecoder().decode(await remote.readBlob(moved.revision.blobId))).toBe(body);
+    expect(entries.filter(entry => entry.path === fromPath)).toEqual([]);
+    expect(entries.filter(entry => entry.kind === "live" && entry.path === toPath)).toHaveLength(1);
+  };
+  const publishedEntryId = async (remote: RemoteStore, path: string) => {
+    const entry = (await remoteEntries(remote)).find(candidate => candidate.kind === "live" && candidate.path === path);
+    if (!entry) throw new Error(`Expected ${path} to be published`);
+    return entry.entryId;
+  };
+
+  it.each([
+    ["after its data block PUT", "afterBlobPut", "改好的正文。"],
+    ["after its Head PUT", "afterHeadPut", "改好的正文。"],
+    ["after its data block PUT without changing the empty content", "afterBlobPut", ""],
+    ["after its Head PUT without changing the empty content", "afterHeadPut", ""],
+  ] as const)("follows a rename %s on the next synchronization", async (_name, hook, body) => {
+    const {plugin, remote, hooks, createFile, editCreated, renameCreated} = await setup();
+    createFile("notes/未命名.md", "");
+    hooks[hook] = () => {
+      hooks[hook] = undefined;
+      renameCreated("notes/未命名.md", "notes/新名字.md");
+      if (body) editCreated("notes/新名字.md", body);
+    };
+    await plugin.togglePause();
+    const entryId = await publishedEntryId(remote, "notes/未命名.md");
+
+    await plugin.syncNow();
+
+    expectClean(plugin);
+    await expectFollowedRename(remote, entryId, "notes/未命名.md", "notes/新名字.md", body);
+    expect(pendingRenames()).toEqual({});
+    plugin.onunload();
+  });
+
+  it("follows a folder rename during the first upload of a file inside it", async () => {
+    const {plugin, remote, hooks, createFile, renameCreated} = await setup();
+    createFile("草稿/未命名.md", "");
+    hooks.afterBlobPut = () => {
+      hooks.afterBlobPut = undefined;
+      renameCreated("草稿", "定稿");
+    };
+    await plugin.togglePause();
+    const entryId = await publishedEntryId(remote, "草稿/未命名.md");
+
+    await plugin.syncNow();
+
+    expectClean(plugin);
+    await expectFollowedRename(remote, entryId, "草稿/未命名.md", "定稿/未命名.md", "");
+    plugin.onunload();
+  });
+
+  it.each([
+    ["data block PUT", (hooks: Awaited<ReturnType<typeof setup>>["hooks"]) => { hooks.failNextBlobPut = true; }],
+    ["Head PUT", (hooks: Awaited<ReturnType<typeof setup>>["hooks"]) => { hooks.failNextHeadPut = 503; }],
+  ] as const)("uploads the new name as a new file when the %s of the renamed upload fails", async (_name, fail) => {
+    const {plugin, remote, hooks, createFile, editCreated, renameCreated} = await setup();
+    createFile("notes/未命名.md", "");
+    fail(hooks);
+    hooks.afterBlobPut = () => {
+      hooks.afterBlobPut = undefined;
+      renameCreated("notes/未命名.md", "notes/新名字.md");
+      editCreated("notes/新名字.md", "改好的正文。");
+    };
+    await plugin.togglePause();
+    expect((await remoteEntries(remote)).map(entry => entry.path)).toEqual(["notes/example.md"]);
+    expect(Object.keys(pendingRenames() as object)).toEqual(["notes/未命名.md"]);
+    host.openedModals = [];
+
+    await plugin.syncNow();
+
+    expectClean(plugin);
+    expect(host.notices).toEqual([]);
+    const entries = await remoteEntries(remote);
+    expect(entries.map(entry => [entry.kind, entry.path]).sort()).toEqual([["live", "notes/example.md"], ["live", "notes/新名字.md"]]);
+    await plugin.syncNow();
+    expectClean(plugin);
+    expect(pendingRenames()).toEqual({});
+    plugin.onunload();
+  });
+
+  it("keeps one live Entry at the new name when the renamed upload loses a Head race", async () => {
+    const {plugin, remote, hooks, createFile, editCreated, renameCreated} = await setup();
+    createFile("notes/未命名.md", "");
+    hooks.failNextHeadPut = 412;
+    hooks.afterBlobPut = () => {
+      hooks.afterBlobPut = undefined;
+      renameCreated("notes/未命名.md", "notes/新名字.md");
+      editCreated("notes/新名字.md", "改好的正文。");
+    };
+    await settle(plugin.togglePause());
+    await settle(plugin.syncNow());
+    await settle(plugin.syncNow());
+
+    expectClean(plugin);
+    expect(host.notices).toEqual([]);
+    const entries = await remoteEntries(remote);
+    expect(entries.map(entry => [entry.kind, entry.path]).sort()).toEqual([["live", "notes/example.md"], ["live", "notes/新名字.md"]]);
+    expect(pendingRenames()).toEqual({});
+    plugin.onunload();
+  });
+
+  it("uses the Entry ID of the retried attempt for a rename during the upload after a Head race", async () => {
+    const {plugin, remote, hooks, createFile, editCreated, renameCreated} = await setup();
+    createFile("notes/未命名.md", "");
+    hooks.failNextHeadPut = 412;
+    let blobPuts = 0;
+    hooks.afterBlobPut = () => {
+      // 第一次尝试的 Head PUT 撞上 412；第二次尝试上传时改名
+      if (++blobPuts !== 2) return;
+      hooks.afterBlobPut = undefined;
+      renameCreated("notes/未命名.md", "notes/新名字.md");
+      editCreated("notes/新名字.md", "改好的正文。");
+    };
+    await settle(plugin.togglePause());
+    expect(plugin.getStatusText()).toMatch(/^空闲：/u);
+    expect(blobPuts).toBe(2);
+    const entryId = await publishedEntryId(remote, "notes/未命名.md");
+
+    await settle(plugin.syncNow());
+
+    expectClean(plugin);
+    await expectFollowedRename(remote, entryId, "notes/未命名.md", "notes/新名字.md", "改好的正文。");
+    plugin.onunload();
+  });
+
+  it("forgets the uploading new files once a synchronization ends", async () => {
+    const {plugin, remote, hooks, createFile, renameCreated} = await setup();
+    createFile("notes/未命名.md", "");
+    hooks.failNextBlobPut = true;
+    await plugin.togglePause();
+    expect((await remoteEntries(remote)).map(entry => entry.path)).toEqual(["notes/example.md"]);
+
+    renameCreated("notes/未命名.md", "notes/新名字.md");
+    await plugin.saveSettings();
+
+    expect(pendingRenames()).toEqual({});
+    plugin.onunload();
+  });
+
+  describe("unchanged behavior", () => {
+    it("follows a rename made after the first upload finished", async () => {
+      const {plugin, remote, createFile, editCreated, renameCreated} = await setup();
+      createFile("notes/未命名.md", "");
+      await plugin.togglePause();
+      const entryId = await publishedEntryId(remote, "notes/未命名.md");
+      renameCreated("notes/未命名.md", "notes/新名字.md");
+      editCreated("notes/新名字.md", "改好的正文。");
+
+      await plugin.syncNow();
+
+      expectClean(plugin);
+      await expectFollowedRename(remote, entryId, "notes/未命名.md", "notes/新名字.md", "改好的正文。");
+      plugin.onunload();
+    });
+
+    it("uploads only the new name for a rename made before the first synchronization", async () => {
+      const {plugin, remote, createFile, editCreated, renameCreated} = await setup();
+      createFile("notes/未命名.md", "");
+      renameCreated("notes/未命名.md", "notes/新名字.md");
+      editCreated("notes/新名字.md", "改好的正文。");
+
+      await plugin.togglePause();
+
+      expectClean(plugin);
+      expect(pendingRenames()).toEqual({});
+      expect((await remoteEntries(remote)).map(entry => [entry.kind, entry.path]).sort())
+        .toEqual([["live", "notes/example.md"], ["live", "notes/新名字.md"]]);
+      plugin.onunload();
+    });
+
+    it("still asks for a move review when the file is moved on disk without a rename event", async () => {
+      const {plugin, hooks, createFile, editCreated, renameCreated} = await setup();
+      createFile("notes/未命名.md", "");
+      hooks.afterBlobPut = () => {
+        hooks.afterBlobPut = undefined;
+        renameCreated("notes/未命名.md", "notes/新名字.md", false);
+        editCreated("notes/新名字.md", "改好的正文。");
+      };
+      await plugin.togglePause();
+      expect(pendingRenames()).toEqual({});
+
+      await plugin.syncNow();
+
+      expect(plugin.getLocalIssues()).toEqual([expect.objectContaining({
+        kind: "possible-rename", oldPaths: ["notes/未命名.md"], newPaths: ["notes/新名字.md"],
+      })]);
+      expect(host.openedModals).toHaveLength(1);
+      plugin.onunload();
+    });
+
+    it.each([
+      ["an already synchronized file", false],
+      ["a new file renamed during its first upload", true],
+    ] as const)("reports a path collision when a new file appears at the old path of %s", async (_name, duringUpload) => {
+      const {plugin, hooks, createFile, renameCreated} = await setup();
+      createFile("notes/未命名.md", "");
+      const renameAndRecreate = () => {
+        renameCreated("notes/未命名.md", "notes/新名字.md");
+        createFile("notes/未命名.md", "又一篇新笔记。");
+      };
+      if (duringUpload) {
+        hooks.afterBlobPut = () => {
+          hooks.afterBlobPut = undefined;
+          renameAndRecreate();
+        };
+      }
+      await plugin.togglePause();
+      if (!duringUpload) renameAndRecreate();
+
+      await plugin.syncNow();
+
+      expect(plugin.getLocalIssues()).toContainEqual({kind: "path-collision", paths: ["notes/未命名.md"]});
       plugin.onunload();
     });
   });
