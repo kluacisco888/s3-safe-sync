@@ -202,6 +202,9 @@ export default class S3VaultSyncPlugin
   // 这一轮网络类可重试错误第一次失败的时间；同步成功或出现非网络错误时清空
   private networkFailureSince: number | undefined;
   private pathRenames = new PathRenameTracker();
+  // 这次同步尝试正在上传的新文件：路径 -> 计划分配的 Entry ID。它们还不在 Sync Cache 里，
+  // 上传中被改名时改名处理把它们和缓存文件一样记成 Pending Path Rename。每次尝试换新，同步结束清空
+  private uploadingNewFiles: ReadonlyMap<string, string> = new Map();
   private credentials!: CredentialStore;
   private data!: PersistedPluginData;
   private diagnostics!: SyncDiagnostics;
@@ -1337,6 +1340,7 @@ export default class S3VaultSyncPlugin
       const retryHashMemo = new Map<string, VerifiedLocalFile>();
       const result = await retryHeadChanges(
         async (attempt, totalAttempts) => {
+          this.uploadingNewFiles = new Map();
           this.setStatus(
             "Syncing",
             `正在同步（第 ${attempt}/${totalAttempts} 次尝试）。`,
@@ -1359,6 +1363,9 @@ export default class S3VaultSyncPlugin
               fullHashVerification:
                 fullHashVerification && attempt === 1,
               onDownloadApplied: change => downloads.push(change),
+              onNewFilesPlanned: entryIdsByPath => {
+                this.uploadingNewFiles = entryIdsByPath;
+              },
               pathRenames: this.pathRenames.toPathMap(pathRenameSnapshot),
               renameResolution: this.approvedRenameResolution,
               retryHashMemo,
@@ -1474,6 +1481,7 @@ export default class S3VaultSyncPlugin
         }
       }
     } finally {
+      this.uploadingNewFiles = new Map();
       diagnostic.nextRetryAt = this.networkRetryAt ?? this.headRetryAt;
       this.activeRun = undefined;
       await this.diagnostics.finish(diagnostic);
@@ -1748,8 +1756,15 @@ export default class S3VaultSyncPlugin
       this.app.vault.on("rename", (file, oldPath) => {
         if (this.session.signal.aborted) return;
         if (isInternalStagingRename(oldPath, file.path, this.app.vault.configDir)) return;
+        const cachedFiles = this.data.cache?.files ?? {};
         const dirtyRenamePaths = this.pathRenames.record(
-          Object.values(this.data.cache?.files ?? {}),
+          [
+            ...Object.values(cachedFiles),
+            // 正在第一次上传的新文件还不在缓存里；同一路径缓存里已有时以缓存为准
+            ...[...this.uploadingNewFiles].flatMap(([path, entryId]) =>
+              cachedFiles[path] ? [] : [{ entryId, path }],
+            ),
+          ],
           oldPath,
           file.path,
         );

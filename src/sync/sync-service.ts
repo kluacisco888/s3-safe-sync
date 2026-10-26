@@ -268,6 +268,9 @@ export interface SynchronizeOptions extends SyncScanOptions {
   assertLocalObservationCurrent?: () => void;
   // 每个本地动作落地后立即交出；之后的上传或发布失败时，调用方仍知道哪些文件已经下载
   onDownloadApplied?: (change: SyncFileChange) => void;
+  // 计划出要上传的新文件后、开始下载和上传前交出「路径 -> 计划分配的 Entry ID」；没有要上传的新文件时不调用。
+  // 调用方据此把这次上传中被改名的新文件记成 Pending Path Rename
+  onNewFilesPlanned?: (entryIdsByPath: ReadonlyMap<string, string>) => void;
   pathRenames?: ReadonlyMap<string, PersistedPathRename>;
   renameResolution?: PossibleRenameResolution;
 }
@@ -1835,6 +1838,12 @@ export class SyncService {
         conflict.kind === "edit-delete" ||
         conflict.kind === "edit-edit",
     );
+    const newFileEntryIds = new Map(
+      plan.remoteChanges.flatMap((change) =>
+        change.kind === "upload-new" ? [[change.path, change.entryId] as const] : [],
+      ),
+    );
+    if (newFileEntryIds.size > 0) syncOptions.onNewFilesPlanned?.(newFileEntryIds);
     await this.assertRemoteEntriesBeforePublication(
       remote,
       new Set([
