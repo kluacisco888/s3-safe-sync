@@ -1328,6 +1328,20 @@ describe("SyncEngine", () => {
       expect(plan.remoteChanges).toEqual([]);
     });
 
+    it.each([
+      ["the accepted deletion first", ["w", "z"]],
+      ["the accepted deletion last", ["z", "w"]],
+    ])("uploads a file at a path with two deletions, preferring the one this device accepted, with %s", (_, order) => {
+      const tombstones = { w: tombstone("w", path, ""), z: tombstone("z", path, "") };
+      const plan = engine().reconcile({
+        base: snapshot([tombstone("w", path, "")], "commit-base"),
+        local: observe([file(path, "")]),
+        remote: snapshot(order.map((id) => tombstones[id as "w" | "z"]), "commit-remote"),
+      });
+
+      uploadedAsNew(plan, "");
+    });
+
     it("still compares with the deletion when this device never saw a deletion at that path", () => {
       const plan = engine().reconcile({
         base: snapshot([], "commit-base"),

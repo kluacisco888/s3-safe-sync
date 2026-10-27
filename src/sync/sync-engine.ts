@@ -387,11 +387,19 @@ export class SyncEngine {
     const localActions: LocalAction[] = [];
     const remoteChanges: RemoteChange[] = [];
     const remoteEntries = Object.values(remote.entries);
+    // 本设备 base 里已经是 deleted 的墓碑：这次删除本设备已经接受过
+    const acceptedDeletion = (entry: VaultEntry): boolean =>
+      entry.kind === "deleted" && base?.entries[entry.entryId]?.kind === "deleted";
     const remoteByPath = new Map<string, VaultEntry>();
     for (const entry of remoteEntries) {
       const owner = remoteByPath.get(entry.path);
       // A historical tombstone must not shadow the current owner after a path is reused.
-      if (!owner || owner.kind === "deleted" || entry.kind !== "deleted") {
+      // 只有墓碑的路径上优先取本设备已接受的那条，结果不随记录里的条目顺序变
+      if (
+        !owner ||
+        entry.kind !== "deleted" ||
+        (owner.kind === "deleted" && (!acceptedDeletion(owner) || acceptedDeletion(entry)))
+      ) {
         remoteByPath.set(entry.path, entry);
       }
     }
@@ -412,9 +420,6 @@ export class SyncEngine {
       !rejectedStaleCopyEntryIds?.has(entry.entryId) &&
       !deferredEntryIds.has(entry.entryId) &&
       matchesRecordedRevision(entry, file);
-    // 本设备 base 里已经是 deleted 的墓碑：这次删除本设备已经接受过
-    const acceptedDeletion = (entry: VaultEntry): boolean =>
-      entry.kind === "deleted" && base?.entries[entry.entryId]?.kind === "deleted";
     // 无身份的本机文件在这个路径上对应的远端条目；本设备已接受的墓碑不再算，路径上的文件当新文件
     const pathOwner = (path: string): VaultEntry | undefined => {
       const owner = remoteByPath.get(path);
