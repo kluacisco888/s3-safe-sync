@@ -1288,5 +1288,66 @@ describe("SyncEngine", () => {
       expect(plan.conflicts).toEqual([]);
       expect(plan.localActions).toHaveLength(30);
     });
+
+    // 本设备已经接受过这条删除（base 里是 deleted），又在同一路径新建了文件
+    const uploadedAsNew = (plan: ReturnType<SyncEngine["reconcile"]>, hash: string) => {
+      expect(plan.conflicts).toEqual([]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toEqual([{ entryId: "new-1", file: file(path, hash), kind: "upload-new", path }]);
+    };
+
+    it("uploads an empty file created at the path of a deletion this device already accepted", () => {
+      const plan = engine().reconcile({
+        base: snapshot([tombstone("w", path, "")], "commit-base"),
+        local: observe([file(path, "")]),
+        remote: snapshot([tombstone("w", path, "")], "commit-remote"),
+      });
+
+      uploadedAsNew(plan, "");
+    });
+
+    it("uploads a non-empty file created at the path of a deletion this device already accepted", () => {
+      const plan = engine().reconcile({
+        base: snapshot([tombstone("w", path, "v1")], "commit-base"),
+        local: observe([file(path, "fresh")]),
+        remote: snapshot([tombstone("w", path, "v1")], "commit-remote"),
+      });
+
+      uploadedAsNew(plan, "fresh");
+    });
+
+    it("asks to import a file at an accepted deletion's path while the first sync is pending", () => {
+      const plan = engine().reconcile({
+        base: snapshot([tombstone("w", path, "v1")], "commit-base"),
+        local: observe([file(path, "fresh")], { bootstrapPending: true }),
+        remote: snapshot([tombstone("w", path, "v1")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toMatchObject([{ kind: "import-candidate", path }]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
+
+    it("still compares with the deletion when this device never saw a deletion at that path", () => {
+      const plan = engine().reconcile({
+        base: snapshot([], "commit-base"),
+        local: observe([file(path, "")]),
+        remote: snapshot([tombstone("z", path, "")], "commit-remote"),
+      });
+
+      expect(plan.localActions).toEqual([{ entryId: "z", kind: "delete-local", path }]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
+
+    it("still compares with a live Entry that took over the path of an accepted deletion", () => {
+      const plan = engine().reconcile({
+        base: snapshot([tombstone("w", path, "v1")], "commit-base"),
+        local: observe([file(path, "fresh")]),
+        remote: snapshot([tombstone("w", path, "v1"), live("y", path, "y1")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toMatchObject([{ kind: "bootstrap-mismatch", path }]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
   });
 });

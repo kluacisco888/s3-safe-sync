@@ -7205,6 +7205,31 @@ describe("cleaning expired content out of the remote record", () => {
       await expect(fixture.phone.synchronize()).resolves.toMatchObject({ deleted: 1, status: "complete" });
       expect(fixture.phoneVault.readText("note.md")).toBeUndefined();
     });
+
+    it.each([
+      ["an empty file", ""],
+      ["a non-empty file", "fresh start"],
+    ])("uploads %s created at the path of a deletion this device already accepted", async (_, content) => {
+      const fixture = await setup({ "未命名.md": "" });
+      await fixture.phoneVault.delete("未命名.md");
+      await expect(fixture.phone.synchronize()).resolves.toMatchObject({ status: "complete" });
+      await expect(fixture.desktop.synchronize()).resolves.toMatchObject({ deleted: 1, status: "complete" });
+      const accepted = await entryAt(fixture.observer, "未命名.md");
+      expect(accepted).toMatchObject({ kind: "deleted" });
+
+      await fixture.desktopVault.write("未命名.md", text(content));
+      await expect(fixture.desktop.synchronize()).resolves.toMatchObject({ deleted: 0, status: "complete", uploaded: 1 });
+
+      expect(fixture.desktopVault.readText("未命名.md")).toBe(content);
+      const atPath = Object.values((await readCurrent(fixture.observer)).snapshot.entries)
+        .filter((entry) => entry.path === "未命名.md");
+      expect(atPath.map((entry) => entry.kind).sort()).toEqual(["deleted", "live"]);
+      const created = atPath.find((entry) => entry.kind === "live")!;
+      expect(created.entryId).not.toBe(accepted.entryId);
+      // 已接受删除的另一台设备能下载到它
+      await expect(fixture.phone.synchronize()).resolves.toMatchObject({ downloaded: 1, status: "complete" });
+      expect(fixture.phoneVault.readText("未命名.md")).toBe(content);
+    });
   });
 
   describe("listing and removing what the user confirmed", () => {

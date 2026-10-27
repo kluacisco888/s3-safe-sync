@@ -412,11 +412,19 @@ export class SyncEngine {
       !rejectedStaleCopyEntryIds?.has(entry.entryId) &&
       !deferredEntryIds.has(entry.entryId) &&
       matchesRecordedRevision(entry, file);
+    // 本设备 base 里已经是 deleted 的墓碑：这次删除本设备已经接受过
+    const acceptedDeletion = (entry: VaultEntry): boolean =>
+      entry.kind === "deleted" && base?.entries[entry.entryId]?.kind === "deleted";
+    // 无身份的本机文件在这个路径上对应的远端条目；本设备已接受的墓碑不再算，路径上的文件当新文件
+    const pathOwner = (path: string): VaultEntry | undefined => {
+      const owner = remoteByPath.get(path);
+      return owner && !acceptedDeletion(owner) ? owner : undefined;
+    };
 
     for (const file of local.files) {
       const remoteEntry = file.entryId
         ? remote.entries[file.entryId]
-        : remoteByPath.get(file.path);
+        : pathOwner(file.path);
       const baseEntry = remoteEntry
         ? base?.entries[remoteEntry.entryId]
         : undefined;
@@ -775,7 +783,7 @@ export class SyncEngine {
       if (file.entryId) {
         continue;
       }
-      const knownPath = remoteByPath.has(file.path);
+      const knownPath = pathOwner(file.path) !== undefined;
       if (!knownPath) {
         if (base && !local.bootstrapPending) {
           remoteChanges.push({
