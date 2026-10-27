@@ -2767,7 +2767,9 @@ export class SyncService {
     const rejected = new Set<string>();
     for (const staleCopy of plan.staleCopies ?? []) {
       try {
-        await this.assertRemoteRecoveryForLocalContent(input.remote, staleCopy.entryId, staleCopy.contentHash);
+        await this.assertRemoteRecoveryForLocalContent(
+          input.remote, staleCopy.entryId, staleCopy.contentHash, staleCopy.acceptedBaseContentHash,
+        );
       } catch (error) {
         if (!(error instanceof RemoteStateError)) throw error;
         rejected.add(staleCopy.entryId);

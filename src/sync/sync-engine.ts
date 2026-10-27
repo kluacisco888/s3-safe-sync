@@ -205,11 +205,14 @@ export interface SyncPlan {
   conflicts: SyncConflict[];
   localActions: LocalAction[];
   remoteChanges: RemoteChange[];
-  // 按旧副本规则改成下载的 Entry 及被替换的本地内容；执行前要核实远端有它的恢复副本
+  // 按旧副本规则改成下载的 Entry、或远端删除时按 base 判定没改过而要删的 Entry，及被替换的本地内容；
+  // 执行前要核实远端有它的恢复副本
   staleCopies?: StaleCopy[];
 }
 
 export interface StaleCopy {
+  // 本机已接受的 base 内容；远端记录已不引用它时不再要求恢复副本（不变量 9 的例外）
+  acceptedBaseContentHash?: string;
   contentHash: string;
   entryId: string;
 }
@@ -450,17 +453,27 @@ export class SyncEngine {
         continue;
       }
       // 本机还是本设备 base 那一版、在 base 路径上，当成没改过：远端的删除包含了本机这份。
-      // 删除记录没有恢复副本时不这样认（delete-edit 冲突选了「保留删除」而 base 已被清理），退回 edit-delete
+      // 删除记录没有恢复副本时不这样认（delete-edit 冲突选了「保留删除」而 base 已被清理），退回 edit-delete；
+      // 本机这一版在远端核实不了恢复副本时同样退回 edit-delete
       const unchangedSinceBase =
         remoteEntry?.kind === "deleted" &&
         remoteEntry.recovery !== undefined &&
         baseEntry?.kind === "live" &&
         file.path === baseEntry.path &&
-        file.contentHash === baseEntry.revision.contentHash;
+        file.contentHash === baseEntry.revision.contentHash &&
+        !rejectedStaleCopyEntryIds?.has(remoteEntry.entryId);
       if (
         remoteEntry?.kind === "deleted" &&
         (remoteEntry.lastContentHash === file.contentHash || unchangedSinceBase)
       ) {
+        if (remoteEntry.lastContentHash !== file.contentHash) {
+          // 删的不是删除记录那一版：执行前先核实本机这一版在远端可恢复（不变量 9），已被清理出记录时放行
+          staleCopies.push({
+            acceptedBaseContentHash: file.contentHash,
+            contentHash: file.contentHash,
+            entryId: remoteEntry.entryId,
+          });
+        }
         localActions.push({
           entryId: remoteEntry.entryId,
           kind: "delete-local",

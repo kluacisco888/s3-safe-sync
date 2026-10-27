@@ -1169,6 +1169,29 @@ describe("SyncEngine", () => {
       expect(plan.remoteChanges).toEqual([]);
     });
 
+    it("asks to verify the base copy it deletes, accepting it once the record no longer holds it", () => {
+      const plan = engine().reconcile({
+        base: snapshot([live("x", path, "v1")], "commit-base"),
+        local: observe([file(path, "v1", "x")]),
+        remote: snapshot([tombstone("x", path, "v2")], "commit-remote"),
+      });
+
+      expect(plan.staleCopies).toEqual([{ acceptedBaseContentHash: "sha256:v1", contentHash: "sha256:v1", entryId: "x" }]);
+    });
+
+    it("keeps an edit-delete Conflict for a base copy whose Recovery Copy could not be verified", () => {
+      const plan = engine().reconcile({
+        base: snapshot([live("x", path, "v1")], "commit-base"),
+        local: observe([file(path, "v1", "x")]),
+        rejectedStaleCopyEntryIds: new Set(["x"]),
+        remote: snapshot([tombstone("x", path, "v2")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toMatchObject([{ entryId: "x", kind: "edit-delete", path }]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.staleCopies).toBeUndefined();
+    });
+
     it("still deletes a copy that matches the deleted content", () => {
       const plan = engine().reconcile({
         base: snapshot([live("x", path, "v1")], "commit-base"),
@@ -1178,6 +1201,8 @@ describe("SyncEngine", () => {
 
       expect(plan.conflicts).toEqual([]);
       expect(plan.localActions).toEqual([{ entryId: "x", kind: "delete-local", path }]);
+      // 删的正是删除记录那一版，由删除前检查读它的恢复副本，不另核
+      expect(plan.staleCopies).toBeUndefined();
     });
 
     it("keeps an edit-delete Conflict for a base copy when the Deletion Record has no Recovery Copy", () => {

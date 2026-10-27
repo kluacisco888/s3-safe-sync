@@ -7142,6 +7142,69 @@ describe("cleaning expired content out of the remote record", () => {
 
       expect(fixture.phoneVault.readText("note.md")).toBeUndefined();
     });
+
+    it("still publishes unrelated edits on the device that edited a note whose kept Deletion Record has no Recovery Copy", async () => {
+      const fixture = await keptDeletionAfterPurgedBase();
+      await fixture.desktopVault.write("b.md", text("desktop b"));
+
+      // S4：不抛「缺少恢复副本」，本机 v1 进冲突候选，无关的 b.md 照常发布
+      await expect(fixture.desktop.synchronize()).resolves.toMatchObject({ deleted: 0, status: "action-required" });
+
+      expect(await entryAt(fixture.observer, "note.md")).toMatchObject({ kind: "conflicted", reason: "edit-delete" });
+      const published = await entryAt(fixture.observer, "b.md") as LiveEntry;
+      expect(new TextDecoder().decode(await fixture.observer.readBlob(published.revision.blobId))).toBe("desktop b");
+    });
+
+    // 记录仍引用手机这份 V1，但 V1 的数据块读不回来
+    const editedThenDeletedWithLostBase = async () => {
+      const fixture = await setup({ "note.md": "V1" });
+      const v1 = (await entryAt(fixture.observer, "note.md") as LiveEntry).revision;
+      fixture.objects.serverDate = at(1);
+      await fixture.desktopVault.write("note.md", text("V2"));
+      await fixture.desktop.synchronize();
+      await fixture.desktopVault.delete("note.md");
+      await expect(fixture.desktop.synchronize()).resolves.toMatchObject({ status: "complete" });
+      const deleted = await entryAt(fixture.observer, "note.md") as DeletedEntry;
+      expect((deleted.history ?? []).some((revision) => revision.revisionId === v1.revisionId)).toBe(true);
+      fixture.objects.serverDate = at(2);
+      return { ...fixture, v1 };
+    };
+
+    it("keeps an edit-delete Conflict when the record still holds the base copy but it fails verification", async () => {
+      const fixture = await editedThenDeletedWithLostBase();
+      await fixture.objects.put(`${prefix}/v1/blobs/${fixture.v1.blobId}`, text("corrupted ciphertext"));
+      await fixture.phoneVault.write("b.md", text("phone b"));
+
+      await expect(fixture.phone.synchronize()).resolves.toMatchObject({ deleted: 0, status: "action-required" });
+
+      expect(fixture.phoneVault.readText("note.md")).toBeUndefined();
+      const conflict = await entryAt(fixture.observer, "note.md");
+      expect(conflict).toMatchObject({ kind: "conflicted", reason: "edit-delete" });
+      const candidates = conflict.kind === "conflicted" ? conflict.candidates : [];
+      expect(candidates.map((candidate) => candidate.contentHash)).toEqual([await sha256Content(text("V1"))]);
+      expect(new TextDecoder().decode(await fixture.observer.readBlob(candidates[0]!.blobId))).toBe("V1");
+      // 别的改动照常发布
+      expect(await entryAt(fixture.observer, "b.md")).toMatchObject({ kind: "live" });
+    });
+
+    it("reports a network failure while verifying the base copy without deleting it", async () => {
+      const fixture = await editedThenDeletedWithLostBase();
+      fixture.objects.onGet = (key) => {
+        if (key.endsWith(`/blobs/${fixture.v1.blobId}`)) {
+          fixture.objects.onGet = undefined;
+          throw new Error("temporary recovery read network failure");
+        }
+      };
+
+      const synchronization = fixture.phone.synchronize();
+
+      await expect(synchronization).rejects.toThrow("temporary recovery read network failure");
+      await expect(synchronization).rejects.not.toBeInstanceOf(RemoteStateError);
+      expect(fixture.phoneVault.readText("note.md")).toBe("V1");
+      // 网络恢复后照常删除
+      await expect(fixture.phone.synchronize()).resolves.toMatchObject({ deleted: 1, status: "complete" });
+      expect(fixture.phoneVault.readText("note.md")).toBeUndefined();
+    });
   });
 
   describe("listing and removing what the user confirmed", () => {
