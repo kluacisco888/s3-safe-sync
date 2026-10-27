@@ -449,9 +449,17 @@ export class SyncEngine {
       ) {
         continue;
       }
+      // 本机还是本设备 base 那一版、在 base 路径上，当成没改过：远端的删除包含了本机这份。
+      // 删除记录没有恢复副本时不这样认（delete-edit 冲突选了「保留删除」而 base 已被清理），退回 edit-delete
+      const unchangedSinceBase =
+        remoteEntry?.kind === "deleted" &&
+        remoteEntry.recovery !== undefined &&
+        baseEntry?.kind === "live" &&
+        file.path === baseEntry.path &&
+        file.contentHash === baseEntry.revision.contentHash;
       if (
         remoteEntry?.kind === "deleted" &&
-        remoteEntry.lastContentHash === file.contentHash
+        (remoteEntry.lastContentHash === file.contentHash || unchangedSinceBase)
       ) {
         localActions.push({
           entryId: remoteEntry.entryId,

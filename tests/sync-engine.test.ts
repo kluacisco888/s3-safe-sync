@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   SyncEngine,
+  type ObservedFile,
   type ReplicaObservation,
+  type RevisionRef,
+  type VaultEntry,
   type VaultSnapshot,
 } from "../src/sync/sync-engine";
 
@@ -1118,6 +1121,147 @@ describe("SyncEngine", () => {
       expect(plan.localActions).toEqual([]);
       expect(plan.remoteChanges).toEqual([]);
       expect(plan.staleCopies).toBeUndefined();
+    });
+  });
+
+  // 远端是删除记录时，和其他行一样拿本设备的 base 判断本机有没有改过
+  describe("a remote deletion compared with this device's base", () => {
+    const revision = (hash: string): RevisionRef => ({
+      blobId: `blob-${hash}`, contentHash: `sha256:${hash}`, createdAt: "2026-09-01T00:00:00.000Z",
+      revisionId: `revision-${hash}`, size: hash.length,
+    });
+    const live = (entryId: string, path: string, hash: string): VaultEntry => ({
+      entryId, kind: "live", path, revision: revision(hash),
+    });
+    const tombstone = (entryId: string, path: string, lastHash: string, withRecovery = true): VaultEntry => ({
+      deletedAt: "2026-09-02T00:00:00.000Z", entryId, kind: "deleted", lastContentHash: `sha256:${lastHash}`,
+      lastRevisionId: `revision-${lastHash}`, path,
+      ...(withRecovery ? { recovery: { ...revision(lastHash), expiresAt: "2026-10-02T00:00:00.000Z" } } : {}),
+    });
+    const file = (path: string, hash: string, entryId?: string): ObservedFile => ({
+      contentHash: `sha256:${hash}`, path, size: hash.length, ...(entryId ? { entryId } : {}),
+    });
+    // 另有几篇无关笔记，删除一篇不会被当成 Bulk Deletion
+    const others = Array.from({ length: 10 }, (_, index) => live(`other-${index}`, `other-${index}.md`, `o${index}`));
+    const otherFiles = others.map((entry) => file(entry.path, `o${entry.entryId.slice(6)}`, entry.entryId));
+    const snapshot = (entries: VaultEntry[], commitId: string): VaultSnapshot => ({
+      commitId, entries: Object.fromEntries([...others, ...entries].map((entry) => [entry.entryId, entry])),
+      protocolVersion: 1, vaultId: "vault-1",
+    });
+    const observe = (files: ObservedFile[], extra: Partial<ReplicaObservation> = {}): ReplicaObservation => ({
+      basedOnCommitId: "commit-base", files: [...otherFiles, ...files], replicaId: "phone", ...extra,
+    });
+    const engine = (): SyncEngine => {
+      let next = 0;
+      return new SyncEngine(() => `new-${++next}`);
+    };
+    const path = "note.md";
+
+    it("deletes a copy that still matches the base when the deleted content is a later edit", () => {
+      const plan = engine().reconcile({
+        base: snapshot([live("x", path, "v1")], "commit-base"),
+        local: observe([file(path, "v1", "x")]),
+        remote: snapshot([tombstone("x", path, "v2")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([]);
+      expect(plan.localActions).toEqual([{ entryId: "x", kind: "delete-local", path }]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
+
+    it("still deletes a copy that matches the deleted content", () => {
+      const plan = engine().reconcile({
+        base: snapshot([live("x", path, "v1")], "commit-base"),
+        local: observe([file(path, "v2", "x")]),
+        remote: snapshot([tombstone("x", path, "v2")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([]);
+      expect(plan.localActions).toEqual([{ entryId: "x", kind: "delete-local", path }]);
+    });
+
+    it("keeps an edit-delete Conflict for a base copy when the Deletion Record has no Recovery Copy", () => {
+      const plan = engine().reconcile({
+        base: snapshot([live("x", path, "v1")], "commit-base"),
+        local: observe([file(path, "v1", "x")]),
+        remote: snapshot([tombstone("x", path, "v0", false)], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toMatchObject([{ entryId: "x", kind: "edit-delete", path }]);
+      expect(plan.localActions).toEqual([]);
+    });
+
+    it("keeps an edit-delete Conflict for a copy edited since the base", () => {
+      const plan = engine().reconcile({
+        base: snapshot([live("x", path, "v1")], "commit-base"),
+        local: observe([file(path, "v3", "x")]),
+        remote: snapshot([tombstone("x", path, "v2")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toMatchObject([{ entryId: "x", kind: "edit-delete", path }]);
+      expect(plan.localActions).toEqual([]);
+    });
+
+    it("keeps an edit-delete Conflict for a base copy renamed while offline", () => {
+      const plan = engine().reconcile({
+        base: snapshot([live("x", path, "v1")], "commit-base"),
+        local: observe([file("renamed.md", "v1", "x")]),
+        remote: snapshot([tombstone("x", path, "v2")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toMatchObject([{ entryId: "x", kind: "edit-delete", path }]);
+      expect(plan.localActions).toEqual([]);
+    });
+
+    it("keeps an edit-delete Conflict for a copy at a deleted path when there is no base", () => {
+      const plan = engine().reconcile({
+        local: observe([file(path, "v1")], { bootstrapPending: true }),
+        remote: snapshot([tombstone("x", path, "v2")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toMatchObject([{ entryId: "x", kind: "edit-delete", path }]);
+      expect(plan.localActions).toEqual([]);
+    });
+
+    it("leaves a Conflict already in the Conflict center to the Conflict center", () => {
+      const conflicted: VaultEntry = {
+        candidates: [revision("v3")], deletedAt: "2026-09-02T00:00:00.000Z", entryId: "x", kind: "conflicted",
+        lastContentHash: "sha256:v2", lastRevisionId: "revision-v2", path, reason: "edit-delete",
+      };
+      const plan = engine().reconcile({
+        base: snapshot([conflicted], "commit-base"),
+        local: observe([]),
+        remote: snapshot([conflicted], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
+
+    it("does nothing for a Deferred Download or a not-yet-materialized Entry deleted elsewhere", () => {
+      const plan = engine().reconcile({
+        base: snapshot([live("x", path, "v1"), live("y", "y.md", "y1")], "commit-base"),
+        local: observe([], { deferredEntryIds: ["x"], unmaterializedEntryIds: ["y"] }),
+        remote: snapshot([tombstone("x", path, "v2"), tombstone("y", "y.md", "y2")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
+
+    it("does not count local deletions of base copies toward the Bulk Deletion threshold", () => {
+      const notes = Array.from({ length: 30 }, (_, index) => `n${index}`);
+      const plan = engine().reconcile({
+        base: snapshot(notes.map((id) => live(id, `${id}.md`, `${id}v1`)), "commit-base"),
+        local: observe(notes.map((id) => file(`${id}.md`, `${id}v1`, id))),
+        remote: snapshot(notes.map((id) => tombstone(id, `${id}.md`, `${id}v2`)), "commit-remote"),
+      });
+
+      expect(plan.bulkDeletion).toBeUndefined();
+      expect(plan.conflicts).toEqual([]);
+      expect(plan.localActions).toHaveLength(30);
     });
   });
 });

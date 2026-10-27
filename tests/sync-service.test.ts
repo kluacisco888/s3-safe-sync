@@ -7094,6 +7094,56 @@ describe("cleaning expired content out of the remote record", () => {
     expect(fixture.phoneVault.readText("note.md")).toBe("v0");
   });
 
+  describe("a remote deletion compared with this device's base", () => {
+    // 问题 1 基本形：手机停在 V1，电脑改成 V2 后删除（删除记录带 V2 的恢复副本）
+    const editedThenDeleted = async () => {
+      const fixture = await setup({ "note.md": "V1" });
+      fixture.objects.serverDate = at(1);
+      await fixture.desktopVault.write("note.md", text("V2"));
+      await expect(fixture.desktop.synchronize()).resolves.toMatchObject({ status: "complete", uploaded: 1 });
+      await fixture.desktopVault.delete("note.md");
+      await expect(fixture.desktop.synchronize()).resolves.toMatchObject({ status: "complete", uploaded: 1 });
+      const deleted = await entryAt(fixture.observer, "note.md") as DeletedEntry;
+      expect(deleted).toMatchObject({ kind: "deleted", lastContentHash: await sha256Content(text("V2")) });
+      expect(deleted.recovery?.contentHash).toBe(await sha256Content(text("V2")));
+      fixture.objects.serverDate = at(2);
+      return fixture;
+    };
+
+    it("deletes a copy left at the base version when another device edited and then deleted it", async () => {
+      const fixture = await editedThenDeleted();
+      const remove = vi.spyOn(fixture.phoneVault, "delete");
+
+      await expect(fixture.phone.synchronize()).resolves.toMatchObject({ deleted: 1, status: "complete" });
+
+      // 本机 V1 带着自己的哈希交给本机删除，由它挪进本地回收站
+      expect(remove).toHaveBeenCalledWith("note.md", await sha256Content(text("V1")));
+      expect(fixture.phoneVault.readText("note.md")).toBeUndefined();
+      expect(await entryAt(fixture.observer, "note.md")).toMatchObject({ kind: "deleted" });
+    });
+
+    it("deletes a base copy whose Revision was cleaned out of the record and whose blob is gone", async () => {
+      const fixture = await setup({ "note.md": "V1" });
+      const v1 = (await entryAt(fixture.observer, "note.md") as LiveEntry).revision;
+      fixture.objects.serverDate = at(1);
+      await fixture.desktopVault.write("note.md", text("V2"));
+      await fixture.desktop.synchronize();
+      fixture.objects.serverDate = at(40);
+      await expect(fixture.desktop.cleanupExpiredContent("vault")).resolves.toMatchObject({ removedHistory: 1 });
+      await fixture.objects.delete(`${prefix}/v1/blobs/${v1.blobId}`);
+      await fixture.desktopVault.delete("note.md");
+      await expect(fixture.desktop.synchronize()).resolves.toMatchObject({ status: "complete" });
+      const deleted = await entryAt(fixture.observer, "note.md") as DeletedEntry;
+      expect(deleted.recovery?.contentHash).toBe(await sha256Content(text("V2")));
+      expect((deleted.history ?? []).some((revision) => revision.revisionId === v1.revisionId)).toBe(false);
+      fixture.objects.serverDate = at(41);
+
+      await expect(fixture.phone.synchronize()).resolves.toMatchObject({ deleted: 1, status: "complete" });
+
+      expect(fixture.phoneVault.readText("note.md")).toBeUndefined();
+    });
+  });
+
   describe("listing and removing what the user confirmed", () => {
     const keyOf = (kind: "recovery" | "history", entryId: string, revisionId: string): string => `${kind}:${entryId}:${revisionId}`;
 
