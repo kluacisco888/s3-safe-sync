@@ -1342,6 +1342,18 @@ describe("SyncEngine", () => {
       uploadedAsNew(plan, "");
     });
 
+    it("holds a deletion and a same-type file created at an accepted deletion's path for move review", () => {
+      const plan = engine().reconcile({
+        base: snapshot([tombstone("w", path, "v1"), live("z", "z.md", "z1")], "commit-base"),
+        local: observe([file(path, "fresh")]),
+        remote: snapshot([tombstone("w", path, "v1"), live("z", "z.md", "z1")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toMatchObject([{ kind: "possible-rename" }]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
+
     it("still compares with the deletion when this device never saw a deletion at that path", () => {
       const plan = engine().reconcile({
         base: snapshot([], "commit-base"),
