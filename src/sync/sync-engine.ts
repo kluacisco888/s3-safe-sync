@@ -205,11 +205,14 @@ export interface SyncPlan {
   conflicts: SyncConflict[];
   localActions: LocalAction[];
   remoteChanges: RemoteChange[];
-  // 按旧副本规则改成下载的 Entry 及被替换的本地内容；执行前要核实远端有它的恢复副本
+  // 按旧副本规则改成下载的 Entry、或远端删除时按 base 判定没改过而要删的 Entry，及被替换的本地内容；
+  // 执行前要核实远端有它的恢复副本
   staleCopies?: StaleCopy[];
 }
 
 export interface StaleCopy {
+  // 本机已接受的 base 内容；远端记录已不引用它时不再要求恢复副本（不变量 9 的例外）
+  acceptedBaseContentHash?: string;
   contentHash: string;
   entryId: string;
 }
@@ -384,11 +387,19 @@ export class SyncEngine {
     const localActions: LocalAction[] = [];
     const remoteChanges: RemoteChange[] = [];
     const remoteEntries = Object.values(remote.entries);
+    // 本设备 base 里已经是 deleted 的墓碑：这次删除本设备已经接受过
+    const acceptedDeletion = (entry: VaultEntry): boolean =>
+      entry.kind === "deleted" && base?.entries[entry.entryId]?.kind === "deleted";
     const remoteByPath = new Map<string, VaultEntry>();
     for (const entry of remoteEntries) {
       const owner = remoteByPath.get(entry.path);
       // A historical tombstone must not shadow the current owner after a path is reused.
-      if (!owner || owner.kind === "deleted" || entry.kind !== "deleted") {
+      // 只有墓碑的路径上优先取本设备已接受的那条，结果不随记录里的条目顺序变
+      if (
+        !owner ||
+        entry.kind !== "deleted" ||
+        (owner.kind === "deleted" && (!acceptedDeletion(owner) || acceptedDeletion(entry)))
+      ) {
         remoteByPath.set(entry.path, entry);
       }
     }
@@ -409,11 +420,16 @@ export class SyncEngine {
       !rejectedStaleCopyEntryIds?.has(entry.entryId) &&
       !deferredEntryIds.has(entry.entryId) &&
       matchesRecordedRevision(entry, file);
+    // 无身份的本机文件在这个路径上对应的远端条目；本设备已接受的墓碑不再算，路径上的文件当新文件
+    const pathOwner = (path: string): VaultEntry | undefined => {
+      const owner = remoteByPath.get(path);
+      return owner && !acceptedDeletion(owner) ? owner : undefined;
+    };
 
     for (const file of local.files) {
       const remoteEntry = file.entryId
         ? remote.entries[file.entryId]
-        : remoteByPath.get(file.path);
+        : pathOwner(file.path);
       const baseEntry = remoteEntry
         ? base?.entries[remoteEntry.entryId]
         : undefined;
@@ -449,10 +465,28 @@ export class SyncEngine {
       ) {
         continue;
       }
+      // 本机还是本设备 base 那一版、在 base 路径上，当成没改过：远端的删除包含了本机这份。
+      // 删除记录没有恢复副本时不这样认（delete-edit 冲突选了「保留删除」而 base 已被清理），退回 edit-delete；
+      // 本机这一版在远端核实不了恢复副本时同样退回 edit-delete
+      const unchangedSinceBase =
+        remoteEntry?.kind === "deleted" &&
+        remoteEntry.recovery !== undefined &&
+        baseEntry?.kind === "live" &&
+        file.path === baseEntry.path &&
+        file.contentHash === baseEntry.revision.contentHash &&
+        !rejectedStaleCopyEntryIds?.has(remoteEntry.entryId);
       if (
         remoteEntry?.kind === "deleted" &&
-        remoteEntry.lastContentHash === file.contentHash
+        (remoteEntry.lastContentHash === file.contentHash || unchangedSinceBase)
       ) {
+        if (remoteEntry.lastContentHash !== file.contentHash) {
+          // 删的不是删除记录那一版：执行前先核实本机这一版在远端可恢复（不变量 9），已被清理出记录时放行
+          staleCopies.push({
+            acceptedBaseContentHash: file.contentHash,
+            contentHash: file.contentHash,
+            entryId: remoteEntry.entryId,
+          });
+        }
         localActions.push({
           entryId: remoteEntry.entryId,
           kind: "delete-local",
@@ -754,7 +788,7 @@ export class SyncEngine {
       if (file.entryId) {
         continue;
       }
-      const knownPath = remoteByPath.has(file.path);
+      const knownPath = pathOwner(file.path) !== undefined;
       if (!knownPath) {
         if (base && !local.bootstrapPending) {
           remoteChanges.push({
