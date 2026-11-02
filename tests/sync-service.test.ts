@@ -1073,6 +1073,7 @@ describe("SyncService", () => {
       expect(tabletVault.readText("archive/a.md")).toBe("A");
       expect(tabletVault.readText("notes/a.md")).toBeUndefined();
       expect(tabletCache.state!.files["archive/a.md"]?.entryId).toBe(entry.entryId);
+      expect(tabletCache.state!.files["notes/a.md"]).toBeUndefined();
       expect(Object.values((await snapshot()).entries).filter(value => value.kind !== "live")).toEqual([]);
       expect((await snapshot()).entries[entry.entryId]).toMatchObject({kind: "live", path: "archive/a.md"});
       await desktop.synchronize();
