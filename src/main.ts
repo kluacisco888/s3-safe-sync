@@ -226,6 +226,8 @@ export default class S3VaultSyncPlugin
   // 「需要完整校验」标记还在期间，这次加载里真读过内容算出的指纹（只在内存里，不写 data.json）。
   // 等用户处理或重试时，下一次自动的完整校验沿用大小、修改时间没变且没有改动事件的文件，不再整库重读
   private readonly loadHashRecord = new Map<string, VerifiedLocalFile>();
+  // 记录所属的存储桶、区域、前缀和仓库；换了就整份作废
+  private loadHashRecordTarget: string | undefined;
   private readonly pluginDataWriter = new SerializedDataWriter(
     () => this.data,
     (snapshot) => {
@@ -1258,6 +1260,10 @@ export default class S3VaultSyncPlugin
     if (triggers.some(trigger => trigger === "manual" || trigger === "resume" || trigger === "integrity-check")) this.networkRetryAttempt = 0;
     const integrityTarget = this.integrityTarget();
     const assertIntegrityTarget = this.captureTargetGuard();
+    if (this.loadHashRecordTarget !== integrityTarget) {
+      this.loadHashRecord.clear();
+      this.loadHashRecordTarget = integrityTarget;
+    }
     if (requestedTarget !== undefined && requestedTarget !== integrityTarget) {
       this.networkRetryAttempt = 0;
       this.networkFailureTarget = undefined;

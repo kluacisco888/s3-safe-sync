@@ -188,3 +188,47 @@ it("rereads every file for a full check the user asked for even when the record 
   await plugin.syncNow();
   expect(takeReads()).toEqual([]);
 });
+
+it("rereads every file on the first sync after the plugin reloads", async () => {
+  const {plugin, start, takeReads} = await fixture();
+  await plugin.syncNow();
+  expect(takeReads()).toEqual(["existing.md", "import.md"]);
+  plugin.onunload();
+  const restarted = await start();
+
+  await restarted.syncNow();
+
+  expect(restarted.getStatusText()).toMatch(/^需要处理：/);
+  expect(takeReads()).toEqual(["existing.md", "import.md"]);
+});
+
+it("rereads every file after the bucket changes", async () => {
+  const {plugin, takeReads} = await fixture();
+  await plugin.syncNow();
+  expect(takeReads()).toEqual(["existing.md", "import.md"]);
+  plugin.getSettings().bucket = "another-bucket";
+  await plugin.saveSettings();
+
+  await plugin.syncNow();
+
+  expect(plugin.getStatusText()).toMatch(/^需要处理：/);
+  expect(takeReads()).toEqual(["existing.md", "import.md"]);
+});
+
+it("rereads every file after the prefix was changed for a sync, even once it is changed back", async () => {
+  const {plugin, takeReads} = await fixture();
+  await plugin.syncNow();
+  expect(takeReads()).toEqual(["existing.md", "import.md"]);
+  plugin.getSettings().prefix = "another-prefix";
+  await plugin.saveSettings();
+  // 另一个前缀下没有这个仓库，同步在读 Head 时就停下
+  await plugin.syncNow();
+  expect(takeReads()).toEqual([]);
+  plugin.getSettings().prefix = "obs-sync";
+  await plugin.saveSettings();
+
+  await plugin.syncNow();
+
+  expect(plugin.getStatusText()).toMatch(/^需要处理：/);
+  expect(takeReads()).toEqual(["existing.md", "import.md"]);
+});
