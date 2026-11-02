@@ -1095,6 +1095,75 @@ describe("SyncService", () => {
     });
   });
 
+  // 第一次同步期间把远端挪动在本机做完后被打断：下一次同步凭 base 和远端记录认回身份，不判成撞名（SPEC 第 18 条）
+  describe("a remote move completed locally before an interrupted first sync saved it", () => {
+    const encode = (text: string) => new TextEncoder().encode(text);
+    // 三个同名同内容的文件：扫描按文件名一对一配对认不出挪动
+    const folders = ["甲", "乙", "丙"];
+    const oldPathOf = (folder: string) => `旧资料/${folder}/说明书.pdf`;
+    const newPathOf = (folder: string) => `存档/旧资料/${folder}/说明书.pdf`;
+    const remaining = "zz/remaining.md";
+    class InterruptedVault extends MemoryVault {
+      interrupt = false;
+      override async write(path: string, body: Uint8Array): Promise<void> {
+        if (this.interrupt && path === remaining) throw new Error("download interrupted");
+        return super.write(path, body);
+      }
+    }
+
+    it("regains each moved file's Entry and completes without a path collision, import review or deletion", async () => {
+      const objects = new MemoryObjectStore();
+      const remote = await RemoteStore.open({objects, prefix: "bootstrap-move", vaultKey: new Uint8Array(32)});
+      const desktopVault = new MemoryVault(), desktopCache = new MemorySyncCache();
+      const desktop = new SyncService({cache: desktopCache, local: desktopVault, remote, replicaId: "desktop"});
+      for (const folder of folders) await desktopVault.write(oldPathOf(folder), encode("same document"));
+      await desktopVault.write(remaining, encode("remaining document"));
+      await desktop.initializeNew("vault");
+      // 平板第一次同步下载完三个文件后被打断：已落地的记进本机记录，第一次同步还没完成
+      const tabletVault = new InterruptedVault(), tabletCache = new MemorySyncCache();
+      const tablet = new SyncService({cache: tabletCache, local: tabletVault, remote, replicaId: "tablet"});
+      tabletVault.interrupt = true;
+      await expect(tablet.synchronize()).rejects.toThrow("download interrupted");
+      expect(tabletCache.state?.bootstrapPending).toBe(true);
+      expect(Object.keys(tabletCache.state!.files).sort()).toEqual(folders.map(oldPathOf).sort());
+      const ids = folders.map(folder => tabletCache.state!.files[oldPathOf(folder)]!.entryId);
+      // 电脑把三个文件挪进存档文件夹
+      for (const folder of folders) await desktopVault.move(oldPathOf(folder), newPathOf(folder));
+      await desktop.synchronize([], {pathRenames: new Map(folders.map((folder, index) =>
+        [oldPathOf(folder), {entryId: ids[index]!, toPath: newPathOf(folder)}]))});
+      const snapshot = async () => remote.readSnapshot((await remote.readHead())!.value);
+      for (const [index, folder] of folders.entries()) {
+        expect((await snapshot()).entries[ids[index]!]).toMatchObject({kind: "live", path: newPathOf(folder)});
+      }
+      // 平板下一次同步把三个文件挪到新位置后又被打断，挪动的进度没存下
+      await expect(tablet.synchronize()).rejects.toThrow("download interrupted");
+      for (const folder of folders) {
+        expect(tabletVault.readText(newPathOf(folder))).toBe("same document");
+        expect(tabletVault.readText(oldPathOf(folder))).toBeUndefined();
+        expect(tabletCache.state!.files[oldPathOf(folder)]).toBeDefined();
+      }
+      const headBefore = (await remote.readHead())!.value.commitId;
+      tabletVault.interrupt = false;
+
+      const result = await tablet.synchronize();
+
+      expect(result).toMatchObject({status: "complete", localIssues: [], uploaded: 0});
+      expect(result.bulkDeletion).toBeUndefined();
+      for (const [index, folder] of folders.entries()) {
+        expect(tabletVault.readText(newPathOf(folder))).toBe("same document");
+        expect(tabletCache.state!.files[newPathOf(folder)]?.entryId).toBe(ids[index]);
+      }
+      expect(tabletVault.readText(remaining)).toBe("remaining document");
+      expect((await tabletVault.list()).some(file => file.path.includes("(path conflict"))).toBe(false);
+      expect(tabletCache.state?.bootstrapPending).toBeUndefined();
+      const after = await snapshot();
+      expect(Object.values(after.entries).filter(entry => entry.kind !== "live")).toEqual([]);
+      expect(Object.values(after.entries).some(entry => entry.path.includes("(path conflict"))).toBe(false);
+      expect((await remote.readHead())!.value.commitId).toBe(headBefore);
+      await expect(tablet.synchronize()).resolves.toMatchObject({status: "complete", uploaded: 0});
+    });
+  });
+
   describe("reviewing local content without a trusted base", () => {
     const setup = async (reverseOrder = false) => {
       const objects = new MemoryObjectStore();
