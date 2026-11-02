@@ -232,3 +232,29 @@ it("rereads every file after the prefix was changed for a sync, even once it is 
   expect(plugin.getStatusText()).toMatch(/^需要处理：/);
   expect(takeReads()).toEqual(["existing.md", "import.md"]);
 });
+
+it("clears the pending full check once the user resolves the import, then syncs incrementally until the next scheduled check rereads everything", async () => {
+  vi.useFakeTimers({toFake: ["Date"]});
+  vi.setSystemTime(new Date("2026-11-02T08:00:00Z"));
+  const {plugin, takeReads} = await fixture();
+  await plugin.syncNow();
+  expect(takeReads()).toEqual(["existing.md", "import.md"]);
+  await plugin.importCandidate("import.md");
+  takeReads();
+  vi.setSystemTime(new Date("2026-11-02T09:00:00Z"));
+
+  await plugin.syncNow();
+
+  expect(plugin.getStatusText()).toMatch(/^空闲：/);
+  expect(takeReads()).toEqual([]);
+  expect(host.stored.fullHashVerificationRequired).toBe(false);
+  expect(host.stored.lastFullHashVerificationAt).toBe(Date.parse("2026-11-02T09:00:00Z"));
+  // 之后的普通同步照旧只看大小和修改时间
+  await plugin.syncNow();
+  expect(takeReads()).toEqual([]);
+  // 到了下一次定期完整校验，不沿用上一轮的记录，整库重读
+  vi.setSystemTime(new Date("2026-11-09T09:00:00Z"));
+  await plugin.syncNow();
+  expect(takeReads()).toEqual(["existing.md", "import.md"]);
+  expect(host.stored.lastFullHashVerificationAt).toBe(Date.parse("2026-11-09T09:00:00Z"));
+});

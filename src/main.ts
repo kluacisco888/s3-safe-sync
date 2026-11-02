@@ -1005,6 +1005,7 @@ export default class S3VaultSyncPlugin
         });
         this.data.fullHashVerificationRequired = false;
         this.data.lastFullHashVerificationAt = Date.now();
+        this.loadHashRecord.clear();
         this.data.pendingPathRenames = {};
         this.pathRenames = new PathRenameTracker();
       }
@@ -1423,6 +1424,8 @@ export default class S3VaultSyncPlugin
         if (fullHashVerification) {
           this.data.fullHashVerificationRequired = false;
           this.data.lastFullHashVerificationAt = Date.now();
+          // 这一轮完整校验做完了；下一次定期完整校验要重新读全部内容，不沿用这一轮的记录
+          this.loadHashRecord.clear();
         }
         try {
           if (fullHashVerification || pathRenameSnapshot.size > 0) {
