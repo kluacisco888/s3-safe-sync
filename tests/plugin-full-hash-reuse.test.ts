@@ -37,9 +37,8 @@ afterEach(() => {
 // 设备需要完整校验（上次没做完、标记还在）；本机有一个已同步的文件和一个待导入文件，所以每次同步都停在「需要处理」
 const fixture = async () => {
   // 只放行算指纹时让出主线程的 0 毫秒定时器；改动后的自动同步、重试等定时器不触发，由测试自己发起同步
-  const realSetTimeout = globalThis.setTimeout;
   vi.stubGlobal("window", {setInterval: () => 1, clearTimeout: () => {}, setTimeout: (callback: () => void, delay?: number) => {
-    if (!delay) realSetTimeout(callback, 0);
+    if (!delay) setImmediate(callback);
     return 1;
   }});
   vi.stubGlobal("document", {visibilityState: "visible"});
