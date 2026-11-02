@@ -223,6 +223,9 @@ export default class S3VaultSyncPlugin
   private pendingDeferredDownloads: DeferredDownloadEntry[] = [];
   // 这次打开「待清理」时读到的列表（只在内存里），确认删除只能从它里面选
   private loadedCleanup: { target: string; listed: CleanupCandidates } | undefined;
+  // 「需要完整校验」标记还在期间，这次加载里真读过内容算出的指纹（只在内存里，不写 data.json）。
+  // 等用户处理或重试时，下一次自动的完整校验沿用大小、修改时间没变且没有改动事件的文件，不再整库重读
+  private readonly loadHashRecord = new Map<string, VerifiedLocalFile>();
   private readonly pluginDataWriter = new SerializedDataWriter(
     () => this.data,
     (snapshot) => {
@@ -1362,6 +1365,9 @@ export default class S3VaultSyncPlugin
               forceHashPaths: new Set(dirtySnapshot.keys()),
               fullHashVerification:
                 fullHashVerification && attempt === 1,
+              loadHashRecord: this.data.fullHashVerificationRequired === true
+                ? this.loadHashRecord
+                : undefined,
               onDownloadApplied: change => downloads.push(change),
               onNewFilesPlanned: entryIdsByPath => {
                 this.uploadingNewFiles = entryIdsByPath;
@@ -1369,6 +1375,7 @@ export default class S3VaultSyncPlugin
               pathRenames: this.pathRenames.toPathMap(pathRenameSnapshot),
               renameResolution: this.approvedRenameResolution,
               retryHashMemo,
+              reuseLoadHashRecord: fullHashVerification,
             },
           );
         },

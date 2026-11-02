@@ -261,6 +261,11 @@ export interface SyncFileChange {
 export interface SyncScanOptions {
   forceHashPaths?: ReadonlySet<string>;
   fullHashVerification?: boolean;
+  // 插件这次加载期间真读过内容算出的指纹（路径 -> 大小、修改时间、指纹），由调用方跨多次同步保留。
+  // 扫描每真读一个文件就写进来；从缓存或 hashHints 沿用的指纹不写
+  loadHashRecord?: Map<string, VerifiedLocalFile>;
+  // 自动的完整校验：大小、修改时间都和 loadHashRecord 一致、且不在 forceHashPaths 里的文件沿用记录，不再重读
+  reuseLoadHashRecord?: boolean;
   retryHashMemo?: Map<string, VerifiedLocalFile>;
 }
 
@@ -2906,7 +2911,15 @@ export class SyncService {
     }
     const reusableHash = (file: LocalFileInfo): string | undefined => {
       if (options.fullHashVerification !== false) {
-        return undefined;
+        // 跨同步时改动事件优先于记录：有改动事件的文件一律重读
+        if (!options.reuseLoadHashRecord || options.forceHashPaths?.has(file.path)) {
+          return undefined;
+        }
+        const recorded = options.loadHashRecord?.get(file.path);
+        return recorded?.modifiedAt === file.modifiedAt &&
+          recorded.size === file.size
+          ? recorded.contentHash
+          : undefined;
       }
       const retryHash = options.retryHashMemo?.get(file.path);
       if (
@@ -3028,6 +3041,7 @@ export class SyncService {
         };
         files.push(verifiedFile);
         options.retryHashMemo?.set(file.path, verifiedFile);
+        options.loadHashRecord?.set(file.path, verifiedFile);
         finishHash(file, hashedBytes);
         continue;
       }
@@ -3049,6 +3063,7 @@ export class SyncService {
       };
       files.push(verifiedFile);
       options.retryHashMemo?.set(file.path, verifiedFile);
+      options.loadHashRecord?.set(file.path, verifiedFile);
       finishHash(file, 0);
     }
     return {
