@@ -223,6 +223,11 @@ export default class S3VaultSyncPlugin
   private pendingDeferredDownloads: DeferredDownloadEntry[] = [];
   // 这次打开「待清理」时读到的列表（只在内存里），确认删除只能从它里面选
   private loadedCleanup: { target: string; listed: CleanupCandidates } | undefined;
+  // 「需要完整校验」标记还在期间，这次加载里真读过内容算出的指纹（只在内存里，不写 data.json）。
+  // 等用户处理或重试时，下一次自动的完整校验沿用大小、修改时间没变且没有改动事件的文件，不再整库重读
+  private readonly loadHashRecord = new Map<string, VerifiedLocalFile>();
+  // 记录所属的存储桶、区域、前缀和仓库；换了就整份作废
+  private loadHashRecordTarget: string | undefined;
   private readonly pluginDataWriter = new SerializedDataWriter(
     () => this.data,
     (snapshot) => {
@@ -1000,6 +1005,7 @@ export default class S3VaultSyncPlugin
         });
         this.data.fullHashVerificationRequired = false;
         this.data.lastFullHashVerificationAt = Date.now();
+        this.loadHashRecord.clear();
         this.data.pendingPathRenames = {};
         this.pathRenames = new PathRenameTracker();
       }
@@ -1255,6 +1261,10 @@ export default class S3VaultSyncPlugin
     if (triggers.some(trigger => trigger === "manual" || trigger === "resume" || trigger === "integrity-check")) this.networkRetryAttempt = 0;
     const integrityTarget = this.integrityTarget();
     const assertIntegrityTarget = this.captureTargetGuard();
+    if (this.loadHashRecordTarget !== integrityTarget) {
+      this.loadHashRecord.clear();
+      this.loadHashRecordTarget = integrityTarget;
+    }
     if (requestedTarget !== undefined && requestedTarget !== integrityTarget) {
       this.networkRetryAttempt = 0;
       this.networkFailureTarget = undefined;
@@ -1291,7 +1301,7 @@ export default class S3VaultSyncPlugin
       const dirtySnapshot = this.dirtyPaths.capture();
       const pathRenameSnapshot = this.pathRenames.capture();
       fullHashVerification =
-        requestedFullHashVerification ||
+        requestedFullHashVerification !== false ||
         (document.visibilityState === "visible" &&
           isFullHashVerificationDue(
             this.data.lastFullHashVerificationAt,
@@ -1362,6 +1372,9 @@ export default class S3VaultSyncPlugin
               forceHashPaths: new Set(dirtySnapshot.keys()),
               fullHashVerification:
                 fullHashVerification && attempt === 1,
+              loadHashRecord: this.data.fullHashVerificationRequired === true
+                ? this.loadHashRecord
+                : undefined,
               onDownloadApplied: change => downloads.push(change),
               onNewFilesPlanned: entryIdsByPath => {
                 this.uploadingNewFiles = entryIdsByPath;
@@ -1369,6 +1382,9 @@ export default class S3VaultSyncPlugin
               pathRenames: this.pathRenames.toPathMap(pathRenameSnapshot),
               renameResolution: this.approvedRenameResolution,
               retryHashMemo,
+              // 用户主动要求的完整校验全部重读；只有自动到期、标记还在、Head 冲突后重试这类自动情况沿用记录
+              reuseLoadHashRecord:
+                fullHashVerification && requestedFullHashVerification !== true,
             },
           );
         },
@@ -1408,6 +1424,8 @@ export default class S3VaultSyncPlugin
         if (fullHashVerification) {
           this.data.fullHashVerificationRequired = false;
           this.data.lastFullHashVerificationAt = Date.now();
+          // 这一轮完整校验做完了；下一次定期完整校验要重新读全部内容，不沿用这一轮的记录
+          this.loadHashRecord.clear();
         }
         try {
           if (fullHashVerification || pathRenameSnapshot.size > 0) {
@@ -1671,7 +1689,7 @@ export default class S3VaultSyncPlugin
       const retryFullHashVerification =
         this.data.fullHashVerificationRequired === true;
       void this.requestSync({
-        fullHashVerification: retryFullHashVerification,
+        fullHashVerification: retryFullHashVerification && "automatic",
       }, "head-retry");
     }, delay);
   }

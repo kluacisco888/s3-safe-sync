@@ -133,6 +133,44 @@ describe("SyncRequestQueue", () => {
     expect(queue.isRunning).toBe(false);
   });
 
+  it("keeps an automatic full check automatic when nothing asks for a full check of its own", async () => {
+    const run = vi.fn(async () => undefined);
+    const queue = new SyncRequestQueue(run);
+
+    await queue.request({ fullHashVerification: "automatic" });
+
+    expect(run).toHaveBeenCalledWith({
+      allowBulkDeletion: false,
+      fullHashVerification: "automatic",
+    });
+  });
+
+  it("lets a full check the user asked for win over an automatic one queued with it", async () => {
+    let finishFirstSync: (() => void) | undefined;
+    const run = vi
+      .fn<(options: SyncRunOptions) => Promise<void>>()
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finishFirstSync = resolve;
+          }),
+      )
+      .mockResolvedValue(undefined);
+    const queue = new SyncRequestQueue(run);
+
+    const firstRequest = queue.request();
+    await Promise.resolve();
+    const userCheck = queue.request({ fullHashVerification: true });
+    const automaticCheck = queue.request({ fullHashVerification: "automatic" });
+    finishFirstSync?.();
+    await Promise.all([firstRequest, userCheck, automaticCheck]);
+
+    expect(run).toHaveBeenNthCalledWith(2, {
+      allowBulkDeletion: false,
+      fullHashVerification: true,
+    });
+  });
+
   it("serializes direct operations with queued synchronization", async () => {
     const events: string[] = [];
     let releaseDirect = (): void => undefined;

@@ -253,7 +253,7 @@ export class SyncEngine {
   }: ReconcileInput): SyncPlan {
     // Resume only identity-proven remote moves whose verified target already exists.
     // Equal hashes alone never establish identity for unrelated local files.
-    if (base && !local.bootstrapPending) {
+    if (base) {
       const byPath = new Map(local.files.map(file => [file.path, file]));
       const byId = new Map<string, ObservedFile[]>();
       const localPathCounts = new Map<string, number>();
@@ -292,7 +292,9 @@ export class SyncEngine {
           completedTargets.set(target, entry.entryId);
           continue;
         }
-        if (!source || source.path !== prior.path || localPathCounts.get(canonicalVaultPath(source.path)) !== 1 ||
+        // 源文件还在、要移进回收站的这一支会动本机文件，只在第一次同步完成后处理
+        if (local.bootstrapPending || !source || source.path !== prior.path ||
+          localPathCounts.get(canonicalVaultPath(source.path)) !== 1 ||
           source.contentHash !== prior.revision.contentHash || target.contentHash !== source.contentHash ||
           entry.revision.contentHash !== source.contentHash || source.size !== prior.revision.size ||
           target.size !== source.size || entry.revision.size !== source.size) continue;
@@ -708,6 +710,20 @@ export class SyncEngine {
         unmaterializedEntryIds.has(baseEntry.entryId);
       const remoteEntry = remote.entries[baseEntry.entryId];
       if (
+        !isPresent &&
+        !absenceIsNotDeletion &&
+        local.bootstrapPending &&
+        remoteEntry?.kind === "live"
+      ) {
+        // 第一次同步还没完成时，本机找不到可能是插件自己做到一半的结果（如挪动被打断），
+        // 不当成用户删除：按远端当前路径和当前版本重新下载
+        localActions.push({
+          entryId: baseEntry.entryId,
+          kind: "download-remote",
+          path: remoteEntry.path,
+          revision: remoteEntry.revision,
+        });
+      } else if (
         !isPresent &&
         !absenceIsNotDeletion &&
         remoteEntry?.kind === "live" &&

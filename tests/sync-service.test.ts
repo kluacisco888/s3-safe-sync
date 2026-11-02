@@ -1009,6 +1009,161 @@ describe("SyncService", () => {
     });
   });
 
+  // 第一次同步还没完成时，本机找不到已接受的文件不算删除（SPEC 第 16 条）
+  describe("an accepted file missing locally while the first sync is pending", () => {
+    const encode = (text: string) => new TextEncoder().encode(text);
+    const setup = async () => {
+      const objects = new MemoryObjectStore();
+      const remote = await RemoteStore.open({objects, prefix: "absence", vaultKey: new Uint8Array(32)});
+      const desktopVault = new MemoryVault();
+      const desktop = new SyncService({cache: new MemorySyncCache(), local: desktopVault, remote, replicaId: "desktop"});
+      await desktopVault.write("notes/a.md", encode("A"));
+      await desktopVault.write("notes/b.md", encode("B"));
+      await desktopVault.write("notes/c.md", encode("C"));
+      await desktop.initializeNew("vault");
+      // 平板第一次同步下载了两个文件后网络中断：已落地的记进本机记录，第一次同步还没完成
+      const tabletVault = new MemoryVault();
+      const tabletCache = new MemorySyncCache();
+      let armed = false;
+      const tablet = new SyncService({
+        cache: tabletCache, local: tabletVault, remote, replicaId: "tablet",
+        onProgress: progress => {
+          if (progress.phase === "downloading" && progress.completed >= 2) armed = true;
+        },
+      });
+      objects.onGet = key => {
+        if (!armed || !key.includes("/blobs/")) return;
+        objects.onGet = undefined;
+        throw new Error("network lost");
+      };
+      await expect(tablet.synchronize()).rejects.toThrow("network lost");
+      expect(tabletCache.state?.bootstrapPending).toBe(true);
+      expect(Object.keys(tabletCache.state!.files).sort()).toEqual(["notes/a.md", "notes/b.md"]);
+      const snapshot = async () => remote.readSnapshot((await remote.readHead())!.value);
+      const entryAt = async (path: string) => Object.values((await snapshot()).entries).find(entry => entry.path === path);
+      return {desktop, desktopVault, tablet, tabletVault, tabletCache, snapshot, entryAt};
+    };
+
+    it("downloads the file again instead of publishing a deletion", async () => {
+      const {tablet, tabletVault, tabletCache, snapshot, entryAt} = await setup();
+      const entry = (await entryAt("notes/a.md"))!;
+      await tabletVault.delete("notes/a.md");
+
+      const result = await tablet.synchronize();
+
+      expect(result.bulkDeletion).toBeUndefined();
+      expect(tabletVault.readText("notes/a.md")).toBe("A");
+      expect(tabletCache.state!.files["notes/a.md"]?.entryId).toBe(entry.entryId);
+      expect(Object.values((await snapshot()).entries).filter(value => value.kind !== "live")).toEqual([]);
+      expect((await snapshot()).entries[entry.entryId]?.kind).toBe("live");
+    });
+
+    it("downloads the file to the path another Replica moved it to instead of deleting it", async () => {
+      const {desktop, desktopVault, tablet, tabletVault, tabletCache, snapshot, entryAt} = await setup();
+      const entry = (await entryAt("notes/a.md"))!;
+      await desktopVault.move("notes/a.md", "archive/a.md");
+      await desktop.synchronize();
+      expect((await entryAt("archive/a.md"))?.entryId).toBe(entry.entryId);
+      // 上一次同步挪到一半被打断：旧路径和新路径上都没有这个文件
+      await tabletVault.delete("notes/a.md");
+
+      const result = await tablet.synchronize();
+
+      expect(result.bulkDeletion).toBeUndefined();
+      expect(tabletVault.readText("archive/a.md")).toBe("A");
+      expect(tabletVault.readText("notes/a.md")).toBeUndefined();
+      expect(tabletCache.state!.files["archive/a.md"]?.entryId).toBe(entry.entryId);
+      expect(tabletCache.state!.files["notes/a.md"]).toBeUndefined();
+      expect(Object.values((await snapshot()).entries).filter(value => value.kind !== "live")).toEqual([]);
+      expect((await snapshot()).entries[entry.entryId]).toMatchObject({kind: "live", path: "archive/a.md"});
+      await desktop.synchronize();
+      expect(desktopVault.readText("archive/a.md")).toBe("A");
+    });
+
+    it("still applies a remote deletion locally", async () => {
+      const {desktop, desktopVault, tablet, tabletVault, entryAt} = await setup();
+      const entry = (await entryAt("notes/b.md"))!;
+      await desktopVault.delete("notes/b.md");
+      const pending = await desktop.synchronize();
+      await desktop.synchronize(pending.bulkDeletion?.entryIds ?? []);
+      expect((await entryAt("notes/b.md"))).toMatchObject({entryId: entry.entryId, kind: "deleted"});
+
+      await tablet.synchronize();
+
+      expect(tabletVault.readText("notes/b.md")).toBeUndefined();
+      expect(tabletVault.readText("notes/a.md")).toBe("A");
+    });
+  });
+
+  // 第一次同步期间把远端挪动在本机做完后被打断：下一次同步凭 base 和远端记录认回身份，不判成撞名（SPEC 第 18 条）
+  describe("a remote move completed locally before an interrupted first sync saved it", () => {
+    const encode = (text: string) => new TextEncoder().encode(text);
+    // 三个同名同内容的文件：扫描按文件名一对一配对认不出挪动
+    const folders = ["甲", "乙", "丙"];
+    const oldPathOf = (folder: string) => `旧资料/${folder}/说明书.pdf`;
+    const newPathOf = (folder: string) => `存档/旧资料/${folder}/说明书.pdf`;
+    const remaining = "zz/remaining.md";
+    class InterruptedVault extends MemoryVault {
+      interrupt = false;
+      override async write(path: string, body: Uint8Array): Promise<void> {
+        if (this.interrupt && path === remaining) throw new Error("download interrupted");
+        return super.write(path, body);
+      }
+    }
+
+    it("regains each moved file's Entry and completes without a path collision, import review or deletion", async () => {
+      const objects = new MemoryObjectStore();
+      const remote = await RemoteStore.open({objects, prefix: "bootstrap-move", vaultKey: new Uint8Array(32)});
+      const desktopVault = new MemoryVault(), desktopCache = new MemorySyncCache();
+      const desktop = new SyncService({cache: desktopCache, local: desktopVault, remote, replicaId: "desktop"});
+      for (const folder of folders) await desktopVault.write(oldPathOf(folder), encode("same document"));
+      await desktopVault.write(remaining, encode("remaining document"));
+      await desktop.initializeNew("vault");
+      // 平板第一次同步下载完三个文件后被打断：已落地的记进本机记录，第一次同步还没完成
+      const tabletVault = new InterruptedVault(), tabletCache = new MemorySyncCache();
+      const tablet = new SyncService({cache: tabletCache, local: tabletVault, remote, replicaId: "tablet"});
+      tabletVault.interrupt = true;
+      await expect(tablet.synchronize()).rejects.toThrow("download interrupted");
+      expect(tabletCache.state?.bootstrapPending).toBe(true);
+      expect(Object.keys(tabletCache.state!.files).sort()).toEqual(folders.map(oldPathOf).sort());
+      const ids = folders.map(folder => tabletCache.state!.files[oldPathOf(folder)]!.entryId);
+      // 电脑把三个文件挪进存档文件夹
+      for (const folder of folders) await desktopVault.move(oldPathOf(folder), newPathOf(folder));
+      await desktop.synchronize([], {pathRenames: new Map(folders.map((folder, index) =>
+        [oldPathOf(folder), {entryId: ids[index]!, toPath: newPathOf(folder)}]))});
+      const snapshot = async () => remote.readSnapshot((await remote.readHead())!.value);
+      for (const [index, folder] of folders.entries()) {
+        expect((await snapshot()).entries[ids[index]!]).toMatchObject({kind: "live", path: newPathOf(folder)});
+      }
+      // 平板下一次同步把三个文件挪到新位置后又被打断，挪动的进度没存下
+      await expect(tablet.synchronize()).rejects.toThrow("download interrupted");
+      for (const folder of folders) {
+        expect(tabletVault.readText(newPathOf(folder))).toBe("same document");
+        expect(tabletVault.readText(oldPathOf(folder))).toBeUndefined();
+        expect(tabletCache.state!.files[oldPathOf(folder)]).toBeDefined();
+      }
+      const headBefore = (await remote.readHead())!.value.commitId;
+      tabletVault.interrupt = false;
+
+      const result = await tablet.synchronize();
+
+      expect(result).toMatchObject({status: "complete", localIssues: [], uploaded: 0});
+      expect(result.bulkDeletion).toBeUndefined();
+      for (const [index, folder] of folders.entries()) {
+        expect(tabletVault.readText(newPathOf(folder))).toBe("same document");
+        expect(tabletCache.state!.files[newPathOf(folder)]?.entryId).toBe(ids[index]);
+      }
+      expect(tabletVault.readText(remaining)).toBe("remaining document");
+      expect((await tabletVault.list()).some(file => file.path.includes("(path conflict"))).toBe(false);
+      expect(tabletCache.state?.bootstrapPending).toBeUndefined();
+      const after = await snapshot();
+      expect(Object.values(after.entries).filter(entry => entry.kind !== "live")).toEqual([]);
+      expect(Object.values(after.entries).some(entry => entry.path.includes("(path conflict"))).toBe(false);
+      expect((await remote.readHead())!.value.commitId).toBe(headBefore);
+      await expect(tablet.synchronize()).resolves.toMatchObject({status: "complete", uploaded: 0});
+    });
+  });
+
   describe("reviewing local content without a trusted base", () => {
     const setup = async (reverseOrder = false) => {
       const objects = new MemoryObjectStore();
@@ -1059,15 +1214,17 @@ describe("SyncService", () => {
       const review = await service.reviewLocalContent("article.md");
       await service.resolveLocalContent("article.md", review.reviewToken, "remote");
       await local.delete("article.md");
+      // 第一次同步还没完成，本机找不到不算删除：按远端当前版本重新下载，不发布删除
       const plan = await service.synchronize();
       expect(plan.localIssues).toEqual([]);
-      expect(plan.bulkDeletion?.entryIds).toEqual([removed.entryId]);
-      await service.synchronize(plan.bulkDeletion!.entryIds);
+      expect(plan.bulkDeletion).toBeUndefined();
+      expect(local.readText("article.md")).toBe("remote article");
+      expect(cache.state!.files["article.md"]!.entryId).toBe(removed.entryId);
       expect(cache.state!.files["unreviewed.md"]!.entryId).toBe(untouched.entryId);
       expect(local.readText("unreviewed.md")).toBe("remote article");
       const after = await remote.readSnapshot((await remote.readHead())!.value);
       expect(after.entries[untouched.entryId]).toEqual(untouched);
-      expect(after.entries[removed.entryId]?.kind).toBe("deleted");
+      expect(after.entries[removed.entryId]?.kind).toBe("live");
     });
 
     it("publishes the local choice while keeping S3's previous version recoverable", async () => {
