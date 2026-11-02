@@ -710,6 +710,20 @@ export class SyncEngine {
       if (
         !isPresent &&
         !absenceIsNotDeletion &&
+        local.bootstrapPending &&
+        remoteEntry?.kind === "live"
+      ) {
+        // 第一次同步还没完成时，本机找不到可能是插件自己做到一半的结果（如挪动被打断），
+        // 不当成用户删除：按远端当前路径和当前版本重新下载
+        localActions.push({
+          entryId: baseEntry.entryId,
+          kind: "download-remote",
+          path: remoteEntry.path,
+          revision: remoteEntry.revision,
+        });
+      } else if (
+        !isPresent &&
+        !absenceIsNotDeletion &&
         remoteEntry?.kind === "live" &&
         remoteEntry.revision.revisionId === baseEntry.revision.revisionId
       ) {

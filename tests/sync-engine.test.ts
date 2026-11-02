@@ -1376,4 +1376,183 @@ describe("SyncEngine", () => {
       expect(plan.remoteChanges).toEqual([]);
     });
   });
+
+  // 第一次同步没完成时，本机找不到已接受的文件可能是插件自己做到一半的结果，不能当成用户删除（SPEC 第 16 条）
+  describe("a base Entry missing locally while the first sync is pending", () => {
+    const revision = (hash: string): RevisionRef => ({
+      blobId: `blob-${hash}`, contentHash: `sha256:${hash}`, createdAt: "2026-09-01T00:00:00.000Z",
+      revisionId: `revision-${hash}`, size: hash.length,
+    });
+    const live = (entryId: string, path: string, hash: string): VaultEntry => ({
+      entryId, kind: "live", path, revision: revision(hash),
+    });
+    const tombstone = (entryId: string, path: string, lastHash: string): VaultEntry => ({
+      deletedAt: "2026-09-02T00:00:00.000Z", entryId, kind: "deleted", lastContentHash: `sha256:${lastHash}`,
+      lastRevisionId: `revision-${lastHash}`, path,
+      recovery: { ...revision(lastHash), expiresAt: "2026-10-02T00:00:00.000Z" },
+    });
+    const file = (path: string, hash: string, entryId?: string): ObservedFile => ({
+      contentHash: `sha256:${hash}`, path, size: hash.length, ...(entryId ? { entryId } : {}),
+    });
+    // 另有几篇无关笔记，删除一篇不会被当成 Bulk Deletion
+    const others = Array.from({ length: 10 }, (_, index) => live(`other-${index}`, `other-${index}.md`, `o${index}`));
+    const otherFiles = others.map((entry) => file(entry.path, `o${entry.entryId.slice(6)}`, entry.entryId));
+    const snapshot = (entries: VaultEntry[], commitId: string): VaultSnapshot => ({
+      commitId, entries: Object.fromEntries([...others, ...entries].map((entry) => [entry.entryId, entry])),
+      protocolVersion: 1, vaultId: "vault-1",
+    });
+    const observe = (files: ObservedFile[], extra: Partial<ReplicaObservation> = {}): ReplicaObservation => ({
+      basedOnCommitId: "commit-base", files: [...otherFiles, ...files], replicaId: "tablet", ...extra,
+    });
+    const oldPath = "旧资料/说明书.pdf";
+    const newPath = "存档/旧资料/说明书.pdf";
+    const pending = { bootstrapPending: true };
+
+    it("downloads to the remote path instead of deleting when another Replica only moved it", () => {
+      const plan = new SyncEngine().reconcile({
+        base: snapshot([live("x", oldPath, "v1")], "commit-base"),
+        local: observe([], pending),
+        remote: snapshot([live("x", newPath, "v1")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+      expect(plan.localActions).toEqual([
+        { entryId: "x", kind: "download-remote", path: newPath, revision: revision("v1") },
+      ]);
+      expect(plan.bulkDeletion).toBeUndefined();
+    });
+
+    it("downloads to the same path instead of deleting when the remote Entry is unchanged", () => {
+      const plan = new SyncEngine().reconcile({
+        base: snapshot([live("x", oldPath, "v1")], "commit-base"),
+        local: observe([], pending),
+        remote: snapshot([live("x", oldPath, "v1")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+      expect(plan.localActions).toEqual([
+        { entryId: "x", kind: "download-remote", path: oldPath, revision: revision("v1") },
+      ]);
+    });
+
+    it("downloads the newer remote Revision instead of reporting a delete-edit Conflict", () => {
+      const plan = new SyncEngine().reconcile({
+        base: snapshot([live("x", oldPath, "v1")], "commit-base"),
+        local: observe([], pending),
+        remote: snapshot([live("x", newPath, "v2")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+      expect(plan.localActions).toEqual([
+        { entryId: "x", kind: "download-remote", path: newPath, revision: revision("v2") },
+      ]);
+    });
+
+    // 远端路径上本机已有别的文件：交给现有的撞名判断，不下载也不删除，同一 Entry 不会出两条动作
+    it.each([
+      ["an unidentified copy with the same content", file(newPath, "v1")],
+      ["an unidentified file with other content", file(newPath, "draft")],
+    ])("leaves the remote path to path-collision review when it holds %s", (_, occupant) => {
+      const plan = new SyncEngine().reconcile({
+        base: snapshot([live("x", oldPath, "v1")], "commit-base"),
+        local: observe([occupant], pending),
+        remote: snapshot([live("x", newPath, "v1")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([{ kind: "path-collision", paths: [newPath] }]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
+
+    it("leaves the remote path to path-collision review when another Entry's file is there", () => {
+      const plan = new SyncEngine().reconcile({
+        base: snapshot([live("x", oldPath, "v1"), live("y", "y.md", "y1")], "commit-base"),
+        local: observe([file(newPath, "y1", "y")], pending),
+        remote: snapshot([live("x", newPath, "v1"), live("y", "y.md", "y1")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([{ kind: "path-collision", paths: [newPath] }]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
+
+    it("does nothing when the remote Entry is already deleted", () => {
+      const plan = new SyncEngine().reconcile({
+        base: snapshot([live("x", oldPath, "v1")], "commit-base"),
+        local: observe([], pending),
+        remote: snapshot([tombstone("x", oldPath, "v1")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
+
+    it("still skips a Deferred Download", () => {
+      const plan = new SyncEngine().reconcile({
+        base: snapshot([live("x", oldPath, "v1")], "commit-base"),
+        local: observe([], { ...pending, deferredEntryIds: ["x"] }),
+        remote: snapshot([live("x", newPath, "v1")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
+
+    it("downloads a not-yet-materialized Entry only once", () => {
+      const plan = new SyncEngine().reconcile({
+        base: snapshot([live("x", oldPath, "v1")], "commit-base"),
+        local: observe([], { ...pending, unmaterializedEntryIds: ["x"] }),
+        remote: snapshot([live("x", newPath, "v1")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+      expect(plan.localActions).toEqual([
+        { entryId: "x", kind: "download-remote", path: newPath, revision: revision("v1") },
+      ]);
+    });
+
+    it("does not count re-downloaded Entries toward the Bulk Deletion threshold", () => {
+      const missing = Array.from({ length: 8 }, (_, index) => `m${index}`);
+      const plan = new SyncEngine().reconcile({
+        base: snapshot(missing.map((id) => live(id, `旧/${id}.md`, `${id}v1`)), "commit-base"),
+        local: observe([], pending),
+        remote: snapshot(missing.map((id) => live(id, `新/${id}.md`, `${id}v1`)), "commit-remote"),
+      });
+
+      expect(plan.bulkDeletion).toBeUndefined();
+      expect(plan.remoteChanges).toEqual([]);
+      expect(plan.localActions).toHaveLength(8);
+    });
+
+    // 第一次同步完成以后，「删除胜过没改内容的挪动」照旧（SPEC 第 12 条）
+    it("still publishes a deletion that wins over an unedited remote move after the first sync", () => {
+      const plan = new SyncEngine().reconcile({
+        base: snapshot([live("x", oldPath, "v1")], "commit-base"),
+        local: observe([]),
+        remote: snapshot([live("x", newPath, "v1")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toMatchObject([{ entryId: "x", kind: "delete-remote", path: oldPath }]);
+    });
+
+    it("still reports delete-edit for a remote edit after the first sync", () => {
+      const plan = new SyncEngine().reconcile({
+        base: snapshot([live("x", oldPath, "v1")], "commit-base"),
+        local: observe([]),
+        remote: snapshot([live("x", newPath, "v2")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toMatchObject([{ entryId: "x", kind: "delete-edit", path: oldPath }]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
+  });
 });
