@@ -140,3 +140,38 @@ it("does not reread unchanged files on the next sync while an import decision ke
   expect(takeReads()).toEqual([]);
   expect(host.stored.fullHashVerificationRequired).toBe(true);
 });
+
+it("after a sync stopped by a local change, rereads only files with a change event or changed size or modification time", async () => {
+  const {plugin, files, emitModify, setDuringRead, takeReads} = await fixture();
+  files.set("notes.md", {text: "unchanged note", mtime: 1});
+  // 第一次同步读文件时 existing.md 收到改动事件（内容和修改时间都没变），同步因 local-change 停下
+  setDuringRead(() => emitModify("existing.md"));
+  await plugin.syncNow();
+  expect(plugin.getStatusText()).toContain("本地文件被改动");
+  expect(takeReads()).toEqual(["existing.md", "import.md", "notes.md"]);
+  // import.md 的修改时间变了，但没有改动事件
+  files.get("import.md")!.mtime = 2;
+
+  await plugin.syncNow();
+
+  expect(plugin.getStatusText()).toMatch(/^需要处理：/);
+  expect(takeReads()).toEqual(["existing.md", "import.md"]);
+  expect(host.stored.fullHashVerificationRequired).toBe(true);
+});
+
+it("rereads a file that received a change event between syncs even when its size and modification time did not change", async () => {
+  const {plugin, files, emitModify, takeReads} = await fixture();
+  await plugin.syncNow();
+  expect(takeReads()).toEqual(["existing.md", "import.md"]);
+  // 内容变了，大小和修改时间凑巧都没变
+  files.get("existing.md")!.text = "CURRENT";
+  emitModify("existing.md");
+
+  await plugin.syncNow();
+
+  expect(takeReads()).toEqual(["existing.md"]);
+  // 用户处理完导入后，这次读到的新内容作为本机改动上传
+  await plugin.importCandidate("import.md");
+  await plugin.syncNow();
+  expect(plugin.getStatusText()).toContain("上传 1");
+});
