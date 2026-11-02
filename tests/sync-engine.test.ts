@@ -1452,17 +1452,27 @@ describe("SyncEngine", () => {
     });
 
     // 远端路径上本机已有别的文件：交给现有的撞名判断，不下载也不删除，同一 Entry 不会出两条动作
-    it.each([
-      ["an unidentified copy with the same content", file(newPath, "v1")],
-      ["an unidentified file with other content", file(newPath, "draft")],
-    ])("leaves the remote path to path-collision review when it holds %s", (_, occupant) => {
+    it("leaves the remote path to path-collision review when it holds an unidentified file with other content", () => {
       const plan = new SyncEngine().reconcile({
         base: snapshot([live("x", oldPath, "v1")], "commit-base"),
-        local: observe([occupant], pending),
+        local: observe([file(newPath, "draft")], pending),
         remote: snapshot([live("x", newPath, "v1")], "commit-remote"),
       });
 
       expect(plan.conflicts).toEqual([{ kind: "path-collision", paths: [newPath] }]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
+
+    // 同内容的无身份文件满足「挪动已经做完」的补救条件，认回这个 Entry，不下载也不撞名（SPEC 第 18 条）
+    it("regains the Entry for an unidentified copy with the same content at the remote path", () => {
+      const plan = new SyncEngine().reconcile({
+        base: snapshot([live("x", oldPath, "v1")], "commit-base"),
+        local: observe([file(newPath, "v1")], pending),
+        remote: snapshot([live("x", newPath, "v1")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([]);
       expect(plan.localActions).toEqual([]);
       expect(plan.remoteChanges).toEqual([]);
     });
@@ -1551,6 +1561,92 @@ describe("SyncEngine", () => {
       });
 
       expect(plan.conflicts).toMatchObject([{ entryId: "x", kind: "delete-edit", path: oldPath }]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
+  });
+
+  // 第一次同步期间，上一次同步已把远端挪动在本机做完但没存下进度：凭 base 和远端记录认回身份（SPEC 第 18 条）
+  describe("a remote move already completed locally while the first sync is pending", () => {
+    const revision = (hash: string): RevisionRef => ({
+      blobId: `blob-${hash}`, contentHash: `sha256:${hash}`, createdAt: "2026-09-01T00:00:00.000Z",
+      revisionId: `revision-${hash}`, size: hash.length,
+    });
+    const live = (entryId: string, path: string, hash: string): VaultEntry => ({
+      entryId, kind: "live", path, revision: revision(hash),
+    });
+    const file = (path: string, hash: string, entryId?: string): ObservedFile => ({
+      contentHash: `sha256:${hash}`, path, size: hash.length, ...(entryId ? { entryId } : {}),
+    });
+    const snapshot = (entries: VaultEntry[], commitId: string): VaultSnapshot => ({
+      commitId, entries: Object.fromEntries(entries.map((entry) => [entry.entryId, entry])),
+      protocolVersion: 1, vaultId: "vault-1",
+    });
+    const observe = (files: ObservedFile[]): ReplicaObservation => ({
+      basedOnCommitId: "commit-base", bootstrapPending: true, files, replicaId: "tablet",
+    });
+    // 三个同名同内容的文件分别在三个旧文件夹，远端把它们挪到新文件夹，路径后半段不变
+    const folders = ["甲", "乙", "丙"];
+    const oldPathOf = (folder: string) => `旧资料/${folder}/说明书.pdf`;
+    const newPathOf = (folder: string) => `存档/旧资料/${folder}/说明书.pdf`;
+
+    it("regains each Entry for its moved copy instead of reporting a path collision", () => {
+      const plan = new SyncEngine().reconcile({
+        base: snapshot(folders.map((folder) => live(folder, oldPathOf(folder), "same")), "commit-base"),
+        local: observe(folders.map((folder) => file(newPathOf(folder), "same"))),
+        remote: snapshot(folders.map((folder) => live(folder, newPathOf(folder), "same")), "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
+
+    it("regains the Entry when the remote move also updated the content", () => {
+      const plan = new SyncEngine().reconcile({
+        base: snapshot([live("x", oldPathOf("甲"), "v1")], "commit-base"),
+        local: observe([file(newPathOf("甲"), "v2")]),
+        remote: snapshot([live("x", newPathOf("甲"), "v2")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
+
+    it("still reports a path collision when the moved copy differs from the current remote Revision", () => {
+      const plan = new SyncEngine().reconcile({
+        base: snapshot([live("x", oldPathOf("甲"), "v1")], "commit-base"),
+        local: observe([file(newPathOf("甲"), "v1")]),
+        remote: snapshot([live("x", newPathOf("甲"), "v2")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([{ kind: "path-collision", paths: [newPathOf("甲")] }]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
+
+    // 旧路径上的源文件还在（复制做完、源还没移进回收站）：第一次同步期间不做这一支，不动本机文件
+    it("leaves a copied move whose source is still present to path-collision review", () => {
+      const plan = new SyncEngine().reconcile({
+        base: snapshot([live("x", oldPathOf("甲"), "same")], "commit-base"),
+        local: observe([file(oldPathOf("甲"), "same", "x"), file(newPathOf("甲"), "same")]),
+        remote: snapshot([live("x", newPathOf("甲"), "same")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toEqual([{ kind: "path-collision", paths: [newPathOf("甲")] }]);
+      expect(plan.localActions).toEqual([]);
+      expect(plan.remoteChanges).toEqual([]);
+    });
+
+    it("still asks to import an unknown local file next to a regained move", () => {
+      const plan = new SyncEngine().reconcile({
+        base: snapshot([live("x", oldPathOf("甲"), "same")], "commit-base"),
+        local: observe([file(newPathOf("甲"), "same"), file("草稿.md", "draft")]),
+        remote: snapshot([live("x", newPathOf("甲"), "same")], "commit-remote"),
+      });
+
+      expect(plan.conflicts).toMatchObject([{ kind: "import-candidate", path: "草稿.md" }]);
       expect(plan.localActions).toEqual([]);
       expect(plan.remoteChanges).toEqual([]);
     });
