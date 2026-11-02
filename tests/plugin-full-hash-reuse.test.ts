@@ -175,3 +175,16 @@ it("rereads a file that received a change event between syncs even when its size
   await plugin.syncNow();
   expect(plugin.getStatusText()).toContain("上传 1");
 });
+
+it("rereads every file for a full check the user asked for even when the record covers them", async () => {
+  const {plugin, takeReads} = await fixture();
+  await plugin.syncNow();
+  expect(takeReads()).toEqual(["existing.md", "import.md"]);
+
+  await plugin.verifyAllFiles();
+
+  expect(takeReads()).toEqual(["existing.md", "import.md"]);
+  // 用户主动的完整校验之后，自动的完整校验照样沿用记录
+  await plugin.syncNow();
+  expect(takeReads()).toEqual([]);
+});

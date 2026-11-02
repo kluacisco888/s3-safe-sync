@@ -1294,7 +1294,7 @@ export default class S3VaultSyncPlugin
       const dirtySnapshot = this.dirtyPaths.capture();
       const pathRenameSnapshot = this.pathRenames.capture();
       fullHashVerification =
-        requestedFullHashVerification ||
+        requestedFullHashVerification !== false ||
         (document.visibilityState === "visible" &&
           isFullHashVerificationDue(
             this.data.lastFullHashVerificationAt,
@@ -1375,7 +1375,9 @@ export default class S3VaultSyncPlugin
               pathRenames: this.pathRenames.toPathMap(pathRenameSnapshot),
               renameResolution: this.approvedRenameResolution,
               retryHashMemo,
-              reuseLoadHashRecord: fullHashVerification,
+              // 用户主动要求的完整校验全部重读；只有自动到期、标记还在、Head 冲突后重试这类自动情况沿用记录
+              reuseLoadHashRecord:
+                fullHashVerification && requestedFullHashVerification !== true,
             },
           );
         },
@@ -1678,7 +1680,7 @@ export default class S3VaultSyncPlugin
       const retryFullHashVerification =
         this.data.fullHashVerificationRequired === true;
       void this.requestSync({
-        fullHashVerification: retryFullHashVerification,
+        fullHashVerification: retryFullHashVerification && "automatic",
       }, "head-retry");
     }, delay);
   }
