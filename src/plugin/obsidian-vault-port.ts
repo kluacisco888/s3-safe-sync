@@ -49,6 +49,10 @@ export const isInSyncScope = (path: string): boolean => {
     return false;
   }
   const basename = segments.at(-1) ?? "";
+  // macOS 文件夹图标文件：名字是 Icon 加回车符，安卓建不了这种文件名
+  if (basename === "Icon\r") {
+    return false;
+  }
   return !/^~\$.*\.(?:docx?|pptx?|xlsx?)$/iu.test(basename);
 };
 
