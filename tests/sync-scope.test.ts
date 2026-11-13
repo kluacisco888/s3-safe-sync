@@ -19,7 +19,7 @@ import {
   type SyncCachePort,
 } from "../src/sync/sync-service";
 
-const ICON = "Icon\r";
+const MAC_FOLDER_ICON = "Icon\r";
 const bytes = (value: string) => new TextEncoder().encode(value);
 
 describe("macOS 文件夹图标文件 Icon\\r", () => {
@@ -91,7 +91,7 @@ const livePaths = async (remote: RemoteStore): Promise<string[]> => {
 };
 
 describe("同步层对 Icon\\r 的处理", () => {
-  it("本机有 Icon\\r 时只上传普通笔记，同步完成且没有未同步项", async () => {
+  it("本机有 Icon\\r 时只上传普通笔记，同步完成且没有 Unsynced Local Entry", async () => {
     const files = new Map<string, Uint8Array>();
     const remote = await RemoteStore.open({ objects: memoryObjects(), prefix: "obs-sync", vaultKey: new Uint8Array(32) });
     const service = new SyncService({
@@ -101,7 +101,7 @@ describe("同步层对 Icon\\r 的处理", () => {
       replicaId: "desktop",
     });
     await service.initializeNew("vault-1");
-    files.set(ICON, new Uint8Array(0));
+    files.set(MAC_FOLDER_ICON, new Uint8Array(0));
     files.set("note.md", bytes("note"));
 
     const result = await service.synchronize();
@@ -117,34 +117,51 @@ describe("同步层对 Icon\\r 的处理", () => {
     expect(await livePaths(remote)).toEqual(["note.md"]);
   });
 
-  it("远端和上次同步结果里已有活的 Icon\\r 时，不发布删除、不删本机文件、不下载", async () => {
+  it("远端和 Sync Cache 里已有活的 Icon\\r 时，连续两轮同步都不发布 Deletion Record、不删本机文件、不下载", async () => {
     const files = new Map<string, Uint8Array>([
-      [ICON, new Uint8Array(0)],
+      [MAC_FOLDER_ICON, new Uint8Array(0)],
       ["note.md", bytes("note")],
     ]);
     const vault = memoryVault(files);
     const remote = await RemoteStore.open({ objects: memoryObjects(), prefix: "obs-sync", vaultKey: new Uint8Array(32) });
     const cache = memoryCache();
-    // 旧版规则：Icon\r 也在同步范围内，先把它传上去并记进上次同步结果
-    const legacy: LocalVaultPort = Object.assign(Object.create(new ObsidianVaultPort(vault)) as ObsidianVaultPort, {
+    // 旧版规则：Icon\r 也在同步范围内，先把它传上去并记进 Sync Cache；
+    // 只有 list 和 supportsPath 换成旧规则，其余操作交给真实的 ObsidianVaultPort
+    const real = new ObsidianVaultPort(vault);
+    const legacy: LocalVaultPort = {
+      cleanupEmptyDirectories: (retiredPaths) => real.cleanupEmptyDirectories(retiredPaths),
+      delete: (path, expectedContentHash) => real.delete(path, expectedContentHash),
+      hashContent: (path, options) => real.hashContent(path, options),
       list: async () => [...files].map(([path, body]) => ({ path, modifiedAt: 1, size: body.byteLength })),
+      move: (fromPath, toPath, expectedSourceHash, expectedTargetHash) =>
+        real.move(fromPath, toPath, expectedSourceHash, expectedTargetHash),
+      pathExists: (path) => real.pathExists(path),
+      read: (path) => real.read(path),
+      stat: (path) => real.stat(path),
       supportsPath: () => true,
-    });
+      write: (path, body, expectedCurrentHash) => real.write(path, body, expectedCurrentHash),
+    };
     await new SyncService({ cache, local: legacy, remote, replicaId: "desktop" }).initializeNew("vault-1");
-    expect(await livePaths(remote)).toEqual([ICON, "note.md"]);
+    expect(await livePaths(remote)).toEqual([MAC_FOLDER_ICON, "note.md"]);
 
     const local = new ObsidianVaultPort(vault);
     const write = vi.spyOn(local, "write");
     const remove = vi.spyOn(local, "delete");
     const move = vi.spyOn(local, "move");
-    const result = await new SyncService({ cache, local, remote, replicaId: "desktop" }).synchronize();
 
-    expect(result).toMatchObject({ deleted: 0, downloaded: 0, downloads: [], uploads: [] });
-    expect(result.deferredDownloadEntries).toMatchObject([{ path: ICON, reason: "unsupported-path" }]);
-    expect(write).not.toHaveBeenCalled();
-    expect(remove).not.toHaveBeenCalled();
-    expect(move).not.toHaveBeenCalled();
-    expect(files.has(ICON)).toBe(true);
-    expect(await livePaths(remote)).toEqual([ICON, "note.md"]);
+    // 第一轮用新规则同步；第二轮再同步一次，Icon\r 仍应是已知但未落地的 Deferred Download
+    for (const round of [1, 2]) {
+      const result = await new SyncService({ cache, local, remote, replicaId: "desktop" }).synchronize();
+
+      expect(result, `第 ${round} 轮`).toMatchObject({ deleted: 0, downloaded: 0, downloads: [], uploads: [] });
+      expect(result.deferredDownloadEntries, `第 ${round} 轮`).toMatchObject([
+        { path: MAC_FOLDER_ICON, reason: "unsupported-path" },
+      ]);
+      expect(write).not.toHaveBeenCalled();
+      expect(remove).not.toHaveBeenCalled();
+      expect(move).not.toHaveBeenCalled();
+      expect(files.has(MAC_FOLDER_ICON)).toBe(true);
+      expect(await livePaths(remote)).toEqual([MAC_FOLDER_ICON, "note.md"]);
+    }
   });
 });
