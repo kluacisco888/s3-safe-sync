@@ -49,6 +49,11 @@ export const isInSyncScope = (path: string): boolean => {
     return false;
   }
   const basename = segments.at(-1) ?? "";
+  // Icon\r 是 macOS 给文件夹设自定义图标时生成的隐藏文件，正文为空、图标存在资源分支里，不是笔记内容；
+  // 安卓建不了这个文件名，传上去会让安卓设备同步失败，所以所有平台都排除
+  if (basename === "Icon\r") {
+    return false;
+  }
   return !/^~\$.*\.(?:docx?|pptx?|xlsx?)$/iu.test(basename);
 };
 

@@ -45,7 +45,7 @@ A local item on a new or reinstalled Replica whose relationship to the Remote St
 _Avoid_: Local change, conflict
 
 **Sync Scope**:
-The set of ordinary Vault files eligible for synchronization, excluding Obsidian configuration, hidden paths, underscore paths, version-control data, and temporary files by default.
+The set of ordinary Vault files eligible for synchronization, excluding Obsidian configuration, hidden paths, underscore paths, version-control data, temporary files, and the macOS folder icon file `Icon\r` by default.
 _Avoid_: Entire Vault, backup set
 
 **Deferred Download**:

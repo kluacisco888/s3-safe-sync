@@ -139,7 +139,7 @@ Reported remote integrity and Repair Mode failures are saved on this device, bou
 
 ## Scope and limits
 
-The plugin synchronizes ordinary Vault files. It excludes Obsidian configuration, dot-prefixed and underscore-prefixed path segments, version-control directories, `node_modules`, and temporary Office files.
+The plugin synchronizes ordinary Vault files. It excludes Obsidian configuration, dot-prefixed and underscore-prefixed path segments, version-control directories, `node_modules`, temporary Office files, and the macOS folder icon file `Icon\r` (a file whose name is exactly `Icon` followed by a carriage return, in any folder, on every platform).
 
 - No plugin-imposed automatic file-size limit on desktop, Android, or iOS, including cellular and unknown networks. Large transfers can use mobile data; pause sync when needed.
 - Existing size-deferred files are reconsidered on the next sync. Already verified manual downloads are not reported as unsynced solely because of their size.

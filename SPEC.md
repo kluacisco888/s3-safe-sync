@@ -22,7 +22,7 @@ The plugin does not run after Obsidian is closed, provide telemetry, synchronize
 
 ## Sync Scope
 
-Include ordinary files of every extension. Exclude `.obsidian`, dot-prefixed path segments, underscore-prefixed path segments, version-control directories, `node_modules`, and temporary office files. Configurable exclusion globs, bookmarks, and configuration synchronization are outside the first release. Remote paths that the current device cannot create are deferred without becoming deletions and require a rename on another device. A previously deferred Entry remains known as unmaterialized and is downloaded when its path later becomes supported instead of treating its absence as a local deletion.
+Include ordinary files of every extension. Exclude `.obsidian`, dot-prefixed path segments, underscore-prefixed path segments, version-control directories, `node_modules`, temporary office files, and the macOS folder icon file `Icon\r` (a file whose name is exactly `Icon` followed by a carriage return, in any folder, on every platform). Configurable exclusion globs, bookmarks, and configuration synchronization are outside the first release. Remote paths that the current device cannot create are deferred without becoming deletions and require a rename on another device. A previously deferred Entry remains known as unmaterialized and is downloaded when its path later becomes supported instead of treating its absence as a local deletion.
 
 ## Remote layout
 
